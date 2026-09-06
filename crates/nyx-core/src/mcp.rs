@@ -1781,9 +1781,15 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                 }),
                 "image": json!({
                     "type": "string",
-                    "description": "optional; the project's MARK as an image (a file path or URL). \
-                                   Mutually exclusive with `icon` — see it. Pass null to clear the \
-                                   mark. Unchanged if omitted.",
+                    "description": "optional; the project's MARK as an image. Accepts an `http(s):` \
+                                   or `data:` URL, or a path to a picture nyx itself adopted (the \
+                                   desktop picker copies the chosen file into nyx's own directory \
+                                   and stores THAT path). An arbitrary path elsewhere on disk is \
+                                   STORED BUT NOT RENDERED — the app serves project pictures over \
+                                   its own scheme, which reaches only that directory, so the mark \
+                                   falls back to the icon or the initial. Mutually exclusive with \
+                                   `icon` — see it. Pass null to clear the mark. Unchanged if \
+                                   omitted.",
                 }),
             },
             "required": ["project_id"],

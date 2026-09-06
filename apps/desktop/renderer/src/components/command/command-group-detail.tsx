@@ -6,7 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Tooltip } from "@/components/ui/tooltip";
 import { SidebarLineFamilyGlyph } from "@/components/ui/sidebar-line";
 import { MicroLabel } from "@/components/ui/tree-primitives";
-import { GroupSwatches } from "@/components/panes/group-swatches";
+import { GROUP_OPTIONS, GroupSwatches } from "@/components/panes/group-swatches";
 import {
   COMMAND_GROUP_SHAPES,
   type CommandGroupShape,
@@ -70,7 +70,7 @@ export function CommandGroupDetail({
     if (next !== group.name) onRename(next);
   };
 
-  const tone = { "--group-tone": `var(--group-${group.color ?? 0})` } as CSSProperties;
+  const tone = { "--group-tone": `var(--identity-${group.color ?? 0})` } as CSSProperties;
 
   return (
     <div style={tone} className="flex flex-col">
@@ -126,7 +126,7 @@ export function CommandGroupDetail({
       <div className="mt-3.5 flex flex-col gap-1.5">
         <span className="text-xs font-medium text-foreground">Colour</span>
         {/* THE SHARED SWATCH ROW — the very control `group-panel.tsx` mounts. */}
-        <GroupSwatches value={group.color} onSelect={onRecolor} />
+        <GroupSwatches options={GROUP_OPTIONS} value={group.color} onSelect={onRecolor} />
       </div>
 
       <DetailSeparator />

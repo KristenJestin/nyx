@@ -7654,18 +7654,30 @@ fn identity_value(raw: &str) -> Option<String> {
     }
 }
 
-/// Persist a project's ACCENT colour, bumping `updated_at`. `None` (or a blank string) CLEARS it,
-/// which puts the project back on the neutral tile. Returns rows updated (0 if the id is unknown).
-/// The core stores the string and never interprets it — the renderer resolves it against the
-/// design system.
+/// The render-side NEUTRAL token. It is what an ABSENT accent looks like, so it is not a value
+/// this column may hold: folding it here gives the absence exactly ONE spelling (`NULL`) for
+/// EVERY writer — the picker (whose first swatch already sends `null`) and the MCP tool alike.
+/// Without the fold an agent could write it, the tile would render neutral, and `dressed` would
+/// still read "this project wears something" — a project that looks bare with an active
+/// *Remove identity*.
+const ACCENT_NEUTRAL_TOKEN: &str = "identity-0";
+
+/// Persist a project's ACCENT colour, bumping `updated_at`. `None`, a blank string, or the
+/// neutral token CLEAR it, which puts the project back on the neutral tile. Returns rows updated
+/// (0 if the id is unknown). The core stays OPAQUE about what a non-neutral string MEANS — it
+/// stores `identity-3` exactly as it would store `#4f46e5`, and the renderer resolves it against
+/// the design system.
 pub fn set_project_accent(
     conn: &mut SqliteConnection,
     id: &str,
     accent: Option<&str>,
 ) -> QueryResult<usize> {
+    let accent = accent
+        .and_then(identity_value)
+        .filter(|v| v != ACCENT_NEUTRAL_TOKEN);
     diesel::update(projects::table.find(id))
         .set((
-            projects::accent.eq(accent.and_then(identity_value)),
+            projects::accent.eq(accent),
             projects::updated_at.eq(now_millis()),
         ))
         .execute(conn)
@@ -31877,8 +31889,10 @@ mod tests {
         assert_eq!(fresh.icon, None, "…no glyph");
         assert_eq!(fresh.image_path, None, "…and no image");
 
-        // A colour AND a glyph: both halves land, through their own setter.
-        set_project_accent(&mut conn, &project.id, Some("primary")).unwrap();
+        // A colour AND a glyph: both halves land, through their own setter. The accent is a
+        // PALETTE token (`identity-N`, ADR-0012), never a SEMANTIC one: `--primary` and its
+        // siblings are RESERVED, and an identity that borrowed one would read as a state.
+        set_project_accent(&mut conn, &project.id, Some("identity-3")).unwrap();
         set_project_mark(
             &mut conn,
             &project.id,
@@ -31886,7 +31900,7 @@ mod tests {
         )
         .unwrap();
         let dressed = read(&mut conn);
-        assert_eq!(dressed.accent.as_deref(), Some("primary"));
+        assert_eq!(dressed.accent.as_deref(), Some("identity-3"));
         assert_eq!(dressed.icon.as_deref(), Some("rocket"));
         assert_eq!(dressed.image_path, None);
 
@@ -31903,7 +31917,7 @@ mod tests {
         assert_eq!(swapped.image_path.as_deref(), Some("D:/logo.png"));
         assert_eq!(
             swapped.accent.as_deref(),
-            Some("primary"),
+            Some("identity-3"),
             "the accent is untouched by a mark change"
         );
 
@@ -34488,53 +34502,114 @@ mod tests {
         assert!(schema_health(&mut conn).up_to_date);
     }
 
-    /// THE PALETTE SIZE IS ONE NUMBER, WRITTEN ON FIVE LAYERS, AND NOTHING DERIVES ONE FROM
-    /// ANOTHER ACROSS THE LANGUAGE BOUNDARY — so this test IS the derivation. It reads all five
-    /// and refuses any disagreement:
+    /// The repo root — two levels above `crates/nyx-core`.
+    fn repo_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("the repo root is two levels above crates/nyx-core")
+            .to_path_buf()
+    }
+
+    /// The literal value of an `export const <name> = <n>;` in `pane-groups.ts` — the renderer's
+    /// single spelling of a number, read off the real source rather than restated here.
+    fn pane_groups_const(name: &str) -> i32 {
+        let ts = std::fs::read_to_string(
+            repo_root().join("apps/desktop/renderer/src/components/panes/pane-groups.ts"),
+        )
+        .expect("read pane-groups.ts");
+        ts.split(&format!("export const {name} = "))
+            .nth(1)
+            .unwrap_or_else(|| panic!("pane-groups.ts declares {name}"))
+            .split(';')
+            .next()
+            .expect("the declaration ends with a semicolon")
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} is a literal number"))
+    }
+
+    /// THE PALETTE'S SIZE — one number, written on two layers, nothing derives one from the other
+    /// across the language boundary, so this test IS the derivation:
     ///
-    ///  1. the `--group-N` design tokens in `apps/desktop/renderer/src/globals.css` (`--group-0`
-    ///     is the NEUTRAL default, not a palette colour, so the count starts at 1);
-    ///  2. `GROUP_COLOR_COUNT` in `apps/desktop/renderer/src/components/panes/pane-groups.ts` —
-    ///     the renderer's single spelling of the number, from which its `GroupColor` union is
-    ///     derived;
+    ///  1. the `--identity-N` design tokens in `apps/desktop/renderer/src/globals.css`
+    ///     (`--identity-0` is the NEUTRAL default, not a palette colour, so the count starts at 1);
+    ///  2. `IDENTITY_COLOR_COUNT` in `apps/desktop/renderer/src/components/panes/pane-groups.ts`.
+    ///
+    /// IT DELIBERATELY SAYS NOTHING ABOUT COMMAND GROUPS. Until ADR-0012 there was ONE number for
+    /// both, and one test asserting all four layers were equal; the palette is now WIDER than the
+    /// bound of any single consumer (twelve tokens, command groups capped at six), so "the size"
+    /// and "the bound" are two facts and get two tests. Adding a thirteenth hue must fail HERE and
+    /// leave `the_command_group_colour_bound_is_the_same_number_on_all_four_layers` untouched.
+    #[test]
+    fn the_identity_palette_size_is_the_same_number_on_both_layers() {
+        let css = std::fs::read_to_string(
+            repo_root().join("apps/desktop/renderer/src/globals.css"),
+        )
+        .expect("read globals.css");
+        let css_count = (1i32..)
+            .take_while(|n| css.contains(&format!("--identity-{n}:")))
+            .last()
+            .expect("globals.css declares at least --identity-1");
+        assert!(
+            css.contains("--identity-0:"),
+            "the neutral default token must exist alongside the palette"
+        );
+
+        let ts_count = pane_groups_const("IDENTITY_COLOR_COUNT");
+        assert_eq!(
+            ts_count, css_count,
+            "IDENTITY_COLOR_COUNT ({ts_count}) and the --identity-N tokens ({css_count}) disagree"
+        );
+    }
+
+    /// THE COMMAND GROUPS' COLOUR BOUND — a DIFFERENT number from the palette's size (ADR-0012),
+    /// written on four layers, and this test is its derivation:
+    ///
+    ///  1. the `--group-N` aliases in `globals.css` — the command-group view of the palette, which
+    ///     stops at the bound ON PURPOSE: aliasing a seventh would paint `var(--group-7)` on a
+    ///     value the write path then rejects, the colour shows, the save fails, and nothing says
+    ///     why (that is the original bug this whole family of tests exists for);
+    ///  2. `GROUP_COLOR_COUNT` in `pane-groups.ts`, from which the `GroupColor` union is derived;
     ///  3. `COMMAND_GROUP_COLOR_MIN..=COMMAND_GROUP_COLOR_MAX` here, checked against the LIVE SQL
     ///     `CHECK` from `20260819140000_create_command_groups` rather than against the text of
     ///     `up.sql` — the boundary that actually refuses a write;
     ///  4. the `manage_command_group` MCP schema's `color` bounds, read off the descriptor the
     ///     agent is really served, not off this source;
-    ///  5. [`CATEGORY_COLOR_TOKENS`], the same palette spelled as token NAMES for the category
-    ///     chips (PDR-0017) — the one layer that stores `group-N` as text rather than as an
-    ///     integer, so it is confronted name by name and not merely by count, and read against
-    ///     layer 1 directly (which is where it sits in the body, out of listing order).
+    ///  5. [`CATEGORY_COLOR_TOKENS`], the same aliased palette spelled as token NAMES for the
+    ///     category chips (PDR-0017) — the one layer that stores `group-N` as text rather than as
+    ///     an integer, so it is confronted name by name and not merely by count, and read against
+    ///     layer 1 directly. It closes the mirror-image hole: an alias REMOVED from `globals.css`
+    ///     would leave `category_color_token` folding a slug onto `group-6` and the chip painting
+    ///     `var(--group-6)`, which resolves to nothing at all.
     ///
-    /// Without this, adding a seventh token paints `var(--group-7)` on a value the write path then
-    /// rejects — the colour shows, the save fails, and nothing says why. Layer 5 closes the
-    /// mirror-image hole: a token REMOVED from `globals.css` would leave `category_color_token`
-    /// folding a slug onto `group-6` and the chip painting `var(--group-6)`, which resolves to
-    /// nothing at all.
+    /// LAYER 5 IS ALSO WHY THE ALIASES ARE NOT DEAD CSS. They have no `var(--group-N)` call site
+    /// left in the renderer, but `CATEGORY_COLOR_TOKENS` hands those very names to the chips —
+    /// deleting the alias block would paint every category chip with an undefined custom property.
     #[test]
-    fn the_palette_size_is_the_same_number_on_all_five_layers() {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("the repo root is two levels above crates/nyx-core");
-
-        // LAYER 1 — the design tokens.
-        let css = std::fs::read_to_string(repo.join("apps/desktop/renderer/src/globals.css"))
-            .expect("read globals.css");
-        let css_count = (1i32..)
+    fn the_command_group_colour_bound_is_the_same_number_on_all_four_layers() {
+        // LAYER 1 — the aliases, which stop AT the bound and not one token further.
+        let css = std::fs::read_to_string(
+            repo_root().join("apps/desktop/renderer/src/globals.css"),
+        )
+        .expect("read globals.css");
+        let alias_count = (1i32..)
             .take_while(|n| css.contains(&format!("--group-{n}:")))
             .last()
             .expect("globals.css declares at least --group-1");
         assert!(
             css.contains("--group-0:"),
-            "the neutral default token must exist alongside the palette"
+            "the neutral default alias must exist alongside the aliased palette"
+        );
+        assert_eq!(
+            alias_count, COMMAND_GROUP_COLOR_MAX,
+            "the --group-N aliases ({alias_count}) and COMMAND_GROUP_COLOR_MAX disagree"
         );
 
         // LAYER 5 — read HERE, right against layer 1: it is the only other layer that spells the
         // palette as token NAMES rather than as a count or a bound, so it is confronted name by
         // name (a count alone would let `group-9` sit in the list undetected).
-        let css_tokens: Vec<String> = (1..=css_count).map(|n| format!("group-{n}")).collect();
+        let css_tokens: Vec<String> = (1..=alias_count).map(|n| format!("group-{n}")).collect();
         assert_eq!(
             CATEGORY_COLOR_TOKENS.to_vec(),
             css_tokens,
@@ -34542,23 +34617,10 @@ mod tests {
         );
 
         // LAYER 2 — the renderer's constant.
-        let ts = std::fs::read_to_string(
-            repo.join("apps/desktop/renderer/src/components/panes/pane-groups.ts"),
-        )
-        .expect("read pane-groups.ts");
-        let ts_count: i32 = ts
-            .split("export const GROUP_COLOR_COUNT = ")
-            .nth(1)
-            .expect("pane-groups.ts declares GROUP_COLOR_COUNT")
-            .split(';')
-            .next()
-            .expect("the declaration ends with a semicolon")
-            .trim()
-            .parse()
-            .expect("GROUP_COLOR_COUNT is a literal number");
+        let ts_count = pane_groups_const("GROUP_COLOR_COUNT");
         assert_eq!(
-            ts_count, css_count,
-            "GROUP_COLOR_COUNT ({ts_count}) and the --group-N tokens ({css_count}) disagree"
+            ts_count, COMMAND_GROUP_COLOR_MAX,
+            "GROUP_COLOR_COUNT ({ts_count}) and COMMAND_GROUP_COLOR_MAX disagree"
         );
 
         // LAYER 3 — the SQL CHECK, exercised rather than read: the highest colour INSERTs, the
@@ -34574,23 +34636,19 @@ mod tests {
         };
         assert!(
             insert(&mut conn, "g-max", COMMAND_GROUP_COLOR_MAX).is_ok(),
-            "the highest palette colour must be storable"
+            "the highest allowed colour must be storable"
         );
         assert!(
             insert(&mut conn, "g-min", COMMAND_GROUP_COLOR_MIN).is_ok(),
-            "the lowest palette colour must be storable"
+            "the lowest allowed colour must be storable"
         );
         assert!(
             insert(&mut conn, "g-over", COMMAND_GROUP_COLOR_MAX + 1).is_err(),
-            "the SQL CHECK must refuse a colour above the palette"
+            "the SQL CHECK must refuse a colour above the bound"
         );
         assert!(
             insert(&mut conn, "g-under", COMMAND_GROUP_COLOR_MIN - 1).is_err(),
-            "the SQL CHECK must refuse a colour below the palette"
-        );
-        assert_eq!(
-            COMMAND_GROUP_COLOR_MAX, css_count,
-            "COMMAND_GROUP_COLOR_MAX and the --group-N tokens disagree"
+            "the SQL CHECK must refuse a colour below the bound"
         );
 
         // LAYER 4 — the MCP schema the agent is served.
@@ -34608,6 +34666,24 @@ mod tests {
             color["maximum"].as_i64(),
             Some(i64::from(COMMAND_GROUP_COLOR_MAX)),
             "the MCP schema's colour ceiling drifted from COMMAND_GROUP_COLOR_MAX"
+        );
+    }
+
+    /// THE INVARIANT THAT SURVIVED THE SPLIT. The two numbers above are allowed to differ, but not
+    /// in every direction: a consumer may take FEWER colours than the palette holds, never more.
+    /// This is the one assertion that still protects against the original bug — offering a value
+    /// the write path refuses — now that "equal on all layers" is no longer true.
+    #[test]
+    fn the_command_group_bound_never_exceeds_the_identity_palette() {
+        let palette = pane_groups_const("IDENTITY_COLOR_COUNT");
+        assert!(
+            COMMAND_GROUP_COLOR_MAX <= palette,
+            "command groups may pick up to {COMMAND_GROUP_COLOR_MAX}, \
+             but the palette only holds {palette} colours"
+        );
+        assert!(
+            COMMAND_GROUP_COLOR_MIN >= 1,
+            "colour 0 is the NEUTRAL — the absence of a choice — never a storable value"
         );
     }
 

@@ -67,6 +67,8 @@ export function TerminalsPage() {
     createProject,
     createWorkspace,
     setProjectResumeAgentSessions,
+    setProjectAccent,
+    setProjectMark,
     updateProject,
     deleteWorkspace,
     renameWorkspace,
@@ -234,6 +236,15 @@ export function TerminalsPage() {
           onRename: (name) => updateProject(activeTree.project.id, name),
           onResumeChange: (resume) =>
             setProjectResumeAgentSessions(activeTree.project.id, resume),
+          // The identity block — same live tree, so the header's own mark and the rail tile
+          // repaint the moment a swatch or a glyph is pressed.
+          identity: {
+            accent: activeTree.project.accent ?? null,
+            icon: activeTree.project.icon ?? null,
+            imagePath: activeTree.project.image_path ?? null,
+            onAccentChange: (accent) => setProjectAccent(activeTree.project.id, accent),
+            onMarkChange: (mark) => setProjectMark(activeTree.project.id, mark),
+          },
         }}
         onClose={() => setSettingsTarget(null)}
       />

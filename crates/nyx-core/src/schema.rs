@@ -167,7 +167,9 @@ diesel::table! {
 //   de `diesel::table!`, il n'apparaît donc que dans la migration et `EXPECTED_SCHEMA`).
 // - the projects_identity migration adds the project's CHOSEN visual identity: `projects.accent`
 //   (Nullable<Text>, an opaque colour the core never interprets) plus the mark in its two
-//   spellings, `icon` (a glyph token) and `image_path` (a file path / URL), which are mutually
+//   spellings, `icon` (a glyph token) and `image_path` (a URL, or the path of a picture nyx
+//   adopted into its own directory — an arbitrary path elsewhere is stored but does not render,
+//   see the `set_project_settings` schema), which are mutually
 //   exclusive by a SQL CHECK (`image_path IS NULL OR icon IS NULL`). All three NULLABLE and NULL
 //   by default — a project with no identity falls back to its initial on a neutral tile. Appended
 //   LAST on `projects` (positional decoding), same shape as `worktrees_root` — its date

@@ -72,6 +72,11 @@ interface NyxWindowApi {
   controlsVisible(): Promise<boolean>;
   pickDirectory(title?: string): Promise<string | null>;
   homeDir(): Promise<string | null>;
+  // Optional for the same reason as the close-guard pair above: a preload predating
+  // the project-identity picker (or a bare test double) must still type-check.
+  pickProjectImage?(projectId: string): Promise<string | null>;
+  discardProjectImage?(projectId: string): Promise<void>;
+  pruneProjectImages?(liveProjectIds: string[]): Promise<number>;
 }
 
 /** Read the injected bridge objects. They exist whenever this adapter is selected
@@ -99,6 +104,16 @@ const CORE_INVOKE_CHANNEL = "nyx:core/invoke";
  * Both halves are fixed strings, so both can be removed EXACTLY rather than guessed at.
  */
 const IPC_WRAP_PREFIX = `Error invoking remote method '${CORE_INVOKE_CHANNEL}': `;
+
+/**
+ * The same wrapper, for ANY channel. Electron builds it identically whichever `ipcMain.handle`
+ * threw, so the two fixed halves — the lead-in and the `': ` that closes the channel name — are
+ * still removed exactly; only the channel between them is left unconstrained. Needed because the
+ * WINDOW channels (`nyx:window/…`) also surface refusals a human reads: the picture picker throws
+ * a written sentence, and without this the settings modal would print
+ * `Error invoking remote method 'nyx:window/pick-project-image': Error: <sentence>`.
+ */
+const IPC_WRAP_ANY_CHANNEL = /^Error invoking remote method '[^']*': /;
 /** `Error.prototype.toString()` on the main-side error, i.e. `name + ": "` with the default name. */
 const STRINGIFIED_ERROR_PREFIX = "Error: ";
 
@@ -164,6 +179,22 @@ function unwrapCoreInvokeRejection(e: unknown): unknown {
   return inner.startsWith(STRINGIFIED_ERROR_PREFIX)
     ? inner.slice(STRINGIFIED_ERROR_PREFIX.length)
     : inner;
+}
+
+/**
+ * {@link unwrapCoreInvokeRejection} for a rejection that crossed ANY channel — used where a
+ * window-channel failure is rethrown to a surface that will DISPLAY it. Same two-step reading:
+ * the attached cause when the build provides one, else the wrapper removed from the message.
+ */
+function unwrapInvokeRejection(e: unknown): unknown {
+  const wrapped = messageField(e);
+  if (wrapped === null || !IPC_WRAP_ANY_CHANNEL.test(wrapped)) return e;
+  const cause = isRecord(e) ? e.cause : undefined;
+  if ((messageField(cause) ?? "").trim().length > 0) return cause;
+  const inner = wrapped.replace(IPC_WRAP_ANY_CHANNEL, "");
+  return inner.startsWith(STRINGIFIED_ERROR_PREFIX)
+    ? new Error(inner.slice(STRINGIFIED_ERROR_PREFIX.length))
+    : new Error(inner);
 }
 
 /** Build a {@link BridgeError} from a caught IPC/command failure. */
@@ -467,6 +498,49 @@ export const electronBridge: NyxBridge = {
       return (await windowApi().pickDirectory(title)) ?? null;
     } catch {
       return null;
+    }
+  },
+
+  async pickProjectImage(projectId: string): Promise<string | null> {
+    // NOT swallowed, unlike `pickDirectory` above: a refusal here (extension, size)
+    // is a sentence the human needs to read, and turning it into `null` would spell
+    // it exactly like pressing Cancel. Only a preload that predates the picker
+    // degrades silently — there is nothing to say about it.
+    const api = windowApi();
+    if (!api.pickProjectImage) {
+      // A preload predating the picker. NOT `null`: that is how Cancel is spelled, and a button
+      // that silently does nothing is worse than one that says why.
+      throw new Error("This build cannot pick a project picture — restart nyx to pick one up.");
+    }
+    try {
+      return (await api.pickProjectImage(projectId)) ?? null;
+    } catch (e) {
+      // The refusal written in the main process, WITHOUT Electron's `Error invoking remote
+      // method '…'` wrapper: this message goes straight into the alert under the button.
+      throw unwrapInvokeRejection(e);
+    }
+  },
+
+  async discardProjectImage(projectId: string): Promise<void> {
+    // Best-effort by design: the row is the truth, the file is a cache of it. A
+    // failed delete leaves an orphan that the NEXT gesture on this project takes —
+    // adopting a picture and removing the identity both work off the directory
+    // listing, never off a remembered name, so the retry is automatic. NOT the boot
+    // sweep: it spares every file a LIVE project could claim, so it only collects
+    // this one once the project itself is gone. Either way, a locked file must never
+    // block the human from removing the identity.
+    try {
+      await windowApi().discardProjectImage?.(projectId);
+    } catch {
+      /* the next gesture on this project takes it */
+    }
+  },
+
+  async pruneProjectImages(liveProjectIds: string[]): Promise<number> {
+    try {
+      return (await windowApi().pruneProjectImages?.(liveProjectIds)) ?? 0;
+    } catch {
+      return 0;
     }
   },
 

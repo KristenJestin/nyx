@@ -73,6 +73,11 @@ export class FakeNyxBridge implements NyxBridge {
     this.ackCalls.length = 0;
     this.subs.clear();
     this.pickedDirectory = null;
+    this.pickedProjectImage = null;
+    this.projectImageRefusal = null;
+    this.discardedProjectImages.length = 0;
+    this.keptProjectImages.length = 0;
+    this.prunedProjectImages.length = 0;
     this.homeDirValue = "/home/test";
   }
   /** Push an event to every live subscriber of `channel`. */
@@ -206,6 +211,35 @@ export class FakeNyxBridge implements NyxBridge {
   pickedDirectory: string | null = null;
   pickDirectory(_title?: string): Promise<string | null> {
     return Promise.resolve(this.pickedDirectory);
+  }
+
+  /** Test control: what the picture picker answers — a COPY's path, or `null` for a
+   *  cancel. */
+  pickedProjectImage: string | null = null;
+  /** Test control: the sentence the picker REFUSES with (extension / size). Set it to
+   *  rehearse a refusal; it wins over {@link pickedProjectImage}, because on the real
+   *  side a refusal rejects and a cancel resolves `null` — two different outcomes the
+   *  caller must be able to tell apart. */
+  projectImageRefusal: string | null = null;
+  /** Every project whose picture was discarded, and every sweep, in call order. */
+  readonly discardedProjectImages: string[] = [];
+  /** For each `discardProjectImage`, the copy the caller asked to KEEP (`null` when it kept none). */
+  readonly keptProjectImages: (string | null)[] = [];
+  readonly prunedProjectImages: string[][] = [];
+  pickProjectImage(_projectId: string): Promise<string | null> {
+    if (this.projectImageRefusal !== null) {
+      return Promise.reject(new Error(this.projectImageRefusal));
+    }
+    return Promise.resolve(this.pickedProjectImage);
+  }
+  discardProjectImage(projectId: string, keep?: string): Promise<void> {
+    this.discardedProjectImages.push(projectId);
+    this.keptProjectImages.push(keep ?? null);
+    return Promise.resolve();
+  }
+  pruneProjectImages(liveProjectIds: string[]): Promise<number> {
+    this.prunedProjectImages.push([...liveProjectIds]);
+    return Promise.resolve(0);
   }
 
   homeDirValue: string | null = "/home/test";

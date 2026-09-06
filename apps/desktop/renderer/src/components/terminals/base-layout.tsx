@@ -690,6 +690,8 @@ export function BaseLayout() {
     renameWorkspace,
     reorderProjects,
     setProjectResumeAgentSessions,
+    setProjectAccent,
+    setProjectMark,
   } = useProjects();
   const { activeProjectId, setActiveProjectId, globalScope, setGlobalScope } = useActiveProject();
   // The SYSTÈME singleton, read through its OWN door (`system_scope_detail`) — never through
@@ -1390,6 +1392,18 @@ export function BaseLayout() {
               onRename: (name) => (targetId ? updateProject(targetId, name) : Promise.resolve()),
               onResumeChange: (resume) =>
                 targetId ? setProjectResumeAgentSessions(targetId, resume) : Promise.resolve(),
+              // The identity block, read from the LIVE tree so a press repaints the rail tile
+              // behind the modal at once (the optimistic write in `useProjects`), and written
+              // through the very commands the MCP tool uses.
+              identity: {
+                accent: liveTree?.project.accent ?? null,
+                icon: liveTree?.project.icon ?? null,
+                imagePath: liveTree?.project.image_path ?? null,
+                onAccentChange: (accent) =>
+                  targetId ? setProjectAccent(targetId, accent) : Promise.resolve(),
+                onMarkChange: (mark) =>
+                  targetId ? setProjectMark(targetId, mark) : Promise.resolve(),
+              },
             }}
             onClose={() => setProjectSettingsTree(null)}
           />

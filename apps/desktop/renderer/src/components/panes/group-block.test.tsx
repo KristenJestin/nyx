@@ -163,14 +163,14 @@ describe("GroupBlock", () => {
     );
     const read = () => container.querySelector("[data-group-block]") as HTMLElement;
     expect(read().dataset.groupColor).toBe("none");
-    expect(read().getAttribute("style")).toContain("var(--group-0)");
+    expect(read().getAttribute("style")).toContain("var(--identity-0)");
     rerender(
       <GroupBlock groupId="g1" color={3} name={null}>
         <span>row</span>
       </GroupBlock>,
     );
     expect(read().dataset.groupColor).toBe("3");
-    expect(read().getAttribute("style")).toContain("var(--group-3)");
+    expect(read().getAttribute("style")).toContain("var(--identity-3)");
   });
 
   /**

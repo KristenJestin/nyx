@@ -31,7 +31,7 @@ import type { GroupColor } from "./pane-groups";
  *    command stays in COMMANDS. A terminal joining a group does not change SECTION, it changes
  *    APPEARANCE. {@link groupListBlocks} is what keeps that true — it re-orders nothing into a
  *    second list, it only makes a group's members contiguous inside the one list.
- *  - THE DEFAULT IS GREY (`--group-0`, the design system's existing neutral). The block DELIMITS
+ *  - THE DEFAULT IS GREY (`--identity-0`, the design system's existing neutral). The block DELIMITS
  *    without HIERARCHISING: a solo terminal must not look secondary next to a group. This is why
  *    every tint is a `color-mix` against `transparent` rather than a flat surface token: it rides
  *    whatever the sidebar is painted with.
@@ -324,7 +324,7 @@ export function GroupBlock({
       // `--group-tone` is the ONE place the group's colour enters the block; the folder, the name,
       // the guide line and the hover fill are all mixes of it, so a group is re-tinted by changing
       // a single custom property.
-      style={{ "--group-tone": `var(--group-${color ?? 0})` } as CSSProperties}
+      style={{ "--group-tone": `var(--identity-${color ?? 0})` } as CSSProperties}
       className={cn(
         // NO border and NO fill at rest — variant B+. The radius is kept because the hover fill and
         // the drag rings are painted on this box.

@@ -2,11 +2,30 @@ import { useCallback, useState } from "react";
 import { errorText } from "@/bridge";
 import { XCircleIcon } from "lucide-react";
 
-import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { toast } from "@/components/ui/toast";
+import { ProjectIdentity } from "./project-identity";
+
+/**
+ * The project's VISUAL IDENTITY, as this pane needs it: the three stored fields plus the two
+ * writes. Threaded from the caller (which owns `useProjects`) rather than read here, so the
+ * optimistic tree update repaints every `<ProjectMark>` — rail, home, cross-project rows — the
+ * moment a swatch is pressed, with no reload and no second source of truth.
+ */
+export interface GlobalSectionIdentity {
+  /** The stored accent (a palette token name), or `null`. */
+  accent: string | null;
+  /** The stored glyph token, or `null`. Mutually exclusive with {@link imagePath}. */
+  icon: string | null;
+  /** The stored picture path (the copy nyx owns), or `null`. */
+  imagePath: string | null;
+  /** Persist an accent — `null` clears it. */
+  onAccentChange: (accent: string | null) => void | Promise<void>;
+  /** Persist the mark — a glyph, a picture, or `null` to drop it. */
+  onMarkChange: (mark: { icon: string } | { image: string } | null) => void | Promise<void>;
+}
 
 export interface GlobalSectionProps {
   /** The project id whose settings are edited (null disables the controls). */
@@ -32,6 +51,12 @@ export interface GlobalSectionProps {
    * is still required so the default (rename-enabled) callers stay unchanged.
    */
   showRename?: boolean;
+  /**
+   * The project's visual identity — the accent + mark block. REQUIRED wherever the pane is
+   * rendered: it is the only surface through which a human dresses a project, so a caller that
+   * forgot to wire it would silently take the capability away again.
+   */
+  identity: GlobalSectionIdentity;
 }
 
 /**
@@ -43,6 +68,11 @@ export interface GlobalSectionProps {
  *  - **Name** — an editable field with a Save action. Validation mirrors the rename
  *    dialog: a trimmed, non-empty value is required (Save is disabled otherwise), and
  *    a no-op rename (unchanged after trim) is also disabled.
+ *  - **Identity** — the accent + mark block ([`ProjectIdentity`]), the only surface through which
+ *    a human dresses a project. It is the pane's DOMINANT object (the one framed element, and the
+ *    largest) but it sits UNDER the name, which is what the round-2 feedback settled: the section
+ *    opens on what the project is CALLED, then on what it LOOKS like. Every choice persists on the
+ *    press — no Save of its own.
  *  - **Resume agent sessions** — a toggle that, when on, makes nyx re-attach this
  *    project's terminals' active Claude sessions at relaunch (exact `--resume`) rather
  *    than opening a bare shell. Persisted immediately on flip (independent of Save).
@@ -58,6 +88,7 @@ export function GlobalSection({
   onRename,
   onResumeChange,
   showRename = true,
+  identity,
 }: GlobalSectionProps) {
   const [name, setName] = useState(projectName);
   const [saving, setSaving] = useState(false);
@@ -141,11 +172,20 @@ export function GlobalSection({
         </form>
       )}
 
+      {/* Identity — the pane's dominant object, under the name and above the toggle (the order
+          arbitrated on the round-3 prototype). */}
+      <ProjectIdentity
+        projectId={projectId}
+        projectName={projectName}
+        accent={identity.accent}
+        icon={identity.icon}
+        imagePath={identity.imagePath}
+        onAccentChange={identity.onAccentChange}
+        onMarkChange={identity.onMarkChange}
+      />
+
       {/* Resume agent sessions */}
-      <label
-        htmlFor="resume-agent-sessions"
-        className={cn("flex items-start justify-between gap-3", showRename && "mt-5")}
-      >
+      <label htmlFor="resume-agent-sessions" className="mt-5 flex items-start justify-between gap-3">
         <span className="flex flex-col gap-0.5">
           <span className="text-sm font-medium text-foreground">Resume agent sessions</span>
           <span className="text-xs text-muted-foreground">

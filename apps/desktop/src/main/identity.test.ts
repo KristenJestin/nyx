@@ -22,11 +22,15 @@ import {
   type IdentityApp,
   V1_USERDATA_DIR_NAME,
 } from "./identity";
+import { electronStub } from "./test-electron-stub";
 
 // Stub `electron` so importing `sidecar.ts` (which `import`s `app`) does not need the real
 // runtime — the test only exercises the PURE `resolveDataDirFrom`, which takes its inputs
-// explicitly (never reads the real `app`).
-mock.module("electron", () => ({ app: { getPath: () => "/should/not/be/read" } }));
+// explicitly (never reads the real `app`; the stub's `getPath` answers `/should/not/be/read`).
+// The stub is SHARED with the other specs of this folder on purpose: `mock.module` is global to
+// the test process and last-write-wins, so a narrower one declared here would win over theirs
+// whenever `bun test src/main` runs the folder in one process, and break them.
+mock.module("electron", () => electronStub);
 const { resolveDataDirFrom } = await import("./sidecar");
 
 /** An in-memory fake of the slice of Electron's `app` the identity logic drives. Records the

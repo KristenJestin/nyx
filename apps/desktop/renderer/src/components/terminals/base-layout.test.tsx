@@ -660,6 +660,137 @@ describe("BaseLayout — project settings entry point (resume toggle)", () => {
 });
 
 /**
+ * THE IDENTITY BLOCK, END TO END — the Global pane's dressing gestures, from the press to the
+ * command on the bridge and back to the rail tile.
+ *
+ * This is where "persists immediately AND repaints without a reload" is actually proven: the
+ * `<ProjectIdentity>` unit file asserts the callbacks, this one asserts what those callbacks reach
+ * (`set_project_accent` / `set_project_mark`, the very writes the MCP tool uses) and what the rail
+ * does about it (the optimistic tree update in `useProjects`). The rail tile node is captured
+ * BEFORE the modal opens, because the dialog hides the rest of the tree from the role queries
+ * while it is up — the node itself stays mounted, which is the whole point.
+ */
+describe("BaseLayout — project identity (accent, glyph, picture)", () => {
+  function installIdentityBackend(calls: { cmd: string; args: Record<string, unknown> }[]): void {
+    mockIPC((cmd, args) => {
+      const a = (args ?? {}) as Record<string, unknown>;
+      calls.push({ cmd, args: a });
+      switch (cmd) {
+        case "list_projects":
+          return [project("p1", "Alpha")];
+        case "list_workspaces":
+          return [root(`ws-${a.projectId as string}`, a.projectId as string)];
+        case "workspace_runtime_snapshot":
+          return {
+            workspace: { id: a.workspaceId as string, name: "root", path: "/x" },
+            terminals: [],
+            agent_sessions: [],
+            services: [],
+          };
+        case "agent_active_sessions":
+        case "agent_activity_snapshot":
+          return [];
+        default:
+          return undefined;
+      }
+    });
+  }
+
+  /** Open Global on Alpha and hand back the rail tile's mark node (captured before the modal). */
+  async function openIdentity(): Promise<HTMLElement> {
+    const tile = await screen.findByRole("button", { name: "Project Alpha" });
+    const mark = tile.querySelector("span") as HTMLElement;
+    fireEvent.contextMenu(tile);
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Project settings for Alpha" }));
+    await screen.findByRole("group", { name: "Accent" });
+    return mark;
+  }
+
+  it("an accent, then a glyph, then a picture — each persists at once and repaints the rail", async () => {
+    const calls: { cmd: string; args: Record<string, unknown> }[] = [];
+    installIdentityBackend(calls);
+    renderLayout();
+    const mark = await openIdentity();
+    // Undressed: the initial on the neutral tile — what every project looked like before.
+    expect(mark).toHaveTextContent("A");
+    expect(mark.className).toContain("bg-muted");
+
+    // ACCENT — the token NAME, never a pixel value, and the eraser is not `identity-0`.
+    fireEvent.click(screen.getByRole("button", { name: "Accent 3" }));
+    await waitFor(() => expect(calls.some((c) => c.cmd === "set_project_accent")).toBe(true));
+    expect(calls.find((c) => c.cmd === "set_project_accent")?.args).toEqual({
+      id: "p1",
+      accent: "identity-3",
+    });
+    // Repainted with no reload: the neutral tile classes are gone, the accent paints inline.
+    await waitFor(() => expect(mark.className).not.toContain("bg-muted"));
+
+    // GLYPH — one write, and it is the one that also clears the picture column.
+    fireEvent.click(screen.getByRole("button", { name: "Rocket" }));
+    await waitFor(() => expect(calls.some((c) => c.cmd === "set_project_mark")).toBe(true));
+    expect(calls.find((c) => c.cmd === "set_project_mark")?.args).toEqual({
+      id: "p1",
+      icon: "rocket",
+    });
+    await waitFor(() => expect(mark.querySelector("svg")).not.toBeNull());
+
+    // PICTURE — the COPY's path is what is written, and adopting it drops the glyph in the same
+    // write (icon/image are ONE slot, in two spellings).
+    bridgeFake().pickedProjectImage = "/data/project-icons/p1.png";
+    fireEvent.click(screen.getByRole("button", { name: "Choose image…" }));
+    await waitFor(() =>
+      expect(calls.filter((c) => c.cmd === "set_project_mark")).toHaveLength(2),
+    );
+    expect(calls.filter((c) => c.cmd === "set_project_mark")[1]?.args).toEqual({
+      id: "p1",
+      image: "/data/project-icons/p1.png",
+    });
+    await waitFor(() => expect(mark.querySelector("img")).not.toBeNull());
+    // …and the glyph is no longer worn, on screen as in the database.
+    expect(screen.getByRole("button", { name: "Rocket" })).toHaveAttribute("aria-pressed", "false");
+
+    // REMOVAL — the three fields at once, and the copied file goes with the reference.
+    fireEvent.click(screen.getByRole("button", { name: /remove identity/i }));
+    await waitFor(() =>
+      expect(calls.filter((c) => c.cmd === "set_project_mark")).toHaveLength(3),
+    );
+    expect(calls.filter((c) => c.cmd === "set_project_mark")[2]?.args).toEqual({
+      id: "p1",
+      icon: null,
+    });
+    await waitFor(() =>
+      expect(calls.filter((c) => c.cmd === "set_project_accent")).toHaveLength(2),
+    );
+    expect(calls.filter((c) => c.cmd === "set_project_accent")[1]?.args).toEqual({
+      id: "p1",
+      accent: null,
+    });
+    expect(bridgeFake().discardedProjectImages).toContain("p1");
+    // Back to the initial on the neutral tile.
+    await waitFor(() => expect(mark.className).toContain("bg-muted"));
+    expect(mark).toHaveTextContent("A");
+  });
+
+  it("a REFUSED picture says so in line and writes nothing", async () => {
+    const calls: { cmd: string; args: Record<string, unknown> }[] = [];
+    installIdentityBackend(calls);
+    renderLayout();
+    await openIdentity();
+
+    bridgeFake().projectImageRefusal =
+      "A project picture must stay under 2 MB — hero-banner.png is 4.7 MB.";
+    fireEvent.click(screen.getByRole("button", { name: "Choose image…" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "A project picture must stay under 2 MB — hero-banner.png is 4.7 MB.",
+      ),
+    );
+    expect(calls.some((c) => c.cmd === "set_project_mark")).toBe(false);
+  });
+});
+
+/**
  * The project CRUD rebranched onto the rail (PRD-B) — reached via the tile's RIGHT-CLICK context
  * menu (v2.5.6 finding #24: the ⋮ kebab trigger was removed, right-click is the sole entry point).
  * It drives project RENAME (via the project-settings modal → `update_project`), DELETE project

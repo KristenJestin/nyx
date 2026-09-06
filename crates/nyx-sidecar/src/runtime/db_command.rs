@@ -1133,6 +1133,70 @@ impl Ctx<'_> {
                     .map_err(Self::db_err)?;
                 Ok("null".to_string())
             }
+            // THE HUMAN'S HALF OF THE PROJECT'S VISUAL IDENTITY. Both arms call the very writes
+            // the MCP tool `set_project_settings` calls (`db::set_project_accent` /
+            // `db::set_project_mark`), so the agent surface and the UI surface converge on ONE
+            // code path — there is no second way to dress a project.
+            //
+            // `accent` is REQUIRED and NULLABLE (`{ id, accent: string | null }`) — this command
+            // does one thing, so "say nothing" is not one of its states: an explicit `null`
+            // CLEARS, a string sets, and an ABSENT key is a malformed call rather than a silent
+            // erase. Read through `arg_tristate` so `null` and "missing" stay distinguishable at
+            // all (`arg_opt_str` folds them into one and would turn a typo into a wipe).
+            //
+            // The absence of an accent has exactly ONE spelling in the database — `NULL` — so the
+            // picker's first swatch ERASES, it does not write `identity-0` (that token is the
+            // render-side neutral, never a stored value). `db::set_project_accent` normalises a
+            // blank string to `NULL` too, the same reflex `worktrees_root` gets.
+            //
+            // The core stays OPAQUE about what the string means: it stores `identity-3` exactly
+            // as it would store `#4f46e5`, and the renderer resolves it against the design system
+            // (ADR-0012).
+            "set_project_accent" => {
+                let id = self.arg_str("id")?;
+                let accent = self
+                    .arg_tristate("accent", |v| v.as_str().map(|s| s.to_string()))?
+                    .ok_or_else(|| {
+                        format!("{}: missing string|null arg 'accent'", self.command)
+                    })?;
+                self.db()
+                    .with_conn(|c| db::set_project_accent(c, &id, accent.as_deref()))
+                    .map_err(Self::db_err)?;
+                Ok("null".to_string())
+            }
+            // The MARK is ONE slot in two spellings, and the exclusion is STRUCTURAL: it is held
+            // by the `projects` CHECK and by `db::set_project_mark` (which writes BOTH columns, so
+            // setting one always clears the other), never by a convention on this side. What this
+            // arm adds is the refusal of an IMPOSSIBLE request — `icon` AND `image` both supplied
+            // — with the exact sentence `set_project_settings` uses, so the two surfaces refuse
+            // the same call the same way rather than each picking an arbitrary winner.
+            //
+            // `null` on either key clears the mark entirely (both columns), which puts the
+            // project back on its initial. Neither key present is a no-op, exactly as on the MCP
+            // side: this arm never guesses that "nothing said" means "erase".
+            "set_project_mark" => {
+                let id = self.arg_str("id")?;
+                let icon = self.arg_tristate("icon", |v| v.as_str().map(|s| s.to_string()))?;
+                let image = self.arg_tristate("image", |v| v.as_str().map(|s| s.to_string()))?;
+                if matches!(icon, Some(Some(_))) && matches!(image, Some(Some(_))) {
+                    return Err(format!(
+                        "{}: a project carries an 'icon' OR an 'image', never both — pass one of them",
+                        self.command
+                    ));
+                }
+                let mark = match (icon, image) {
+                    (Some(Some(icon)), _) => Some(Some(db::ProjectMark::Icon(icon))),
+                    (_, Some(Some(image))) => Some(Some(db::ProjectMark::Image(image))),
+                    (Some(None), _) | (_, Some(None)) => Some(None),
+                    (None, None) => None,
+                };
+                if let Some(mark) = mark {
+                    self.db()
+                        .with_conn(|c| db::set_project_mark(c, &id, mark.as_ref()))
+                        .map_err(Self::db_err)?;
+                }
+                Ok("null".to_string())
+            }
             // v2.5.5 LAZY agent-session resume: PARK the `claude --resume <id>` commands the
             // renderer read from `workspace_restore_plan` (`{ parks: [{ terminalId, sessionId,
             // command }] }`) into the runtime's `ResumeParks`, keyed by terminal RECORD id. Each is
@@ -4391,8 +4455,22 @@ fn mutates_workspace_tree(command: &str) -> bool {
 /// `projects_reorder` is a pure ordering write (no use case, no domain event). `delete_project`
 /// likewise has NO use case emitting a domain event (it calls `db::delete_project` directly),
 /// so its push stays on this legacy broadcast until it is migrated to a use case.
+///
+/// `set_project_accent` / `set_project_mark` are here for the SAME reason the MCP twin
+/// (`set_project_settings`) emits `ChangedTopic::Workspaces`: the identity a project wears is
+/// read from the project tree, and `useProjects` holds ONE tree PER HOOK INSTANCE (the rail's
+/// `BaseLayout`, `HomePage`, `TerminalsPage` … each have their own `useState`), synchronised
+/// only by this push. Without it the surface that WROTE repaints and every other one keeps the
+/// old mark until an unrelated tree mutation — the human presses a swatch in the rail's settings
+/// while standing on the home, and the home keeps the old colour.
+///
+/// No reconciliation loop: the subscribers to `workspaces://changed` are pure READERS
+/// (`loadProjectTrees` re-lists), none of them issues an identity write in response.
 fn pushes_workspace_tree_legacy(command: &str) -> bool {
-    matches!(command, "delete_project" | "projects_reorder")
+    matches!(
+        command,
+        "delete_project" | "projects_reorder" | "set_project_accent" | "set_project_mark"
+    )
 }
 
 /// THE NODE CONTRACT for the ONE node `proto_variant_set_node_params` just edited (finding
@@ -4565,6 +4643,188 @@ mod tests {
         }
     }
 
+    /// Create a project through the REAL dispatch and hand back its id — the shape the identity
+    /// specs below need, and nothing else.
+    fn a_project(h: &Harness, tag: &str) -> String {
+        let created = h
+            .run(
+                "create_project",
+                serde_json::json!({ "name": "Nyx", "rootPath": format!("/tmp/{tag}") }),
+            )
+            .expect("create the project");
+        let json: serde_json::Value = serde_json::from_str(&created).unwrap();
+        json["project"]["id"].as_str().unwrap().to_string()
+    }
+
+    /// Read a project back from the DB — the PERSISTED state, not the dispatch's return value
+    /// (both identity commands answer `null`, so the only honest assertion is the row).
+    fn stored(h: &Harness, id: &str) -> nyx_core::db::Project {
+        h.runtime
+            .db()
+            .with_conn(|c| nyx_core::db::get_project(c, id))
+            .expect("read the project")
+            .expect("the project exists")
+    }
+
+    /// THE HUMAN CAN NOW DRESS A PROJECT. `set_project_accent` is the UI's half of what the MCP
+    /// tool `set_project_settings` already did, over the same `db::set_project_accent` write.
+    ///
+    /// The two states that matter are SET and CLEARED, and the second is the one with a trap: the
+    /// absence of an accent has ONE spelling in the database (`NULL`), so the picker's first
+    /// swatch must ERASE rather than store `identity-0`. `--identity-0` is a render-side neutral;
+    /// a stored one would be a second spelling of "no choice" and every reader would have to know
+    /// about both.
+    #[test]
+    fn set_project_accent_stores_the_token_and_null_clears_it() {
+        let h = Harness::new();
+        let id = a_project(&h, "identity-accent");
+        assert_eq!(stored(&h, &id).accent, None, "a fresh project wears none");
+
+        h.run(
+            "set_project_accent",
+            serde_json::json!({ "id": id, "accent": "identity-3" }),
+        )
+        .expect("set the accent");
+        assert_eq!(stored(&h, &id).accent.as_deref(), Some("identity-3"));
+
+        // The NAME of the token is what is stored — the core never resolves it to a colour
+        // (ADR-0012), so a raw CSS colour from an agent lands just as literally.
+        h.run(
+            "set_project_accent",
+            serde_json::json!({ "id": id, "accent": "#4f46e5" }),
+        )
+        .unwrap();
+        assert_eq!(stored(&h, &id).accent.as_deref(), Some("#4f46e5"));
+
+        // `null` CLEARS — back to the neutral tile.
+        h.run(
+            "set_project_accent",
+            serde_json::json!({ "id": id, "accent": null }),
+        )
+        .expect("clear the accent");
+        assert_eq!(stored(&h, &id).accent, None);
+
+        // …and so does a blank string, which `db::set_project_accent` normalises: an empty accent
+        // and an unset accent are the SAME state for every reader.
+        h.run(
+            "set_project_accent",
+            serde_json::json!({ "id": id, "accent": "identity-5" }),
+        )
+        .unwrap();
+        h.run(
+            "set_project_accent",
+            serde_json::json!({ "id": id, "accent": "   " }),
+        )
+        .unwrap();
+        assert_eq!(stored(&h, &id).accent, None);
+
+        // A MISSING key is a malformed call, not a silent erase: this command does one thing, so
+        // "say nothing" is not one of its states.
+        h.run("set_project_accent", serde_json::json!({ "id": id }))
+            .expect_err("'accent' is required (nullable, but required)");
+    }
+
+    /// THE MARK IS ONE SLOT IN TWO SPELLINGS, and this test is the exclusion seen from the wire.
+    ///
+    /// It is NOT enforced here — `db::set_project_mark` writes BOTH columns whichever spelling
+    /// arrives, and the `projects` CHECK refuses a row carrying two — which is exactly why the
+    /// test asserts the OBSERVABLE consequence (setting one clears the other) rather than a guard
+    /// in this file. What this arm does own is the refusal of the IMPOSSIBLE request: `icon` AND
+    /// `image` together, refused with `set_project_settings`'s own sentence rather than resolved
+    /// by an arbitrary winner.
+    #[test]
+    fn set_project_mark_holds_the_icon_or_image_exclusion() {
+        let h = Harness::new();
+        let id = a_project(&h, "identity-mark");
+
+        h.run(
+            "set_project_mark",
+            serde_json::json!({ "id": id, "icon": "rocket" }),
+        )
+        .expect("set the icon");
+        let row = stored(&h, &id);
+        assert_eq!(row.icon.as_deref(), Some("rocket"));
+        assert_eq!(row.image_path, None);
+
+        // An IMAGE over an icon CLEARS the icon — the exclusion, from the wire.
+        h.run(
+            "set_project_mark",
+            serde_json::json!({ "id": id, "image": "D:/logo.png" }),
+        )
+        .expect("set the image");
+        let row = stored(&h, &id);
+        assert_eq!(row.image_path.as_deref(), Some("D:/logo.png"));
+        assert_eq!(row.icon, None, "an image replaces the glyph, it does not join it");
+
+        // …and an icon over an image clears the image, the other way round.
+        h.run(
+            "set_project_mark",
+            serde_json::json!({ "id": id, "icon": "flask" }),
+        )
+        .unwrap();
+        let row = stored(&h, &id);
+        assert_eq!(row.icon.as_deref(), Some("flask"));
+        assert_eq!(row.image_path, None);
+
+        // BOTH at once is a request nyx cannot honour — refused, with the MCP surface's wording,
+        // and the stored mark is left exactly as it was.
+        let err = h
+            .run(
+                "set_project_mark",
+                serde_json::json!({ "id": id, "icon": "box", "image": "D:/logo.png" }),
+            )
+            .expect_err("an icon AND an image is not a state a project can be in");
+        assert!(
+            err.contains("never both"),
+            "the refusal must say WHY, got: {err}"
+        );
+        assert_eq!(stored(&h, &id).icon.as_deref(), Some("flask"));
+
+        // `null` on EITHER key drops the mark entirely — back to the initial on its tile.
+        h.run(
+            "set_project_mark",
+            serde_json::json!({ "id": id, "icon": null }),
+        )
+        .expect("clear the mark");
+        let row = stored(&h, &id);
+        assert_eq!(row.icon, None);
+        assert_eq!(row.image_path, None);
+
+        h.run(
+            "set_project_mark",
+            serde_json::json!({ "id": id, "image": "D:/logo.png" }),
+        )
+        .unwrap();
+        h.run(
+            "set_project_mark",
+            serde_json::json!({ "id": id, "image": null }),
+        )
+        .unwrap();
+        let row = stored(&h, &id);
+        assert_eq!(row.icon, None);
+        assert_eq!(row.image_path, None);
+
+        // THE MARK AND THE ACCENT ARE INDEPENDENT HALVES: an image COVERS an accented tile, it
+        // does not erase the accent, and the accent comes back when the image goes.
+        h.run(
+            "set_project_accent",
+            serde_json::json!({ "id": id, "accent": "identity-7" }),
+        )
+        .unwrap();
+        h.run(
+            "set_project_mark",
+            serde_json::json!({ "id": id, "image": "D:/logo.png" }),
+        )
+        .unwrap();
+        assert_eq!(stored(&h, &id).accent.as_deref(), Some("identity-7"));
+        h.run(
+            "set_project_mark",
+            serde_json::json!({ "id": id, "image": null }),
+        )
+        .unwrap();
+        assert_eq!(stored(&h, &id).accent.as_deref(), Some("identity-7"));
+    }
+
     /// DONE-CRITERION (« Frontière de domaine : capacités autorisées du projet Système ») — the
     /// UI/IPC surface refuses the singleton for every capability it does not have, table-driven
     /// over the REAL dispatch (`Harness::run` drives the same `dispatch` the pipe loop does).
@@ -4600,6 +4860,13 @@ mod tests {
                 "set_project_resume_agent_sessions",
                 serde_json::json!({ "id": pid, "resume": true }),
             ),
+            // The visual identity is a project SETTING like the others: the singleton is a
+            // technical container the sidebar never renders, so it has no tile to dress.
+            (
+                "set_project_accent",
+                serde_json::json!({ "id": pid, "accent": "identity-3" }),
+            ),
+            ("set_project_mark", serde_json::json!({ "id": pid, "icon": "rocket" })),
             ("projects_reorder", serde_json::json!({ "ids": [pid] })),
             // workspace lifecycle + inventory
             ("list_workspaces", serde_json::json!({ "projectId": pid })),

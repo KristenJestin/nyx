@@ -5,7 +5,7 @@ import { cn } from "@/lib/utils";
 import { Dialog, DialogBackdrop, DialogCloseX, DialogPopup } from "@/components/ui/dialog";
 import { CommandsSection } from "@/components/command/commands-section";
 import { CategoriesSection } from "./categories-section";
-import { GlobalSection } from "./global-section";
+import { GlobalSection, type GlobalSectionIdentity } from "./global-section";
 
 /** Which detail pane of the project-settings modal is shown. */
 export type ProjectSettingsSection = "global" | "categories" | "commands";
@@ -48,6 +48,12 @@ export interface ProjectSettingsGlobalPane {
    * kebab CRUD); other callers keep the field via the default.
    */
   showRename?: boolean;
+  /**
+   * The project's VISUAL IDENTITY — the accent + mark block. Required alongside the rest of the
+   * pane: a project scope that wires Global wires all of it, and there is no other surface where
+   * a human can dress a project.
+   */
+  identity: GlobalSectionIdentity;
   /** Persist a project rename. */
   onRename: (name: string) => Promise<void>;
   /** Persist the resume-opt-in toggle. May return a promise so the section can toast the real
@@ -251,6 +257,7 @@ export function ProjectSettingsDialog({
                   onRename={globalSection.onRename}
                   onResumeChange={globalSection.onResumeChange}
                   showRename={globalSection.showRename}
+                  identity={globalSection.identity}
                 />
               </div>
             ) : activeSection === "categories" ? (

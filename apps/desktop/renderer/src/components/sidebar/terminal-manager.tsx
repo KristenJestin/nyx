@@ -147,6 +147,8 @@ export function TerminalManager() {
     createWorkspace,
     updateProject,
     setProjectResumeAgentSessions,
+    setProjectAccent,
+    setProjectMark,
     deleteProject,
     deleteWorkspace,
     reorderProjects,
@@ -726,6 +728,16 @@ export function TerminalManager() {
               onRename: (name) => (targetId ? updateProject(targetId, name) : Promise.resolve()),
               onResumeChange: (resume) =>
                 targetId ? setProjectResumeAgentSessions(targetId, resume) : Promise.resolve(),
+              // The identity block, read from the LIVE tree so the spine's mark repaints at once.
+              identity: {
+                accent: liveTree?.project.accent ?? null,
+                icon: liveTree?.project.icon ?? null,
+                imagePath: liveTree?.project.image_path ?? null,
+                onAccentChange: (accent) =>
+                  targetId ? setProjectAccent(targetId, accent) : Promise.resolve(),
+                onMarkChange: (mark) =>
+                  targetId ? setProjectMark(targetId, mark) : Promise.resolve(),
+              },
             }}
             onClose={() => {
               setProjectSettings(null);

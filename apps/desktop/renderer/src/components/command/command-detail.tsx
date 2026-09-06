@@ -218,7 +218,7 @@ export function CommandDetail({
                       className="font-medium text-[var(--group-tone)]"
                       style={
                         {
-                          "--group-tone": `var(--group-${position.group.color ?? 0})`,
+                          "--group-tone": `var(--identity-${position.group.color ?? 0})`,
                         } as CSSProperties
                       }
                     >

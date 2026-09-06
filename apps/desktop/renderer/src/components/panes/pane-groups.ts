@@ -65,14 +65,40 @@ import {
 } from "./pane-tree";
 
 /**
- * How many `--group-N` tokens exist — the ONE place the palette's size is written on this side.
+ * How many `--identity-N` colour tokens exist — the SIZE of the shared peer-identity palette, and
+ * the ONE place it is written on this side (`--identity-0`, the neutral, is not counted: it is the
+ * absence of a choice). ADR-0012.
  *
- * It is pinned to the CSS by `group-palette.test.ts` (which derives the token names from this very
- * constant) and to the backend by the Rust `the_palette_size_is_the_same_number_on_all_five_layers`
- * test (`crates/nyx-core/src/db.rs`, `mod tests`), which reads this line, the `--group-N` tokens in
- * `globals.css`, `COMMAND_GROUP_COLOR_MAX`, the `create_command_groups` `up.sql` CHECK, the
- * `manage_command_group` MCP schema and `CATEGORY_COLOR_TOKENS`, and refuses any disagreement.
- * Nothing may restate the number.
+ * NOT to be confused with {@link GROUP_COLOR_COUNT} — see the comment there, this is the whole
+ * point of having two constants.
+ */
+export const IDENTITY_COLOR_COUNT = 12;
+
+/**
+ * THE BOUND OF ONE CONSUMER — how many of the palette's colours a GROUP may choose from. It is NOT
+ * the size of the palette (that is {@link IDENTITY_COLOR_COUNT}, and it is larger): groups stop at
+ * six, projects take all twelve. Since ADR-0012 the two numbers are ALLOWED to differ, and they
+ * will only converge if somebody deliberately migrates command groups — which costs a SQL
+ * migration, a review of the group selector, and a product call on "does a group need twelve
+ * colours". Widening this constant alone paints `var(--identity-7)` on a value the write path then
+ * rejects: the colour shows, the save fails, and nothing says why.
+ *
+ * The number `6` lives in SIX places, on five layers, and nothing derives one from another across
+ * the language boundary — so tests ARE the derivation:
+ *
+ *  1. the `--group-0..6` aliases of `globals.css` (the palette itself is `--identity-0..12`);
+ *  2. this constant, from which the `GroupColor` union is derived;
+ *  3. `COMMAND_GROUP_COLOR_MAX` (`crates/nyx-core/src/db.rs`);
+ *  4. the `CHECK` of the `20260819140000_create_command_groups` migration;
+ *  5. the `color` bounds of the `manage_command_group` MCP schema;
+ *  6. `CATEGORY_COLOR_TOKENS` (`db.rs`), the same aliased palette spelled as token NAMES for the
+ *     category chips (PDR-0017) — and the reason the `--group-N` aliases are NOT dead CSS: they
+ *     have no `var(--group-N)` call site left, but those names reach the chips through this list.
+ *
+ * Pinned by `group-palette.test.ts` here and, on the Rust side, by
+ * `the_command_group_colour_bound_is_the_same_number_on_all_four_layers` — with
+ * `the_command_group_bound_never_exceeds_the_identity_palette` holding the invariant that ties the
+ * two numbers together. Nothing may restate either number.
  */
 export const GROUP_COLOR_COUNT = 6;
 
@@ -86,10 +112,10 @@ type OneToN<N extends number, Acc extends 0[] = [], Out = never> = Acc["length"]
   : OneToN<N, [...Acc, 0], Out | [...Acc, 0]["length"]>;
 
 /**
- * The colour a group may CHOOSE, as the 1-based index of a `--group-N` token. `null` — the
+ * The colour a group may CHOOSE, as the 1-based index of an `--identity-N` token. `null` — the
  * DEFAULT — is not a colour: it is the ABSENCE of a choice, painted with the design system's
- * existing neutral (`--group-0`, the value `--ring` carries in the dark theme). The tokens
- * themselves live in `globals.css` (the "CATEGORICAL GROUP PALETTE" block) and are pinned by
+ * existing neutral (`--identity-0`, the value `--ring` carries in the dark theme). The tokens
+ * themselves live in `globals.css` (the "CATEGORICAL IDENTITY PALETTE" block) and are pinned by
  * `group-palette.test.ts`.
  */
 export type GroupColor = OneToN<typeof GROUP_COLOR_COUNT>;

@@ -243,6 +243,28 @@ fn fixtures() -> Vec<(&'static str, Message)> {
                 args_json: "{}".into(),
             }),
         ),
+        // THE PROJECT-IDENTITY WRITES, on the wire. `DbCommand` carries its arguments as an
+        // OPAQUE JSON string, so what these two cases pin is not a new message kind but the fact
+        // that a payload with a NULL member and a payload with two string members survive the
+        // MessagePack round trip byte-for-byte on both sides — `accent: null` is the CLEAR
+        // gesture (the absence of an accent has one spelling, `NULL`), and it is exactly the
+        // shape a naive encoder is most likely to drop.
+        (
+            "req_db_command_set_project_accent",
+            Message::Request(Request::DbCommand {
+                id: 41,
+                command: "set_project_accent".into(),
+                args_json: "{\"id\":\"proj-1\",\"accent\":\"identity-3\"}".into(),
+            }),
+        ),
+        (
+            "req_db_command_set_project_mark_clear",
+            Message::Request(Request::DbCommand {
+                id: 42,
+                command: "set_project_mark".into(),
+                args_json: "{\"id\":\"proj-1\",\"icon\":null}".into(),
+            }),
+        ),
         (
             "res_db_result",
             Message::Response(Response::DbResult {

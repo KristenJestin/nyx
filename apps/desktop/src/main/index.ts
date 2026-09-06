@@ -19,6 +19,7 @@ import { app, BrowserWindow, shell } from "electron";
 
 import { registerCoreIpc } from "./core-ipc";
 import { applyAppIdentity } from "./identity";
+import { registerProjectImageScheme, serveProjectImages } from "./project-image-protocol";
 import { handleBeforeQuit } from "./quit-guard";
 import { Sidecar } from "./sidecar";
 import { applyWaylandFlags } from "./wayland";
@@ -37,6 +38,14 @@ console.log(`[main] app identity pinned: name=${app.getName()} userData=${userDa
 // --- Pre-ready: command-line flags ------------------------------------------
 // Wayland/HiDPI switches must be appended before the app initializes Chromium.
 applyWaylandFlags(app);
+
+// --- Pre-ready: the project-picture scheme -----------------------------------
+// `nyx-image://project-icons/<copy>` — how the renderer draws a project's picture in BOTH modes.
+// It has to be declared here, before Chromium initialises, or Blink never issues the request: a
+// dev renderer sits at `http://localhost` and a packaged one at `file://`, and neither may load a
+// `file://` subresource from the other's origin. The handler is installed on ready, below; the
+// rules it enforces live in `project-image.ts`. See `project-image-protocol.ts` for the why.
+registerProjectImageScheme();
 
 // --- Single instance ---------------------------------------------------------
 // One nyx per user session: a second launch must focus the running window, not
@@ -105,6 +114,9 @@ if (!gotTheLock) {
 
   void app.whenReady().then(() => {
     registerWindowIpc();
+    // Serve the adopted pictures on the scheme declared above. AFTER ready (`protocol.handle`
+    // needs a session) and BEFORE the window, so the very first paint can already draw a mark.
+    serveProjectImages();
     // The renderer↔sidecar relay (invoke/ack + sidecar-event push). Events are pushed to
     // the CURRENT main window (resolved at emit time so a window recreated on macOS
     // `activate` still receives them).

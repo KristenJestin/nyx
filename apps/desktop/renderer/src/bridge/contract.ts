@@ -902,6 +902,32 @@ export interface NyxBridge {
    *  cancelled. Single selection, directories only. */
   pickDirectory(title?: string): Promise<string | null>;
 
+  // --- The project picture (identity) -------------------------------------
+  /**
+   * Open the OS picture picker for `projectId`, COPY the chosen file into the app's
+   * own data dir and resolve the COPY's absolute path — the value that goes into
+   * `projects.image_path` via `set_project_mark`. The original is never referenced:
+   * moving or deleting it later cannot blank the project's tile.
+   *
+   * `null` = the user cancelled. A REFUSAL (unsupported extension, over the size
+   * bound) REJECTS with a readable message — the caller toasts it, and the two
+   * outcomes stay distinguishable.
+   */
+  pickProjectImage(projectId: string): Promise<string | null>;
+  /** Delete `projectId`'s copied picture. Called when the identity is removed — the
+   *  file does not survive the gesture that dereferences it. Never throws. */
+  discardProjectImage(projectId: string, keep?: string): Promise<void>;
+  /**
+   * Sweep the picture directory of every file belonging to no live project, and
+   * resolve how many were removed. THE NET, for a project deleted while nyx was
+   * closed or deleted by an agent.
+   *
+   * Call it ONLY after a SUCCESSFUL project list: an empty list is refused as a
+   * no-op on the other side, and those two guards together are what stop a boot that
+   * raced (or failed) the list from sweeping every picture the user ever chose.
+   */
+  pruneProjectImages(liveProjectIds: string[]): Promise<number>;
+
   // --- Paths --------------------------------------------------------------
   readonly paths: AppPathsBridge;
 }
@@ -1017,6 +1043,21 @@ export type BackendCommand =
   | "projects_reorder"
   | "set_project_collapsed"
   | "set_project_resume_agent_sessions"
+  // THE PROJECT'S VISUAL IDENTITY, written by a HUMAN. Both call the very writes the MCP tool
+  // `set_project_settings` calls, so the agent surface and the settings modal converge on one
+  // code path — nyx does not gain a second way to dress a project.
+  //
+  // `set_project_accent` — `{ id, accent: string | null }`. The value is the NAME of a palette
+  // token (`identity-3`, ADR-0012), which the backend stores opaquely and `<ProjectMark>`
+  // resolves; a raw CSS colour still works, for an agent that posts one. `accent` is REQUIRED and
+  // NULLABLE: `null` CLEARS, and clearing is the ONLY spelling of "no accent" (the picker's first
+  // swatch erases — it never stores `identity-0`, which is a render-side neutral).
+  | "set_project_accent"
+  // `set_project_mark` — `{ id, icon?: string | null, image?: string | null }`. Icon and image are
+  // ONE slot in two spellings: supplying one CLEARS the other (the `projects` CHECK enforces the
+  // exclusion, not this contract), `null` on either drops the mark entirely, and supplying both
+  // is refused rather than resolved by an arbitrary winner.
+  | "set_project_mark"
   | "list_workspaces"
   | "create_workspace"
   | "rename_workspace"

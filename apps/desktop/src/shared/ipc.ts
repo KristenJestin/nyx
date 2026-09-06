@@ -66,6 +66,36 @@ export const WINDOW_CHANNELS = {
    * (`app.getPath('home')`), mirroring the Tauri `@tauri-apps/api/path` `homeDir`.
    */
   homeDir: "nyx:window/home-dir",
+  /**
+   * Open the OS picture picker for a project's mark, COPY the chosen file into
+   * `userData/project-icons/<projectId>~<revision>.<ext>` and resolve the copy's
+   * absolute path (or `null` if cancelled). A refusal — unsupported extension,
+   * oversized file — REJECTS with a readable sentence, which distinguishes it from a
+   * cancel.
+   *
+   * The copy is the point: `projects.image_path` references a file nyx owns, so
+   * moving or deleting the original cannot blank a project's tile later.
+   *
+   * EVERY CALL RESOLVES A PATH NOBODY HAS SEEN BEFORE — that is what the revision is
+   * for. The renderer stores what it gets back and draws it; a path that repeated
+   * itself would repaint nothing and would leave a mark that had recorded the previous
+   * one as unloadable stuck on its fallback (see `project-image.ts`).
+   */
+  pickProjectImage: "nyx:window/pick-project-image",
+  /**
+   * Drop a project's copied picture. Called when the human REMOVES the identity — the
+   * file does not survive the gesture that dereferences it.
+   */
+  discardProjectImage: "nyx:window/discard-project-image",
+  /**
+   * Sweep `project-icons/` of every file belonging to no live project — the net that
+   * catches a project deleted while nyx was closed, or deleted by an agent (which has
+   * no business knowing about the disk).
+   *
+   * An EMPTY list is an explicit NO-OP, never a total sweep: "there are no projects"
+   * and "the list has not loaded" are indistinguishable here.
+   */
+  pruneProjectImages: "nyx:window/prune-project-images",
 } as const;
 
 /** Union of every allowlisted window channel string. */
@@ -151,6 +181,21 @@ export interface NyxWindowApi {
   pickDirectory(title?: string): Promise<string | null>;
   /** Resolve the user's home directory, or `null`. */
   homeDir(): Promise<string | null>;
+  /**
+   * Open the OS picture picker for `projectId`, copy the chosen file into the app's
+   * data dir and resolve the COPY's absolute path — the value that goes into
+   * `projects.image_path`. `null` when cancelled; REJECTS with a readable sentence
+   * when the file is refused (extension / size).
+   */
+  pickProjectImage(projectId: string): Promise<string | null>;
+  /** Drop `projectId`'s copied picture (the human removed the identity). */
+  discardProjectImage(projectId: string, keep?: string): Promise<void>;
+  /**
+   * Sweep the picture directory of everything belonging to no live project, and
+   * resolve how many files were removed. An EMPTY list is a no-op, never a total
+   * sweep — call it only after a SUCCESSFUL project list.
+   */
+  pruneProjectImages(liveProjectIds: string[]): Promise<number>;
 }
 
 declare global {

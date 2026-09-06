@@ -486,7 +486,7 @@ describe("The head is the same object on BOTH surfaces", () => {
     expect(block(), "the block is still drawn").toBeTruthy();
     // The representation is untouched: the tint token, the head's label state.
     expect(block().dataset.groupColor).toBe("none");
-    expect(block().getAttribute("style")).toContain("var(--group-0)");
+    expect(block().getAttribute("style")).toContain("var(--identity-0)");
     expect(
       (container.querySelector("[data-group-head='cg1']") as HTMLElement).dataset.groupHeadLabel,
     ).toBe("unnamed");

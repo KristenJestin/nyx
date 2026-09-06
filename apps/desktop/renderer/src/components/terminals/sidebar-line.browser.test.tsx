@@ -467,7 +467,7 @@ it("…and the folder keeps its full pointer target, its cursor and its toggle r
  * davantage ».
  *
  * WHAT THE MEASUREMENT SAYS, and it is not quite what the mockup predicted. On the DEFAULT grey
- * (`--group-0`) in the light theme those two layers land on the same value: `muted` at 60 % over
+ * (`--identity-0`) in the light theme those two layers land on the same value: `muted` at 60 % over
  * white and 7 % of the neutral over white are within a pixel level of each other, so compositing
  * one over the other changes nothing a screen can show. The extent of the group is still revealed —
  * hovering any member tints the whole block, which is the job — but "a member row reads lighter

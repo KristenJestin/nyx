@@ -40,6 +40,12 @@ const nyxWindow: NyxWindowApi = {
   pickDirectory: (title) =>
     ipcRenderer.invoke(WINDOW_CHANNELS.pickDirectory, title) as Promise<string | null>,
   homeDir: () => ipcRenderer.invoke(WINDOW_CHANNELS.homeDir) as Promise<string | null>,
+  pickProjectImage: (projectId) =>
+    ipcRenderer.invoke(WINDOW_CHANNELS.pickProjectImage, projectId) as Promise<string | null>,
+  discardProjectImage: (projectId, keep) =>
+    ipcRenderer.invoke(WINDOW_CHANNELS.discardProjectImage, projectId, keep) as Promise<void>,
+  pruneProjectImages: (liveProjectIds) =>
+    ipcRenderer.invoke(WINDOW_CHANNELS.pruneProjectImages, liveProjectIds) as Promise<number>,
 };
 
 /**

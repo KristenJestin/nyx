@@ -189,26 +189,72 @@
   --chart-3: oklch(0.439 0 0);
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
-  /* THE CATEGORICAL GROUP PALETTE — the tint a GROUP may carry, and nothing but a group.
-     TWO notions of group share it: terminal groups (arranged in the deck, persisted in the
-     renderer's localStorage) and COMMAND groups (`managed_command_groups`, persisted in SQLite,
-     whose `color` column is CHECKed to 1..=6 — the 1-based index of a `--group-N` token). They
-     have neither the same storage nor the same lifecycle; they share this vocabulary so a group
-     reads the same wherever it is drawn. Nothing OTHER than a group may take these tokens.
-     It had to be created: every semantic token is RESERVED (a red group would read as an error)
-     and `--chart-1..5` above are greyscale, so they cannot tell two groups apart. One lightness
-     and one chroma across the six — only the HUE varies — so no group ever looks more important
-     than another, and the chroma is HALF the least saturated semantic token so a group can never
-     be mistaken for an alert. Declared ONCE (not per theme): the tone is chosen to read on both.
-     `--group-0` is the DEFAULT — the design system's existing neutral, deliberately NOT a colour:
-     an uncoloured group is a delimited block, not a coloured one. */
-  --group-0: oklch(0.556 0 0);
-  --group-1: oklch(0.76 0.09 322);
-  --group-2: oklch(0.76 0.09 232);
-  --group-3: oklch(0.76 0.09 152);
-  --group-4: oklch(0.76 0.09 62);
-  --group-5: oklch(0.76 0.09 12);
-  --group-6: oklch(0.76 0.09 272);
+  /* THE CATEGORICAL IDENTITY PALETTE — the tint a PEER IDENTITY may carry.
+     NOTHING THAT IS NOT A PEER IDENTITY TAKES THESE TOKENS (ADR-0012, which replaced the earlier
+     wording "nothing other than a group"). A peer identity is what tells APART things that sit at
+     the SAME level, with no hierarchy between them: terminal groups (arranged in the deck,
+     persisted in the renderer's localStorage), COMMAND groups (`managed_command_groups`, persisted
+     in SQLite, whose `color` column is CHECKed to 1..=6 — the 1-based index of a token) and
+     PROJECTS (`projects.accent`, which stores the token NAME, e.g. `identity-3`). Three carriers,
+     three storages, three lifecycles — ONE vocabulary, so a peer reads the same wherever it is
+     drawn.
+     An identity is NEVER a STATE, never an ALERT, never a severity. That reserve is what the
+     palette is FOR: every semantic token is RESERVED (a red group would read as an error) and
+     `--chart-1..5` above are greyscale, so they cannot tell two peers apart. One lightness and one
+     chroma across the twelve — only the HUE varies — so no peer ever looks more important than
+     another, and the chroma is HALF the least saturated semantic token so a peer can never be
+     mistaken for an alert. Declared ONCE (not per theme): the tone is chosen to read on both.
+     `--identity-0` is the DEFAULT — the design system's existing neutral, deliberately NOT a
+     colour: an uncoloured peer is a delimited thing, not a coloured one. It is a RENDER-SIDE
+     neutral only; `projects.accent` spells the absence of a choice `NULL`, never `identity-0`.
+     1..6 are the six hues arbitrated on the mockups and they DO NOT MOVE by a single degree —
+     a group already coloured keeps exactly its colour. 7..12 were interleaved into the widest
+     gaps by ADR-0012 (37, 92, 122, 192, 297, 347) and are DECLARED out of order so that two
+     ADJACENT swatches in the picker row are never two adjacent hues (smallest consecutive step:
+     105°). Twelve is a CEILING, not a comfort — a thirteenth would need another dimension
+     (shape, glyph, pattern), not a tighter hue step.
+     The SIZE of this palette is NOT the BOUND of any one consumer: command groups stop at 6
+     (see `pane-groups.ts`), projects take all twelve. */
+  --identity-0: oklch(0.556 0 0);
+  --identity-1: oklch(0.76 0.09 322);
+  --identity-2: oklch(0.76 0.09 232);
+  --identity-3: oklch(0.76 0.09 152);
+  --identity-4: oklch(0.76 0.09 62);
+  --identity-5: oklch(0.76 0.09 12);
+  --identity-6: oklch(0.76 0.09 272);
+  --identity-7: oklch(0.76 0.09 37);
+  --identity-8: oklch(0.76 0.09 192);
+  --identity-9: oklch(0.76 0.09 297);
+  --identity-10: oklch(0.76 0.09 92);
+  --identity-11: oklch(0.76 0.09 347);
+  --identity-12: oklch(0.76 0.09 122);
+  /* THE `--group-N` ALIASES — the command-group / terminal-group view of the palette.
+     NO CALL SITE READS THEM ANY MORE. The four that did — `panes/group-block.tsx`,
+     `panes/group-swatches.tsx`, `command/command-group-detail.tsx`, `command/command-detail.tsx` —
+     were migrated to the `--identity-N` spelling with the rename, and no source refers to a
+     `--group-N` token today. They are NOT dead compatibility, and deleting them as such is the
+     mistake this paragraph exists to prevent: THIS BLOCK IS LAYER 1 OF THE COMMAND GROUPS' COLOUR
+     BOUND, and it is read as such, from both languages —
+       * `the_command_group_colour_bound_is_the_same_number_on_all_four_layers`
+         (`crates/nyx-core/src/db.rs`) COUNTS the aliases declared here and asserts the count
+         equals `COMMAND_GROUP_COLOR_MAX`, alongside the renderer constant, the live SQL CHECK and
+         the MCP schema — four layers that must say one number;
+       * `describe("the --group-N aliases stop at the command groups' bound")`
+         (`components/panes/group-palette.test.ts`) asserts each alias points at its identity token
+         and that no seventh is declared.
+     Remove the aliases and both go red, which is the intended outcome: the bound would then be
+     written on three layers with nothing holding the CSS to them.
+     THE ALIAS STOPS AT 6, on purpose and permanently: that is the command groups' BOUND (their SQL
+     CHECK is `1..=6`), not a truncated palette. Aliasing 7..12 would offer a group a colour its
+     own write path refuses — the colour shows, the save fails, and nothing says why. That is the
+     original bug this whole family of parity tests exists for. */
+  --group-0: var(--identity-0);
+  --group-1: var(--identity-1);
+  --group-2: var(--identity-2);
+  --group-3: var(--identity-3);
+  --group-4: var(--identity-4);
+  --group-5: var(--identity-5);
+  --group-6: var(--identity-6);
   --radius: 0.625rem;
   --sidebar: oklch(0.985 0 0);
   --sidebar-foreground: oklch(0.145 0 0);

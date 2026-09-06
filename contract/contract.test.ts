@@ -178,6 +178,23 @@ const MESSAGES: Record<string, Message> = {
     command: "list_terminals",
     argsJson: "{}",
   },
+  // The project-identity writes. `argsJson` is an OPAQUE string on this transport, so these two
+  // pin the round trip of the payloads the identity picker really sends — a token accent, and a
+  // NULL member (the clear gesture), which is the shape an encoder is most likely to drop.
+  req_db_command_set_project_accent: {
+    category: "request",
+    kind: "db_command",
+    id: 41,
+    command: "set_project_accent",
+    argsJson: '{"id":"proj-1","accent":"identity-3"}',
+  },
+  req_db_command_set_project_mark_clear: {
+    category: "request",
+    kind: "db_command",
+    id: 42,
+    command: "set_project_mark",
+    argsJson: '{"id":"proj-1","icon":null}',
+  },
   res_db_result: { category: "response", kind: "db_result", id: 40, resultJson: "[]" },
 };
 

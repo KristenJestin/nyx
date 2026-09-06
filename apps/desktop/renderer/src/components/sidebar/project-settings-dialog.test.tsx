@@ -51,6 +51,15 @@ function baseProps() {
       resumeAgentSessions: false,
       onRename: vi.fn(async () => {}),
       onResumeChange: vi.fn(),
+      // The identity block's wiring — an undressed project. Its own behaviour is covered by
+      // `project-identity.test.tsx`; here it only has to exist, since the pane requires it.
+      identity: {
+        accent: null as string | null,
+        icon: null as string | null,
+        imagePath: null as string | null,
+        onAccentChange: vi.fn(),
+        onMarkChange: vi.fn(),
+      },
     },
     onClose: vi.fn(),
   };

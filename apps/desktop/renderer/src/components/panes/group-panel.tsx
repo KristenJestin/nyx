@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogBackdrop, DialogPopup } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { MicroLabel } from "@/components/ui/tree-primitives";
-import { GroupSwatches } from "./group-swatches";
+import { GROUP_OPTIONS, GroupSwatches } from "./group-swatches";
 import type { GroupColor, PaneGroup } from "./pane-groups";
 
 /**
@@ -15,7 +15,7 @@ import type { GroupColor, PaneGroup } from "./pane-groups";
  *  - NOTHING IS ASKED AT CREATION. A group is born from a split, grey and nameless, and stays
  *    usable that way indefinitely. This panel never opens by itself.
  *  - NAME AND COLOUR ARE INDEPENDENT: name without colouring, colour without naming, or both.
- *  - THE FIRST SWATCH IS NOT A COLOUR. It is the ABSENCE of a choice — the neutral `--group-0` —
+ *  - THE FIRST SWATCH IS NOT A COLOUR. It is the ABSENCE of a choice — the neutral `--identity-0` —
  *    and it is what a fresh group has selected when the panel opens.
  *  - CLEARING KEEPS THE GROUP. Emptying the field removes the name; taking the first swatch back
  *    removes the colour. Neither conditions the group's existence.
@@ -119,7 +119,11 @@ export function GroupPanel({
             {/* THE SHARED SWATCH ROW (`group-swatches.tsx`) — the neutral-first rule and the
                 "a no-op is not emitted" rule live in it, so this panel and the commands modal's
                 folder detail cannot answer "which colours does a group have" differently. */}
-            <GroupSwatches value={group.color} onSelect={(color) => onRecolor(group.id, color)} />
+            <GroupSwatches
+              options={GROUP_OPTIONS}
+              value={group.color}
+              onSelect={(color) => onRecolor(group.id, color)}
+            />
           </div>
 
           {/* THE TWO EXITS, AND THEY ARE NOT THE SAME ONE (human review 01M1312M70TP8TJWT4TG505S0J).

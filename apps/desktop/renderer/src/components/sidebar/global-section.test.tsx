@@ -11,7 +11,19 @@ const toastMock = vi.hoisted(() => ({
 }));
 vi.mock("@/components/ui/toast", () => ({ toast: toastMock }));
 
-import { GlobalSection } from "./global-section";
+import { GlobalSection, type GlobalSectionIdentity } from "./global-section";
+
+/** An undressed project's identity wiring — this file covers the pane's TOAST wiring; the identity
+ *  block's own behaviour is covered by `project-identity.test.tsx`. */
+function identityProps(): GlobalSectionIdentity {
+  return {
+    accent: null,
+    icon: null,
+    imagePath: null,
+    onAccentChange: vi.fn(),
+    onMarkChange: vi.fn(),
+  };
+}
 
 /**
  * Coverage for the toast wiring of the project-settings Global pane: a successful
@@ -34,6 +46,7 @@ describe("<GlobalSection> toast wiring — rename", () => {
         projectId="p1"
         projectName="Old"
         resumeAgentSessions={false}
+        identity={identityProps()}
         onRename={onRename}
         onResumeChange={vi.fn()}
       />,
@@ -57,6 +70,7 @@ describe("<GlobalSection> toast wiring — rename", () => {
         projectId="p1"
         projectName="Old"
         resumeAgentSessions={false}
+        identity={identityProps()}
         onRename={onRename}
         onResumeChange={vi.fn()}
       />,
@@ -82,6 +96,7 @@ describe("<GlobalSection> toast wiring — resume toggle", () => {
         projectId="p1"
         projectName="P"
         resumeAgentSessions={false}
+        identity={identityProps()}
         onRename={vi.fn().mockResolvedValue(undefined)}
         onResumeChange={onResumeChange}
       />,
@@ -102,6 +117,7 @@ describe("<GlobalSection> toast wiring — resume toggle", () => {
         projectId="p1"
         projectName="P"
         resumeAgentSessions={false}
+        identity={identityProps()}
         onRename={vi.fn().mockResolvedValue(undefined)}
         onResumeChange={onResumeChange}
       />,
@@ -120,6 +136,7 @@ describe("<GlobalSection> — showRename", () => {
         projectId="p1"
         projectName="P"
         resumeAgentSessions={false}
+        identity={identityProps()}
         onRename={vi.fn().mockResolvedValue(undefined)}
         onResumeChange={vi.fn()}
       />,
@@ -135,6 +152,7 @@ describe("<GlobalSection> — showRename", () => {
         projectId="p1"
         projectName="P"
         resumeAgentSessions={false}
+        identity={identityProps()}
         onRename={vi.fn().mockResolvedValue(undefined)}
         onResumeChange={onResumeChange}
         showRename={false}

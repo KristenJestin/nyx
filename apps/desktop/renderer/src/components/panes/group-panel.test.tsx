@@ -84,7 +84,7 @@ describe("GroupPanel — what it opens with", () => {
       "5",
       "6",
     ]);
-    expect(swatches[0].getAttribute("style")).toContain("var(--group-0)");
+    expect(swatches[0].getAttribute("style")).toContain("var(--identity-0)");
   });
 
   it("shows what the group ALREADY has, so the user edits from what they see", () => {

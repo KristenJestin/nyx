@@ -7,10 +7,10 @@
  *
  *   1. window is created and FRAMELESS (no native frame);
  *   2. renderer has NO Node integration (`require`/`process`/`module` undefined);
- *   3. the ONLY injected global is `window.nyxWindow`, exposing EXACTLY the eight
- *      allowlisted methods (close, confirmClose, controlsVisible, homeDir, minimize,
- *      onCloseRequested, pickDirectory, toggleMaximize) — no `ipcRenderer`, no extra
- *      channels;
+ *   3. the ONLY injected global is `window.nyxWindow`, exposing EXACTLY the eleven
+ *      allowlisted methods (close, confirmClose, controlsVisible, discardProjectImage,
+ *      homeDir, minimize, onCloseRequested, pickDirectory, pickProjectImage,
+ *      pruneProjectImages, toggleMaximize) — no `ipcRenderer`, no extra channels;
  *   4. the allowlisted IPC actually round-trips (`controlsVisible()` returns a bool;
  *      `toggleMaximize()` flips `isMaximized()`).
  *
@@ -92,14 +92,22 @@ app.whenReady().then(async () => {
   // (3) only the allowlisted bridge, exact methods, no ipcRenderer
   if (report.hasIpcRenderer) return fail("ipcRenderer leaked into the renderer");
   if (report.bridge !== "object") return fail(`window.nyxWindow missing (typeof=${report.bridge})`);
-  // The allowlisted window-control surface: the frameless chrome controls; the two
-  // MAIN-process resolvers the contract routes through the window bridge (`pickDirectory`
-  // — the native folder picker — and `homeDir` — `AppPathsBridge.homeDir`); and the
-  // close-guard pair (`onCloseRequested` — the OS close-requested push the agent
-  // close-warning subscribes to — and `confirmClose` — proceed with the real close).
+  // The allowlisted window-control surface: the frameless chrome controls (`minimize`,
+  // `toggleMaximize`, `close`, `controlsVisible`); the two MAIN-process resolvers the
+  // contract routes through the window bridge (`pickDirectory` — the native folder picker
+  // — and `homeDir` — `AppPathsBridge.homeDir`); the close-guard pair (`onCloseRequested`
+  // — the OS close-requested push the agent close-warning subscribes to — and
+  // `confirmClose` — proceed with the real close); and the PROJECT PICTURE trio, which is
+  // on this bridge for the same reason as `pickDirectory` — the native dialog and the
+  // filesystem are main-process concerns the sandboxed renderer cannot reach:
+  // `pickProjectImage` (open the picker, then COPY the chosen file into the app's own data
+  // dir and hand back the copy's path), `discardProjectImage` (drop a project's copy when
+  // its picture is cleared), and `pruneProjectImages` (the boot sweep that deletes copies
+  // whose project is gone). Growing this list is exactly the event this smoke exists to
+  // catch: adding a channel to the preload without widening the line below fails here.
   // Sorted (Object.keys order) for a stable assertion.
   const expected =
-    "close,confirmClose,controlsVisible,homeDir,minimize,onCloseRequested,pickDirectory,toggleMaximize";
+    "close,confirmClose,controlsVisible,discardProjectImage,homeDir,minimize,onCloseRequested,pickDirectory,pickProjectImage,pruneProjectImages,toggleMaximize";
   if (report.keys !== expected) return fail(`nyxWindow keys = "${report.keys}", expected "${expected}"`);
   console.log(`[smoke-window] allowlisted bridge exposes exactly [${expected}] ✓`);
 

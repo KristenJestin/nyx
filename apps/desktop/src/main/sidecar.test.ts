@@ -21,10 +21,15 @@
  */
 import { describe, expect, mock, test } from "bun:test";
 
+import { electronStub } from "./test-electron-stub";
+
 // Stub `electron` so importing `sidecar.ts` (which `import`s `app`) does not need the real
 // runtime — these tests exercise only the PURE derivation helpers, which take their inputs
-// explicitly and never read the real `app`.
-mock.module("electron", () => ({ app: { getPath: () => "/should/not/be/read" } }));
+// explicitly and never read the real `app` (the stub's `getPath` answers `/should/not/be/read`).
+// The stub is SHARED with the other specs of this folder on purpose: `mock.module` is global to
+// the test process and last-write-wins, so a narrower one declared here would win over theirs
+// whenever `bun test src/main` runs the folder in one process, and break them.
+mock.module("electron", () => electronStub);
 const { deriveSidecarBin, deriveResourceDir, sidecarExeName } = await import("./sidecar");
 
 describe("sidecarExeName picks the per-OS executable name", () => {

@@ -31,6 +31,8 @@
     "smoke:data-dir": "bun test src/main/identity.test.ts",
     "smoke:sidecar-derivation": "bun test src/main/sidecar.test.ts",
     "smoke:quit-guard": "bun test src/main/quit-guard.test.ts",
+    "smoke:project-image": "bun test src/main/project-image.test.ts",
+    "smoke:window-ipc": "bun test src/main/window-ipc.test.ts",
     "smoke:dev-identity": "bun test scripts/dev-server-identity.test.ts",
     "install:linux": "node scripts/install-linux.cjs"
   },

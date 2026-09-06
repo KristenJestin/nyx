@@ -592,7 +592,7 @@ describe("CommandCatalog — composition happens HERE, and it happens at the DRA
     const block = container.querySelector("[data-group-block]") as HTMLElement;
     expect(block).not.toBeNull();
     expect(block.dataset.groupColor).toBe("none");
-    expect(block.getAttribute("style")).toContain("var(--group-0)");
+    expect(block.getAttribute("style")).toContain("var(--identity-0)");
     // Exactly its members are inside it; the solo commands are not.
     const inside = Array.from(block.querySelectorAll("[data-command-row]")).map(
       (row) => (row as HTMLElement).dataset.commandRow,

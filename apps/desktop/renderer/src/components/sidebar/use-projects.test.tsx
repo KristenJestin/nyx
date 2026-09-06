@@ -1,5 +1,5 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
-import { mockIPC, emit } from "@/bridge/test-harness";
+import { bridgeFake, mockIPC, emit } from "@/bridge/test-harness";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { useProjects, type ProjectRecord, type WorkspaceRecord } from "./use-projects";
@@ -17,6 +17,9 @@ interface FakeBackend {
   setWorkspaceCollapsed: { id: string; collapsed: boolean }[];
   /** Every `projects_reorder` call's id sequence, in order received. */
   projectsReorder: string[][];
+  /** Every identity write, as the payload the bridge really put on the wire. */
+  setProjectAccent: { id: string; accent: string | null }[];
+  setProjectMark: Record<string, unknown>[];
 }
 
 function project(id: string, collapsed = false): ProjectRecord {
@@ -56,6 +59,8 @@ function installBackend(
     setProjectCollapsed: [],
     setWorkspaceCollapsed: [],
     projectsReorder: [],
+    setProjectAccent: [],
+    setProjectMark: [],
   };
 
   // `shouldMockEvents: true` makes `emit`/`listen` work in tests, so a test can fire
@@ -83,6 +88,27 @@ function installBackend(
           for (const list of Object.values(backend.workspaces)) {
             const row = list.find((w) => w.id === id);
             if (row) row.collapsed = collapsed;
+          }
+          return null;
+        }
+        case "set_project_accent": {
+          const id = a.id as string;
+          const accent = (a.accent as string | null) ?? null;
+          backend.setProjectAccent.push({ id, accent });
+          const row = backend.projects.find((p) => p.id === id);
+          if (row) row.accent = accent;
+          return null;
+        }
+        case "set_project_mark": {
+          // The payload is recorded VERBATIM, because which keys it carries is the
+          // contract: the backend refuses `icon` and `image` together.
+          backend.setProjectMark.push({ ...a });
+          const row = backend.projects.find((p) => p.id === (a.id as string));
+          if (row) {
+            // ONE slot, two spellings — mirror `db::set_project_mark`, which writes
+            // both columns whichever arrived.
+            row.icon = (a.icon as string | null) ?? null;
+            row.image_path = (a.image as string | null) ?? null;
           }
           return null;
         }
@@ -249,5 +275,125 @@ describe("useProjects live refresh on workspaces://changed (review 01KV9611923NK
       await emit("workspaces://changed");
     });
     await waitFor(() => expect(result.current.projects.map((t) => t.project.id)).toEqual(["p2"]));
+  });
+});
+
+describe("useProjects visual identity (accent + mark)", () => {
+  beforeEach(() => {
+    installBackend([], {});
+  });
+
+  it("setProjectAccent reflects the token on the tree AND persists it", async () => {
+    const backend = installBackend([project("p1")], { p1: [workspace("w1", "p1")] });
+    const { result } = renderHook(() => useProjects());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      await result.current.setProjectAccent("p1", "identity-3");
+    });
+    expect(result.current.projects[0].project.accent).toBe("identity-3");
+    expect(backend.setProjectAccent).toEqual([{ id: "p1", accent: "identity-3" }]);
+
+    // CLEARING IS `null`, never `identity-0`: the absence of an accent has one
+    // spelling, and `--identity-0` is a render-side neutral the UI must not store.
+    await act(async () => {
+      await result.current.setProjectAccent("p1", null);
+    });
+    expect(result.current.projects[0].project.accent).toBeNull();
+    expect(backend.setProjectAccent.at(-1)).toEqual({ id: "p1", accent: null });
+  });
+
+  it("setProjectMark keeps the icon/image exclusion on the tree, both ways", async () => {
+    const backend = installBackend([project("p1")], { p1: [workspace("w1", "p1")] });
+    const { result } = renderHook(() => useProjects());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      await result.current.setProjectMark("p1", { icon: "rocket" });
+    });
+    expect(result.current.projects[0].project.icon).toBe("rocket");
+    expect(result.current.projects[0].project.image_path).toBeNull();
+    // ONE key on the wire — the backend refuses a payload carrying both.
+    expect(backend.setProjectMark).toEqual([{ id: "p1", icon: "rocket" }]);
+
+    await act(async () => {
+      await result.current.setProjectMark("p1", { image: "/data/nyx-v2/project-icons/p1.png" });
+    });
+    // The optimistic reflection clears the glyph too, rather than showing a state the
+    // backend CHECK says cannot exist for the frame before the re-list.
+    expect(result.current.projects[0].project.icon).toBeNull();
+    expect(result.current.projects[0].project.image_path).toBe("/data/nyx-v2/project-icons/p1.png");
+  });
+
+  it("removing the mark drops the COPIED picture — the file does not outlive the reference", async () => {
+    installBackend([project("p1")], { p1: [workspace("w1", "p1")] });
+    const { result } = renderHook(() => useProjects());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      await result.current.setProjectMark("p1", { image: "/data/nyx-v2/project-icons/p1.png" });
+    });
+    // Adopting a picture ALSO reclaims — of the previous copy, never of the one just persisted.
+    // The main process deliberately leaves the old file behind so a refused write cannot strand
+    // the row on something already deleted; this is the second half, and it runs only now that
+    // the write has landed.
+    expect(bridgeFake().discardedProjectImages).toEqual(["p1"]);
+    expect(bridgeFake().keptProjectImages).toEqual(["/data/nyx-v2/project-icons/p1.png"]);
+
+    // Back to the initial: the row is cleared AND the copy nyx made is deleted — nothing kept.
+    await act(async () => {
+      await result.current.setProjectMark("p1", null);
+    });
+    expect(result.current.projects[0].project.image_path).toBeNull();
+    expect(bridgeFake().discardedProjectImages).toEqual(["p1", "p1"]);
+    expect(bridgeFake().keptProjectImages[1]).toBeNull();
+
+    // Choosing a GLYPH also dereferences the picture, so it goes too.
+    await act(async () => {
+      await result.current.setProjectMark("p1", { icon: "flask" });
+    });
+    expect(bridgeFake().discardedProjectImages).toEqual(["p1", "p1", "p1"]);
+    expect(bridgeFake().keptProjectImages[2]).toBeNull();
+  });
+});
+
+describe("useProjects boot sweep of orphaned project pictures", () => {
+  beforeEach(() => {
+    installBackend([], {});
+  });
+
+  it("sweeps AFTER a successful list, naming every live project", async () => {
+    installBackend([project("p1"), project("p2")], {
+      p1: [workspace("w1", "p1")],
+      p2: [workspace("w2", "p2")],
+    });
+    const { result } = renderHook(() => useProjects());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await waitFor(() => expect(bridgeFake().prunedProjectImages).toEqual([["p1", "p2"]]));
+  });
+
+  it("NEVER sweeps when the list FAILED — the refusal that protects a live picture", async () => {
+    // The sweep's argument is "everything alive". A list that threw yields nothing
+    // alive, and sweeping on it would delete every picture the user ever chose. The
+    // main process refuses an empty list for the same reason; this is the other half.
+    mockIPC(() => {
+      throw new Error("list_projects: transient IPC failure");
+    });
+    const { result } = renderHook(() => useProjects());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.projects).toEqual([]);
+    expect(bridgeFake().prunedProjectImages).toEqual([]);
+  });
+
+  it("does not sweep on an EMPTY project list either", async () => {
+    // Same reason, one step earlier: a fresh install has no projects, and "no
+    // projects" must not be spelled the same way as "I could not read them".
+    installBackend([], {});
+    const { result } = renderHook(() => useProjects());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(bridgeFake().prunedProjectImages).toEqual([]);
   });
 });

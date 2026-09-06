@@ -205,6 +205,27 @@ export interface UseProjects {
    */
   setProjectResumeAgentSessions: (id: string, resume: boolean) => Promise<void>;
   /**
+   * Persist a project's ACCENT — the name of a palette token (`identity-3`), or
+   * `null` to clear it back to the neutral tile. Optimistically reflected on the
+   * tree so every `<ProjectMark>` repaints at once, then persisted via
+   * `set_project_accent`.
+   *
+   * CLEARING IS `null`, never `identity-0`: the absence of an accent has one
+   * spelling in the database, and `--identity-0` is a render-side neutral the UI
+   * never stores.
+   */
+  setProjectAccent: (id: string, accent: string | null) => Promise<void>;
+  /**
+   * Persist a project's MARK — its glyph OR its picture, never both. Pass
+   * `{ icon }` to set a glyph, `{ image }` to set a picture, or `null` to drop
+   * the mark and fall back to the project's initial.
+   *
+   * The EXCLUSION is not arbitrated here: `set_project_mark` writes both columns,
+   * so setting one clears the other, and the optimistic reflection does the same
+   * on the tree rather than leaving a stale sibling on screen for one frame.
+   */
+  setProjectMark: (id: string, mark: { icon: string } | { image: string } | null) => Promise<void>;
+  /**
    * Persist a project band's open/closed state. Optimistically reflected on the
    * tree (so the next reload restores the same disclosure), then persisted via
    * the backend `set_project_collapsed`.
@@ -252,15 +273,44 @@ export function useProjects(): UseProjects {
   // StrictMode double-mount guard: load exactly once per real mount.
   const bootstrapped = useRef(false);
 
+  /**
+   * Put the tree back on what the database actually holds. The repair path for an optimistic
+   * write that was REFUSED: the write is also what would have emitted the corrective
+   * `workspaces://changed`, so nothing else is coming. A transient list failure leaves the
+   * current tree rather than blanking it — the next event recovers, exactly as the subscription
+   * below decides for the same case.
+   */
+  const syncProjectTrees = useCallback(async () => {
+    try {
+      setProjects(await loadProjectTrees());
+    } catch {
+      /* the next event recovers */
+    }
+  }, []);
+
   useEffect(() => {
     if (bootstrapped.current) return;
     bootstrapped.current = true;
     void (async () => {
       try {
-        setProjects(await loadProjectTrees());
+        const trees = await loadProjectTrees();
+        setProjects(trees);
+        // THE BOOT SWEEP, and the ONE place it may be called from. Copied project
+        // pictures live on disk under ids; a project deleted while nyx was closed —
+        // or deleted by an agent, which has no business knowing about the disk —
+        // leaves its file behind, and nothing else would ever collect it.
+        //
+        // It runs HERE and only here, on the success path, AFTER the list resolved:
+        // the sweep's argument is "everything alive", so a list that failed or has
+        // not landed yet would spell it as "nothing is alive". The main process
+        // refuses an empty list for the same reason — two guards, because losing a
+        // picture the user chose is not recoverable.
+        if (trees.length > 0) {
+          void nyxBridge.pruneProjectImages(trees.map((t) => t.project.id));
+        }
       } catch {
         // list_projects failed (transient IPC/DB): leave the tree empty; the
-        // next mutation re-lists and recovers.
+        // next mutation re-lists and recovers. NO SWEEP — see above.
         setProjects([]);
       } finally {
         setLoading(false);
@@ -361,6 +411,11 @@ export function useProjects(): UseProjects {
     // submitting spinner, so awaiting first costs no perceptible snappiness.
     await nyxBridge.invoke("delete_project", { id });
     setProjects((prev) => prev.filter((t) => t.project.id !== id));
+    // The picture goes with the row it belonged to. Leaving it would keep a file on disk
+    // for a project that no longer exists until the NEXT boot — the sweep is a net, not a
+    // schedule, and this gesture knows exactly which project just went. Best-effort by the
+    // bridge's own contract: a locked file must not turn a successful delete into an error.
+    await nyxBridge.discardProjectImage(id);
   }, []);
 
   const deleteWorkspace = useCallback(async (id: string) => {
@@ -435,6 +490,73 @@ export function useProjects(): UseProjects {
     await nyxBridge.invoke("set_project_resume_agent_sessions", { id, resume });
   }, []);
 
+  const setProjectAccent = useCallback(async (id: string, accent: string | null) => {
+    // Optimistically reflect the colour so every mark of that project — rail tile,
+    // home header, corner mark on a cross-project row — repaints at once, then
+    // persist. The rejection PROPAGATES so the settings modal can toast the real
+    // reason.
+    setProjects((prev) =>
+      prev.map((t) => (t.project.id === id ? { ...t, project: { ...t.project, accent } } : t)),
+    );
+    try {
+      await nyxBridge.invoke("set_project_accent", { id, accent });
+    } catch (e) {
+      // RE-READ rather than remember. A refused write leaves the tree showing a colour
+      // the database does not have, and nothing else would take it back: the corrective
+      // `workspaces://changed` is emitted by the write that just FAILED. Re-listing is
+      // also the only answer that stays right when the row moved for another reason
+      // (an agent, another surface) between the optimistic paint and the refusal.
+      void syncProjectTrees();
+      throw e;
+    }
+  }, [syncProjectTrees]);
+
+  const setProjectMark = useCallback(
+    async (id: string, mark: { icon: string } | { image: string } | null) => {
+      // ONE SLOT, TWO SPELLINGS — so the optimistic write sets BOTH fields, exactly
+      // as `db::set_project_mark` does on the other side. Reflecting only the chosen
+      // half would leave the previous glyph next to the new picture for a frame, and
+      // that intermediate state is one the backend CHECK says cannot exist.
+      const icon = mark && "icon" in mark ? mark.icon : null;
+      const image = mark && "image" in mark ? mark.image : null;
+      setProjects((prev) =>
+        prev.map((t) =>
+          t.project.id === id ? { ...t, project: { ...t.project, icon, image_path: image } } : t,
+        ),
+      );
+      // The payload carries exactly ONE of the two keys when setting, so the backend
+      // never sees the both-supplied request it would (rightly) refuse. Clearing is
+      // spelled `icon: null`, which drops both columns.
+      try {
+        await nyxBridge.invoke(
+          "set_project_mark",
+          mark === null ? { id, icon: null } : { id, ...mark },
+        );
+      } catch (e) {
+        // Same repair as `setProjectAccent`: re-read, because the write that would have
+        // corrected the tree is the one that just failed. Nothing is discarded on this
+        // path — the row still references whatever it referenced.
+        void syncProjectTrees();
+        throw e;
+      }
+      // THE COPY DOES NOT OUTLIVE THE REFERENCE — and never predeceases it either.
+      // Moving to a glyph, or to no mark at all, dereferences the picture nyx copied
+      // into its data dir, so the file goes with it here rather than being left to
+      // whichever gesture comes next: the boot sweep spares every file a LIVE project
+      // could claim, so it would not collect this copy until the project itself was
+      // deleted. Choosing a DIFFERENT picture is the same gesture with something to
+      // keep — `adoptProjectImage` deliberately leaves the previous copy in place, and
+      // this is the second half that drops it.
+      //
+      // ORDERED AFTER THE WRITE, in both cases, so a failed persist never leaves a row
+      // pointing at a file that is gone. That is the whole reason the cleanup is here
+      // and not in the main process: only this side knows the row landed.
+      if (image === null) await nyxBridge.discardProjectImage(id);
+      else await nyxBridge.discardProjectImage(id, image);
+    },
+    [syncProjectTrees],
+  );
+
   const setProjectCollapsed = useCallback(async (id: string, collapsed: boolean) => {
     // Optimistically reflect the disclosure on the tree (so a re-list / reload
     // restores the same open state), then persist. A failure leaves the
@@ -467,6 +589,8 @@ export function useProjects(): UseProjects {
     renameWorkspace,
     reorderProjects,
     setProjectResumeAgentSessions,
+    setProjectAccent,
+    setProjectMark,
     setProjectCollapsed,
     setWorkspaceCollapsed,
   };
