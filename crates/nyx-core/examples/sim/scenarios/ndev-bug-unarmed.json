@@ -1,0 +1,59 @@
+{
+  "description": "Un bug dont le projet n'a rien lie au slot repro_check : run_start l'annonce, et le gate de reproduction REFUSE le run au lieu de le laisser passer sans preuve.",
+  "setup": {
+    "scope": "ndev",
+    "spec": {
+      "status": "in_progress",
+      "category": "bug",
+      "phases": ["Build"],
+      "tasks": [{ "title": "repair the defect" }]
+    },
+    "slots": {
+      "build_check": ["green"]
+    }
+  },
+  "answers": [
+    {
+      "when": { "type": "spawn_subagent", "label": "write the reproduction" },
+      "reply": { "diff": "un check qui echoue sur ce defaut" }
+    },
+    {
+      "when": { "type": "ask_human", "prompt_contains": "Answer 'automated'" },
+      "reply": { "decision": "automated" }
+    },
+    {
+      "when": { "type": "spawn_subagent", "label": "repair the defect" },
+      "effect": { "write_file": "fixed" },
+      "reply": { "diff": "le defaut est repare" }
+    },
+    {
+      "when": { "type": "spawn_subagent", "label": "implement" },
+      "reply": { "diff": "la tranche est implementee" }
+    },
+    {
+      "when": { "type": "spawn_subagent" },
+      "reply": { "diff": "audit clean" }
+    },
+    {
+      "when": { "type": "ask_human", "prompt_contains": "in review" },
+      "reply": { "decision": "approve" }
+    },
+    {
+      "when": { "type": "ask_human" },
+      "reply": { "decision": "yes" }
+    }
+  ],
+  "expect": {
+    "warnings_contain": ["repro_check"],
+    "surfaced": [
+      "sub_workflow:coder",
+      "spawn_subagent:write the reproduction",
+      "ask_human:Answer 'automated'"
+    ],
+    "journal": [],
+    "refusal": { "code": "invalid_state", "message_contains": "repro_check" },
+    "spec_status": "in_progress",
+    "category": "bug",
+    "tasks": { "repair the defect": "todo" }
+  }
+}

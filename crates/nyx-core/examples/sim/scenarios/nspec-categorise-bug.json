@@ -1,0 +1,93 @@
+{
+  "description": "/nspec classe un brouillon en bug : le judge decide, set_category ecrit, et le contrat de reproduction se joue avant la mise ready.",
+  "setup": {
+    "scope": "nspec",
+    "spec": {
+      "status": "draft",
+      "category": null
+    }
+  },
+  "answers": [
+    {
+      "when": { "type": "ask_human", "prompt_contains": "Keep grilling" },
+      "reply": { "decision": "grill" }
+    },
+    {
+      "when": { "type": "spawn_subagent", "label": "author spec" },
+      "reply": { "diff": "le probleme et la solution sont rediges" }
+    },
+    {
+      "when": {
+        "type": "ask_human",
+        "prompt_contains": "add a correction / a new requirement"
+      },
+      "reply": {
+        "decision": "Le badge est refuse au second passage : c'est une regression, pas une demande."
+      }
+    },
+    {
+      "when": { "type": "judge", "label": "spec complete?" },
+      "reply": { "verdict": "complete" }
+    },
+    {
+      "when": { "type": "judge", "label": "which category?" },
+      "reply": { "verdict": "bug" }
+    },
+    {
+      "when": { "type": "spawn_subagent", "subject": "bug_reproduction_contract" },
+      "reply": { "diff": "les six elements du contrat sont rediges" }
+    },
+    {
+      "when": { "type": "ask_human", "prompt_contains": "about the defect" },
+      "reply": {
+        "decision": "OBSERVE : la seconde lecture est refusee. ATTENDU : elle est acceptee. CONTRE-EXEMPLE : rebadger dans les deux secondes."
+      }
+    },
+    {
+      "when": { "type": "judge", "label": "reproduction contract complete?" },
+      "reply": { "verdict": "complete" }
+    },
+    {
+      "when": { "type": "judge", "label": "graphic render?" },
+      "reply": { "verdict": "ui" }
+    },
+    {
+      "when": { "type": "ask_human", "prompt_contains": "Prototype it" },
+      "reply": { "decision": "no" }
+    },
+    {
+      "when": { "type": "ask_human", "prompt_contains": "Mark the Spec ready" },
+      "reply": { "decision": "yes" }
+    }
+  ],
+  "expect": {
+    "surfaced": [
+      "ask_human:Keep grilling",
+      "spawn_subagent:author spec",
+      "ask_human:add a correction / a new requirement",
+      "judge:spec complete?",
+      "judge:which category?",
+      "spawn_subagent:bug_reproduction_contract",
+      "ask_human:about the defect",
+      "judge:reproduction contract complete?",
+      "judge:graphic render?",
+      "ask_human:Prototype it",
+      "ask_human:Mark the Spec ready",
+      "done"
+    ],
+    "journal": [],
+    "spec_status": "ready",
+    "category": "bug",
+    "category_created_by": "system",
+    "blackboard": {
+      "entry_choice": "grill",
+      "grill_status": "complete",
+      "category_choice": "bug",
+      "spec_category": "bug",
+      "bug_contract": "complete",
+      "needs_proto": "ui",
+      "do_proto": "no",
+      "ready_ok": "yes"
+    }
+  }
+}

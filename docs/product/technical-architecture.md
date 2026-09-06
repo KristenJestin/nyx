@@ -116,6 +116,7 @@ Le serveur MCP est une interface **externe** (agents) vers l'autorité Rust ; sa
 - **Pourquoi.** Un test hermétique peut être **vert sur un faux positif** : le cas fondateur est la segmentation OSC 133 où le marqueur `B` émis par le fixture était **effacé par le vrai starship**, masquant des heures durant que le produit ne marchait pas. Le monde réel diverge du fixture ; seul le pilotage réel le prouve.
 - **Comment.** Gate e2e Electron **pilotée** (CDP / WebDriver) contre l'app réelle, en plus des tests unitaires/contrat (nécessaires mais **non suffisants** pour déclarer une capacité livrée). Les gates de tranche l'appliquent (cockpit v2.2, review v2.5 9/9, terminal-blocks).
 - **Règle.** Une capacité n'est « livrée » que lorsqu'elle a été **observée fonctionner dans l'app réelle**, pas seulement lorsqu'une suite verte le suggère.
+- **Le simulateur de run ne remplace rien, il précède.** `bun run sim <scénario>` (`crates/nyx-core/examples/sim/`) rejoue un workflow d'orchestration **sans agent et sans app** — vrai moteur, vraie base, vrais PTY pour les gates, réponses scriptées — et prouve le **chemin** : quelle branche du graphe, quels gates, quel journal de `gate_attempts`, quels statuts. C'est ce qui rend une branche d'orchestration falsifiable en quelques secondes au lieu d'une session d'agent, et c'est tout ce qu'il prouve : ni la pertinence d'un LLM, ni la surface runtime. La règle d'or ci-dessus est **inchangée** — une capacité reste livrée par le pilotage CDP de l'app réelle, jamais par un scénario vert.
 
 ## Interdictions
 

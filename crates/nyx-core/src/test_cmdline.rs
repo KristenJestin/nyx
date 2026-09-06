@@ -36,6 +36,38 @@
 //!
 //! It never changes a verdict. `exit 2` stays `exit 2` on all three shells; a gate that was red
 //! stays red, for the reason it claims. Only the spelling moves.
+//!
+//! ## A DELIBERATE duplicate lives in `examples/sim/`
+//!
+//! The run simulator (`crates/nyx-core/examples/sim/`, PRD « Simulateur de run sans agent ») arms
+//! gate slots too, and is bound by exactly the rule above. But it is an EXAMPLE: it compiles only
+//! against `nyx_core`'s PUBLIC API, and this module is `pub(crate)` — a decision, not an oversight
+//! (no `pub(crate)` is widened for the simulator). So `examples/sim/driver.rs` (the [`Shell`] family
+//! + `shell_stem`) and `examples/sim/scenario.rs` (`Sentinel::render`) restate this module's ~30
+//! lines, knowingly. Both files say so; this note is the other half of the pair.
+//!
+//! **What is duplicated is the SET OF BEHAVIOURS, one dialect at a time — not the text.** The
+//! simulator's three sentinels are the same three vehicles, for the same interpreter, with the same
+//! verdicts:
+//!
+//!   * `green` — [`green`] renders `exit 0`, and so does the simulator's: SAME text;
+//!   * `red` — [`red`] renders `exit 1`, and so does the simulator's: SAME text;
+//!   * `green_when_file_exists` — SAME text in POSIX (`test -f 'f' || exit 1; exit 0`, a GUARD that
+//!     bails out early: [`Cmdline::requires_file`] then [`Cmdline::exits`]), DIFFERENT text on the
+//!     two Windows dialects: `if (-not (Test-Path …)) { exit 1 }; exit 0` here against
+//!     `if (Test-Path …) { exit 0 } else { exit 1 }` there, and `if not exist f exit 1&exit 0`
+//!     against `if exist f (exit 0) else (exit 1)`.
+//!
+//! POSIX agrees for a REASON, not by accident: a self-contained `test -f 'f'; exit $?` would be
+//! rejected at PARSE time by `fish`, which [`crate::pty::resolve_shell`] honours as soon as `SHELL`
+//! names it, and a line the shell refuses exits non-zero — a RED that measured nothing. The two
+//! Windows dialects diverge because the shapes differ: here a [`Cmdline`] is a BUILDER that chains
+//! guards before one closing [`Cmdline::exits`], while a `Sentinel` renders a whole line at once and
+//! has nothing to chain. Both spellings are equivalent (green exactly when the file is there) and
+//! both obey the rule above — neither needs anything on `PATH`. So a change to a dialect here must
+//! be CARRIED there, never copy-pasted: transpose the behaviour into the simulator's shape. The two
+//! are kept honest by the same anchor: both ask [`crate::pty::resolve_shell`] which interpreter will
+//! really get the line.
 
 use crate::command::shell_stem;
 use crate::pty::resolve_shell;

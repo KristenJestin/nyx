@@ -1,0 +1,60 @@
+{
+  "description": "Le parcours normal d'un Spec feature : build_check vert, audit propre, review approuvee, aucune reproduction.",
+  "setup": {
+    "scope": "ndev",
+    "spec": {
+      "status": "ready",
+      "category": "feature",
+      "phases": ["Build"],
+      "tasks": [{ "title": "t0" }]
+    },
+    "slots": {
+      "build_check": ["green"]
+    }
+  },
+  "answers": [
+    {
+      "when": { "type": "spawn_subagent", "label": "implement" },
+      "reply": { "diff": "la tranche est implementee" }
+    },
+    {
+      "when": { "type": "spawn_subagent" },
+      "reply": { "diff": "audit clean" }
+    },
+    {
+      "when": { "type": "ask_human", "prompt_contains": "in review" },
+      "reply": { "decision": "approve" }
+    },
+    {
+      "when": { "type": "ask_human" },
+      "reply": { "decision": "yes" }
+    }
+  ],
+  "expect": {
+    "surfaced": [
+      "sub_workflow:coder",
+      "spawn_subagent:implement",
+      "done",
+      "spawn_subagent:user_stories",
+      "spawn_subagent:testing_decisions",
+      "spawn_subagent:implementation_decisions",
+      "spawn_subagent:out_of_scope",
+      "ask_human:in review",
+      "ask_human:confirm",
+      "done"
+    ],
+    "journal": [
+      {
+        "slot": "build_check",
+        "expect": "green",
+        "outcome": "passed",
+        "satisfied": true,
+        "blocking": true
+      }
+    ],
+    "spec_status": "completed",
+    "category": "feature",
+    "tasks": { "t0": "done" },
+    "blackboard": { "audit_verdict": 0, "gate_green": true, "done_ok": "yes" }
+  }
+}

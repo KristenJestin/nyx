@@ -44,20 +44,43 @@ bun run test:core      # cargo test --workspace --lib + contrat sidecar
 bun run test:core:e2e  # les e2e de gate de crates/nyx-core/tests/ (voir ci-dessous)
 bun run test:contract  # parité protocole Rust ↔ TS
 bun run check          # oxfmt + oxlint + tsc côté renderer, cargo check côté Rust
+
+bun run sim <nom>      # rejoue UN scénario du simulateur de run (--list pour les voir)
+bun run test:sim       # rejoue les six, en test d'intégration (voir ci-dessous)
 ```
 
 Dans `apps/desktop/renderer`, la suite se scinde en deux projets vitest : `test:unit` (jsdom) et
 `test:browser` (Vitest Browser Mode — vrai Chromium via Playwright, vrai cœur ghostty en WASM).
 
 `test:core:e2e` est **le** point d'entrée des e2e de `crates/nyx-core/tests/`, et il est appelé par
-`bun run test`. Il nomme ses cibles une à une plutôt que de balayer le dossier, parce que deux
+`bun run test`. Il nomme ses cibles une à une plutôt que de balayer le dossier, parce que trois
 fichiers de `tests/` n'y ont pas leur place et sont **exclus délibérément** : `nyx_next_loop_spike`
 et `agent_activity_signal_spike` sont des *spikes* — des relevés de faisabilité datés, adossés à
 `docs/spikes/`, pas des gates de non-régression — et `nyx_next_loop_spike` est rouge sous Windows
-(3/3) pour des raisons d'environnement PTY. Ajouter un fichier à `tests/` n'a donc aucun effet tant
-qu'il n'est pas ajouté à ce script.
+(3/3) pour des raisons d'environnement PTY ; `sim_scenarios_e2e` est le simulateur, dont le lanceur
+est `test:sim` (voir juste après). Ajouter un fichier à `tests/` n'a donc aucun effet tant qu'il
+n'est pas ajouté à l'un de ces deux scripts.
 
 Détails : `contract/README.md` pour le protocole, `e2e/README.md` pour les prérequis end-to-end.
+
+### Le simulateur de run
+
+`bun run sim <nom>` rejoue un workflow nyx (`ndev`, `nspec`…) **sans agent et sans app** : base
+SQLite jetable ouverte par le vrai chemin de boot, réponses scriptées dans un JSON, gates exécutés
+sur de vrais PTY, verdict en quelques secondes. Il prouve le **chemin** — quelle branche, quels
+gates, quel journal, quels statuts — pas la pertinence d'un LLM. Détails et format :
+`crates/nyx-core/examples/sim/README.md`.
+
+`bun run test:sim` rejoue les six scénarios livrés en `cargo test`. Il n'est chaîné **ni** dans
+`test:core` (`--lib` ne compile aucune cible `tests/`) **ni** dans `test:core:e2e`, donc pas non plus
+dans `bun run test` : chaque scénario seede une base et lance de vrais shells, ce qui n'a pas sa
+place dans une suite unitaire. Sa **compilation**, elle, est couverte par `bun run check:core`
+(`cargo check --workspace --all-targets`), qui compile les cibles `example` et `test` — c'est là
+qu'un `#[path]`-include cassé se voit.
+
+**Mesurer depuis PowerShell** vaut ici comme ailleurs (voir « Pièges connus ») : les sentinelles de
+gate du simulateur sont rendues dans le dialecte que `pty::resolve_shell()` désignera vraiment, donc
+`bun run sim` doit sortir **vert des deux côtés** — et si les deux divergent, c'est le signal.
 
 ### Pièges connus
 
@@ -97,8 +120,9 @@ Détails : `contract/README.md` pour le protocole, `e2e/README.md` pour les pré
 
 - **Renderer** : oxfmt pour le format, oxlint pour le lint, `tsc --noEmit` pour les types — les trois
   via `bun run check`. Aucun fichier de configuration : les outils tournent sur leurs défauts.
-- **Rust** : `cargo check --workspace`. Les tests unitaires vivent dans le module qu'ils couvrent
-  (`mod tests`), pas dans un dossier séparé.
+- **Rust** : `cargo check --workspace --all-targets`, la commande que lance `bun run check:core` —
+  seul gate qui compile aussi les cibles de test, d'exemple et de bench. Les tests unitaires vivent
+  dans le module qu'ils couvrent (`mod tests`), pas dans un dossier séparé.
 - **Nommage** : kebab-case pour les fichiers TS/TSX, snake_case pour le Rust.
 
 ## Commits
