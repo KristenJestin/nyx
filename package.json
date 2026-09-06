@@ -23,7 +23,8 @@
     "check": "bun run --filter nyx-v2-renderer check && bun run check:core",
     "check:core": "cargo check --workspace --all-targets",
     "build:core": "cargo build -p nyx-core",
-    "build:sidecar": "cargo build -p nyx-sidecar"
+    "build:sidecar": "cargo build -p nyx-sidecar",
+    "install:linux": "bun run --filter nyx-v2 install:linux"
   },
   "devDependencies": {
     "typescript": "~5.8.3"

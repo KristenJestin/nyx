@@ -31,7 +31,8 @@
     "smoke:data-dir": "bun test src/main/identity.test.ts",
     "smoke:sidecar-derivation": "bun test src/main/sidecar.test.ts",
     "smoke:quit-guard": "bun test src/main/quit-guard.test.ts",
-    "smoke:dev-identity": "bun test scripts/dev-server-identity.test.ts"
+    "smoke:dev-identity": "bun test scripts/dev-server-identity.test.ts",
+    "install:linux": "node scripts/install-linux.cjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

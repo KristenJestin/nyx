@@ -33,6 +33,7 @@ bun : `apps/desktop` et `apps/desktop/renderer`.
 bun run dev            # renderer en dev
 bun run dev:desktop    # app desktop en dev
 bun run build          # build renderer ; build:desktop pour l'app complète
+bun run install:linux  # Linux : build release + paquet unpacked + lanceur .desktop (voir apps/desktop/PACKAGING.md)
 ```
 
 ## Tests

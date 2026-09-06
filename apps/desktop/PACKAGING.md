@@ -83,6 +83,29 @@ chmod +x release/nyx-<version>.AppImage && ./release/nyx-<version>.AppImage   # 
 main-process resolver lands on the unpacked binary (POSIX + Windows branches), and the packaged
 sidecar handshakes + streams a real PTY — all from the packaged layout.
 
+### Linux — "install" from the source tree (no AppImage, no FUSE)
+
+For a dev/test machine (e.g. Arch, where AppImage needs `fuse2`), the unpacked package IS the
+installed app: `release/linux-unpacked/nyx-v2` is a self-contained Electron app dir with the
+sidecar + plugin in `resources/app.asar.unpacked/`. `bun run install:linux` (root or
+`apps/desktop`) chains everything and registers it as a desktop app:
+
+```sh
+bun install
+bun run install:linux              # from the repo root
+#   1. cargo build -p nyx-sidecar --release
+#   2. bun run package              → release/linux-unpacked/nyx-v2  (NYX_SIDECAR_PROFILE=release)
+#   3. bun run smoke:package        (skip with --skip-smoke)
+#   4. ~/.local/share/applications/nyx-v2.desktop + ~/.local/bin/nyx-v2  (skip with --no-desktop)
+```
+
+Both entries point at the absolute path of the binary inside this checkout, so after a
+`git pull` re-running the same command rebuilds in place and the launcher keeps working.
+Uninstall = delete the `.desktop` file and the symlink. Prerequisites: `bun`, `cargo`, and
+`node` on the PATH (the build scripts are plain Node). The launcher uses `build/icon.png`, the
+nyx face from nyx-site (`build/icon.svg` is its source; electron-builder reads the same file
+for every installer target).
+
 ### Linux glibc baseline (portability)
 
 The sidecar dynamically links **glibc** (`libc.so.6`, `libm.so.6`, `libgcc_s.so.1` — `ldd`
