@@ -47,8 +47,10 @@ export interface UseSpecs {
  */
 export function useSpecs(scope: ActiveScope): UseSpecs {
   const global = scope.kind === "all";
-  // The project the read is narrowed to, or `null` for the cross-project read.
-  const projectId = global ? null : scope.projectId;
+  // The project the read is narrowed to, or `null` for the cross-project read — and `null` too in
+  // the SYSTÈME scope, where there is no project id to narrow to (the singleton is not one of the
+  // projects) and no Spec to find. That `null` disables the read below rather than widening it.
+  const projectId = scope.kind === "project" ? scope.projectId : null;
   // NO project loaded yet — not "every project". The hook says nothing rather than reading
   // the whole app's Specs onto a page that means to show one project's.
   const enabled = global || projectId !== null;

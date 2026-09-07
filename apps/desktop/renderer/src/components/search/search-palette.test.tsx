@@ -60,8 +60,12 @@ function lineTitle(row: HTMLElement): HTMLElement {
 
 /** Surfaces the entered project so a test can assert the activation the navigation depends on. */
 function ActiveProjectProbe() {
-  const { activeProjectId } = useActiveProject();
-  return <div data-testid="active-project">{activeProjectId ?? "none"}</div>;
+  const { activeProjectId, scope } = useActiveProject();
+  return (
+    <div data-testid="active-project" data-scope={scope.kind}>
+      {activeProjectId ?? "none"}
+    </div>
+  );
 }
 
 /**
@@ -96,9 +100,12 @@ function renderPalette(
   initialEntry = "/",
   {
     onAddWorkspace,
+    systemProjectId,
   }: {
     /** The rail's add-workspace flow, as `<BaseLayout>` hands it down. Omitted ⇒ inert. */
     onAddWorkspace?: (projectId: string) => void;
+    /** The SYSTÈME singleton's project id, as `<BaseLayout>` hands it down. Omitted ⇒ none. */
+    systemProjectId?: string | null;
   } = {},
 ) {
   mockIPC(backend);
@@ -107,7 +114,7 @@ function renderPalette(
       <ActiveProjectProvider>
         <RevealWorkspaceProvider>
           <PendingTerminalProvider>
-            <SearchPalette onAddWorkspace={onAddWorkspace} />
+            <SearchPalette onAddWorkspace={onAddWorkspace} systemProjectId={systemProjectId} />
             <ActiveProjectProbe />
             <RevealProbe />
             <PendingTerminalProbe />
@@ -128,6 +135,7 @@ function renderPalette(
     mk("/", "TERMINALS"),
     mk("/work/$specId", "SPEC"),
     mk("/knowledge", "KNOWLEDGE"),
+    mk("/system", "SYSTEM"),
   ]);
   const router = createRouter({
     routeTree,
@@ -1416,5 +1424,78 @@ describe("<SearchPalette> — the action registry", () => {
     expect(screen.getByTestId("search-action-context-project:new-workspace-p9").textContent).toBe(
       screen.getByTestId("search-row-context-project-p9").textContent,
     );
+  });
+});
+
+/**
+ * THE SYSTÈME SIDE-DOOR, driven through the real palette. `global_search` filters no project, so a
+ * hit can belong to the singleton — and the singleton is absent from `list_projects`
+ * (`kind = 'user'`), so posing it as the ENTERED project made the rail's restore effect "recover"
+ * onto a stranger's page. Such a hit lands on the Système SCOPE's own screen instead, the exact
+ * correction `use-home-focus` makes for the cross-project home's rows.
+ *
+ * `<BaseLayout>` hands the singleton's id down (it already holds that read for the rail's tile);
+ * the mapping itself is unit-tested in `search-target.test.ts`. What is asserted here is what the
+ * PALETTE does with it: the route, the scope, and what it does NOT touch.
+ */
+describe("<SearchPalette> — a hit that belongs to the Système singleton", () => {
+  const SYS = "p-sys";
+
+  it("lands a Système command on `/system?command=` and enters the Système scope", async () => {
+    const { router } = renderPalette(
+      backendWith([hit("command", { id: "sys-inst", project_id: SYS, project_name: "System" })]),
+      "/",
+      { systemProjectId: SYS },
+    );
+    const input = await openPalette();
+    // The project the shell entered first, captured before the activation.
+    const enteredBefore = screen.getByTestId("active-project").textContent;
+
+    fireEvent.change(input, { target: { value: "docker" } });
+    fireEvent.click(await screen.findByTestId("search-row-command-sys-inst"));
+
+    await waitFor(() => expect(router.state.location.pathname).toBe("/system"));
+    expect(router.state.location.search).toEqual({ command: "sys-inst" });
+    await waitFor(() =>
+      expect(screen.getByTestId("active-project").getAttribute("data-scope")).toBe("system"),
+    );
+    // THE ENTERED PROJECT IS NOT TOUCHED. The singleton has no id to put there, and the project is
+    // where the rail puts the user back — writing it here is precisely the old bug.
+    expect(screen.getByTestId("active-project").textContent).toBe(enteredBefore);
+  });
+
+  it("takes a PROJECT hit back out of the Système scope, into the project one", async () => {
+    const { router } = renderPalette(
+      backendWith([hit("project", { id: "p2", project_id: "p2", label: "Beta" })]),
+      "/system",
+      { systemProjectId: SYS },
+    );
+    await openPalette();
+    fireEvent.click(await screen.findByTestId("search-row-project-p2"));
+
+    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+    // Activating a hit ENTERS what holds it — so a project's hit leaves the host scope, exactly as
+    // a rail tile would. Landing on `/` while the rail still said "Système" would show the
+    // project's Terminals under an empty section-nav.
+    await waitFor(() =>
+      expect(screen.getByTestId("active-project").getAttribute("data-scope")).toBe("project"),
+    );
+    expect(screen.getByTestId("active-project").textContent).toBe("p2");
+  });
+
+  it("does nothing of the sort on a database with NO singleton", async () => {
+    // `system_scope_detail` answers `null` there, so the shell hands down no id and no hit can be
+    // mistaken for the host's — whatever project it names.
+    const { router } = renderPalette(
+      backendWith([hit("command", { id: "sys-inst", project_id: SYS })]),
+      "/",
+    );
+    const input = await openPalette();
+    fireEvent.change(input, { target: { value: "docker" } });
+    fireEvent.click(await screen.findByTestId("search-row-command-sys-inst"));
+
+    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+    expect(router.state.location.search).toEqual({ command: "sys-inst" });
+    expect(screen.getByTestId("active-project").textContent).toBe(SYS);
   });
 });

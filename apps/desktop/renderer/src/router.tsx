@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import type { QueryClient } from "@tanstack/react-query";
 import {
   createMemoryHistory,
@@ -5,11 +6,12 @@ import {
   createRoute,
   createRouter,
   Outlet,
+  useRouterState,
 } from "@tanstack/react-router";
 
 import { errorText } from "@/bridge";
 import { queryClient } from "@/lib/query";
-import { ActiveProjectProvider } from "@/components/terminals/active-project";
+import { ActiveProjectProvider, useActiveProject } from "@/components/terminals/active-project";
 import { RevealWorkspaceProvider } from "@/components/terminals/reveal-workspace";
 import { PendingTerminalProvider } from "@/components/terminals/pending-terminal";
 import { BaseLayout } from "@/components/terminals/base-layout";
@@ -116,33 +118,79 @@ const terminalsRoute = createRoute({
 });
 
 /**
- * SYSTÈME (`/system`) — the singleton's terminals and commands, on a ROUTE OF ITS OWN (human review
- * `01M1EC7Y2625Q07C5386GKHZFS`, finding U1).
+ * SYSTÈME (`/system`) — the singleton's terminals and commands, on a ROUTE OF ITS OWN, and the ONE
+ * screen of the app's third SCOPE.
  *
- * ## Why it has its own path now
+ * ## A path AND a scope
  *
- * It used to share the index route with `<TerminalsPage>`, dispatched by a `systemScope` boolean:
- * Système was modelled as a SCOPE that REPLACED the entered project, so it took the project's slot,
- * the project's rail selection and — since it was rendered at `/` — the project's active nav entry
- * too. Tested in the real app that model failed on its own terms: entering Système switched off the
- * project tile and hid Work / Knowledge / Engine / Catalogue, and the rail still lit `Terminals`
- * over a page that was not the project's Terminals.
+ * It used to share the index route with `<TerminalsPage>`, dispatched by a `systemScope` boolean.
+ * That failed on its own terms (human review `01M1EC7Y2625Q07C5386GKHZFS`, finding U1): with no
+ * path of its own, the rail lit `Terminals` over a page that was not the project's Terminals. U1
+ * gave it this path and removed the scope along with the flag — and the model then failed the
+ * OTHER way, the rail showing a project entered AND ringed while the host's terminals filled the
+ * screen, with six project section-entries standing over a scope that has none of them.
  *
- * Système is a PAGE, like any other page of the shell: the entered project stays entered while one
- * reads it, and the only thing that has to change is which entry the rail marks. That is exactly
- * what a path is for — `pathname === "/system"` lights the Système tile and nothing else, and
- * `pathname === "/"` goes back to meaning "the project's Terminals" and nothing else. No dispatch
- * component, no scope flag, no redirect table.
+ * The human decision keeps the PATH and restores the SCOPE. `pathname === "/system"` is still the
+ * only thing that draws this screen, and `{kind:"system"}` is what the rail marks — {@link
+ * SystemRouteComponent} mirrors the first into the second, exactly as `/home` mirrors its
+ * `?scope=`, so the url and the app can never disagree.
  *
- * The `?terminal=` / `?command=` deep-links stay the index route's: they name runtime objects of a
- * project, and this route is not the project's. A separate path drops them by construction — there
- * is no shared search to carry over.
+ * ## Its OWN `?terminal=` / `?command=`
+ *
+ * The same deep-links `/` carries, over the singleton's own runtime. They exist because the
+ * CROSS-PROJECT home lists the Système terminals and services — the global `home_snapshot` joins
+ * with no filter, deliberately: the host is what one least wants to miss from a transverse view —
+ * and clicking such a row has to land ON that object. Before this route accepted them, that click
+ * navigated to `/` with the singleton posed as the entered project, a project `useProjects` cannot
+ * see (`db::list_projects` filters `kind = 'user'`), so the rail's restore effect "recovered" onto
+ * a stranger's Terminals page.
+ *
+ * They are NOT shared with `/`: a separate path means separate search state, so an id of one route
+ * is never carried into the other.
  */
+interface SystemSearch {
+  readonly terminal?: string;
+  readonly command?: string;
+}
+
 const systemRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/system",
-  component: SystemScopePage,
+  component: SystemRouteComponent,
+  // The same validation as the index route's twin params — non-strings are dropped.
+  validateSearch: (search: Record<string, unknown>): SystemSearch => {
+    const out: { terminal?: string; command?: string } = {};
+    if (typeof search.terminal === "string") out.terminal = search.terminal;
+    if (typeof search.command === "string") out.command = search.command;
+    return out;
+  },
 });
+
+/**
+ * The route's own half of the Système screen: it MIRRORS the match into the app's scope, and hands
+ * the validated deep-link down as props.
+ *
+ * The mirror lives HERE rather than in `<SystemScopePage>` because `/system` names its scope by
+ * being MATCHED — there is no parameter to read, so the statement belongs to the match rather than
+ * to the component that draws the screen. It also keeps that component free of the router and of
+ * the scope context: it renders the singleton it is given, and nothing else.
+ *
+ * GUARDED ON BEING THE CURRENT SCREEN, and that guard is load-bearing rather than defensive (the
+ * same one `<HomePage>` carries): a match is still mounted while the router commits a navigation
+ * AWAY from it, and a re-render in that window would re-enter the scope the user is leaving.
+ */
+function SystemRouteComponent() {
+  const { terminal, command } = systemRoute.useSearch();
+  const { setScopeKind } = useActiveProject();
+  const onSystemRoute = useRouterState({ select: (s) => s.location.pathname === "/system" });
+  useEffect(() => {
+    if (!onSystemRoute) return;
+    setScopeKind("system");
+  }, [onSystemRoute, setScopeKind]);
+  return (
+    <SystemScopePage deepLinkTerminalId={terminal ?? null} deepLinkCommandId={command ?? null} />
+  );
+}
 
 /**
  * The `/home` search params — WHICH SCOPE the one home page is read in:

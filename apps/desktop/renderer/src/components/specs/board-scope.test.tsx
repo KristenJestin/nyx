@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { mockIPC } from "@/bridge/test-harness";
 import { createAppRouter } from "@/router";
-import { saveGlobalScope } from "@/components/terminals/ui-persistence";
+import { saveScopeKind } from "@/components/terminals/ui-persistence";
 import type { ProjectRecord, WorkspaceRecord } from "@/components/sidebar/use-projects";
 
 import type { SpecListEntry } from "./types";
@@ -185,7 +185,7 @@ function tableKeyCells(): { key: string; mark: string | null }[] {
 
 describe("The Specs board follows the scope", () => {
   beforeEach(() => {
-    saveGlobalScope(false);
+    saveScopeKind("project");
     installBackend();
   });
 
@@ -196,7 +196,7 @@ describe("The Specs board follows the scope", () => {
   });
 
   it("lists EVERY project's Specs in the cross-project scope, in ONE read", async () => {
-    saveGlobalScope(true);
+    saveScopeKind("all");
     mount();
     await waitFor(() => expect(listedTitles()).toEqual(["Alpha work", "Beta work"]));
     // ONE read for the WHOLE scope, with no project filter — and NOT one call per project.
@@ -210,7 +210,7 @@ describe("The Specs board follows the scope", () => {
    * board keeps the same shape in both scopes.
    */
   it("names each Spec's project TWICE in the cross-project scope: the mark AND the key", async () => {
-    saveGlobalScope(true);
+    saveScopeKind("all");
     mount();
     await waitFor(() => expect(listedKeys()).toEqual(["ALPHA-1", "BETA-1"]));
     expect(listedMarks()).toEqual(["Alpha", "Beta"]);
@@ -263,14 +263,14 @@ describe("The Specs board follows the scope", () => {
 
     // …and in the cross-project scope that branch is unreachable: the scope carries no project id
     // to misread as "none loaded", so the page states the scope's own emptiness instead.
-    saveGlobalScope(true);
+    saveScopeKind("all");
     mount();
     expect(await screen.findByTestId("board-empty")).toBeTruthy();
     expect(screen.queryByText("Enter a project to see its Specs.")).toBeNull();
   });
 
   it("changes ONLY the list when the scope flips — live, both ways", async () => {
-    saveGlobalScope(true);
+    saveScopeKind("all");
     mount();
     await waitFor(() => expect(listedTitles()).toEqual(["Alpha work", "Beta work"]));
     // The chrome the two scopes share, captured before the switch.

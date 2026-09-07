@@ -32,6 +32,7 @@ import type {
 const NYX: HomeProject = {
   id: "p1",
   name: "nyx",
+  kind: "user",
   accent: null,
   icon: "sparkles",
   image_path: null,
@@ -39,6 +40,7 @@ const NYX: HomeProject = {
 const PALBANK: HomeProject = {
   id: "p2",
   name: "palbank",
+  kind: "user",
   accent: "#2f6df6",
   icon: null,
   image_path: null,
@@ -47,6 +49,7 @@ const PALBANK: HomeProject = {
 const KEYROAD: HomeProject = {
   id: "p3",
   name: "keyroad",
+  kind: "user",
   accent: null,
   icon: null,
   image_path: null,
@@ -228,7 +231,11 @@ describe("HomePage — the project scope", () => {
         // The rail's per-project dot reads this for every workspace; an empty array is not a
         // snapshot, and the shell's error boundary swallowed the whole screen when it got one.
         if (cmd === "workspace_runtime_snapshot") {
-          return { workspace: { id: "ws-p1", name: "root", path: "/" }, terminals: [], services: [] };
+          return {
+            workspace: { id: "ws-p1", name: "root", path: "/" },
+            terminals: [],
+            services: [],
+          };
         }
         // The Système singleton is ABSENT here — the documented `null` of a database with no scope.
         // The catch-all below answers `[]`, and `[]` is not a `{project, workspace, home}`: the rail
@@ -242,14 +249,12 @@ describe("HomePage — the project scope", () => {
     await waitFor(() => expect(scopes).toContainEqual({ projectId: "p1" }));
     // …and the page draws itself in that scope.
     expect((await homePage()).getAttribute("data-scope")).toBe("project");
-    // EVERY SCOPED read is this project's: the page never asks for another project's home. The
-    // bare `{}` read that also appears here is the RAIL's, not the page's — `<AllProjectsRailDot>`
-    // (`base-layout.tsx`) keeps a cross-project rollup live on every screen, which is the whole
-    // point of the `All projects` tile's dot — and there is exactly ONE of them, so the page is
-    // not making a global read of its own.
-    const scoped = scopes.filter((s) => Object.keys(s as object).length > 0);
-    expect(scoped).toEqual([{ projectId: "p1" }]);
-    expect(scopes.length - scoped.length).toBe(1);
+    // EVERY read of the home is this project's — and there is NO OTHER. The page never asks for
+    // another project's home, and nothing else on the screen makes a cross-project read either:
+    // the rail's `All projects` tile used to keep a global rollup live here for its own dot, and
+    // that dot is gone (`terminals/rail-dots.test.tsx` holds the line on why). So a bare `{}` read
+    // appearing in this list would now mean the page itself had gone global.
+    expect(scopes).toEqual([{ projectId: "p1" }]);
   });
 
   it("renders the four panels and, on an empty home, the four empty states", async () => {

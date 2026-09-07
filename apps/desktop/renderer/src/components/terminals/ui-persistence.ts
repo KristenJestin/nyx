@@ -1,3 +1,8 @@
+// The persisted scope vocabulary is the LIVE one, imported rather than re-spelled: a fourth scope
+// would otherwise be storable here without the app knowing about it. Type-only, so the module
+// graph stays acyclic at runtime (`active-project.tsx` imports the readers below).
+import type { ScopeKind } from "./active-project";
+
 /**
  * UI-STATE PERSISTENCE for the Terminals shell — the small, renderer-local memory of "where the
  * user last was" so a relaunch (or a return to the Terminals page from Work/Knowledge) restores
@@ -25,10 +30,19 @@
 
 /** The last ENTERED project id. */
 const PROJECT_KEY = "nyx.ui.lastProjectId";
-/** Whether the app was left in the CROSS-PROJECT scope (`<ActiveProjectProvider>`'s `globalScope`). */
-const GLOBAL_SCOPE_KEY = "nyx.ui.globalScope";
-/** Schema version of the global-scope flag — a bare boolean. */
-const GLOBAL_SCOPE_VERSION = 1;
+/** Which SCOPE the app was left in (`<ActiveProjectProvider>`'s `scope.kind`). */
+const SCOPE_KIND_KEY = "nyx.ui.scopeKind";
+/** Schema version of the scope kind — a bare string of {@link ScopeKind}'s three values. */
+const SCOPE_KIND_VERSION = 1;
+/**
+ * The LEGACY two-state key this one replaces — a bare boolean, `true` meaning "all projects".
+ * Still READ (never written) so an install that predates the Système scope reopens where it was
+ * left instead of falling back to the project scope. Its own value is left in place: it costs
+ * nothing, and a rollback would find it.
+ */
+const LEGACY_GLOBAL_SCOPE_KEY = "nyx.ui.globalScope";
+/** Schema version of the legacy global-scope flag. */
+const LEGACY_GLOBAL_SCOPE_VERSION = 1;
 /** Prefix for the per-project last SELECTED terminal id (`<prefix><projectId>`). */
 const TERMINAL_KEY_PREFIX = "nyx.ui.lastTerminalId:";
 /** Prefix for a GROUP BLOCK's folded/unfolded state (`<prefix><groupId>`). */
@@ -78,29 +92,41 @@ export function saveLastProjectId(projectId: string | null): void {
 }
 
 /**
- * Whether the app was left in the CROSS-PROJECT scope ("All projects"). `false` when nothing is
- * remembered — the app's default scope is the entered project.
+ * WHICH SCOPE the app was left in — the entered project, every project, or Système. `"project"`
+ * when nothing is remembered, which is the app's default.
  *
  * It rides the SAME registry as the entered project right above, and for the same reason: the two
  * are ONE answer to "where was the user" and a relaunch has to restore them together, or reopening
- * in the global scope would land on a rail that says otherwise. Unlike the project id, there is
- * nothing to VALIDATE against a live tree — "all projects" is true of every tree, the empty one
- * included — so this hint is honoured as read, and the provider seeds itself from it directly
- * rather than waiting for a restore effect.
+ * in another scope would land on a rail that says otherwise. Unlike the project id, there is
+ * nothing to VALIDATE against a live tree — "all projects" and "the host" are true of every tree,
+ * the empty one included — so this hint is honoured as read, and the provider seeds itself from it
+ * directly rather than waiting for a restore effect.
+ *
+ * IT FALLS BACK ON THE LEGACY BOOLEAN, once, and only to read it. This key replaces the two-state
+ * `nyx.ui.globalScope` written before Système became a scope of its own; an install carrying that
+ * value would otherwise reopen in the project scope after having been left in "All projects" — a
+ * silent loss of the one thing this module exists to keep. The migration is a READ: the next scope
+ * change writes the new key and the old one simply stops being consulted.
  */
-export function loadGlobalScope(): boolean {
-  return (
-    loadVersionedJson(
-      GLOBAL_SCOPE_KEY,
-      GLOBAL_SCOPE_VERSION,
-      (value): value is boolean => typeof value === "boolean",
-    ) ?? false
+export function loadScopeKind(): ScopeKind {
+  const stored = loadVersionedJson(
+    SCOPE_KIND_KEY,
+    SCOPE_KIND_VERSION,
+    (value): value is ScopeKind => value === "all" || value === "system" || value === "project",
   );
+  if (stored != null) return stored;
+  const legacyGlobal = loadVersionedJson(
+    LEGACY_GLOBAL_SCOPE_KEY,
+    LEGACY_GLOBAL_SCOPE_VERSION,
+    (value): value is boolean => typeof value === "boolean",
+  );
+  // Nothing remembered at all → the app's default scope, the entered project's.
+  return legacyGlobal === true ? "all" : "project";
 }
 
-/** Remember whether the app is in the cross-project scope. */
-export function saveGlobalScope(global: boolean): void {
-  saveVersionedJson(GLOBAL_SCOPE_KEY, GLOBAL_SCOPE_VERSION, global);
+/** Remember which scope the app is in. */
+export function saveScopeKind(kind: ScopeKind): void {
+  saveVersionedJson(SCOPE_KIND_KEY, SCOPE_KIND_VERSION, kind);
 }
 
 /** The last selected terminal id for `projectId`, or `null` when none is remembered. */

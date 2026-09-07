@@ -210,44 +210,46 @@ describe("the Système tile in the rail", () => {
     expect(rulesOf(rail).filter((r) => between(design, settings, r))).toHaveLength(1);
   });
 
-  it("marks ITSELF and leaves the entered project lit — the marker moves off `Terminals`", async () => {
-    // Human review 01M1EC7Y2625Q07C5386GKHZFS / U1, the whole finding in one test. Système used to
-    // be a SCOPE that replaced the project context: entering it switched the project tile OFF, and
-    // because the page had no route of its own (`/` rendered it) the rail kept lighting `Terminals`
-    // over a screen that was not the project's Terminals. It is a PAGE now, at `/system`.
+  it("TAKES the scope region's mark — the project tile gives up its ring, `Terminals` its own", async () => {
+    // The REVERSAL of human review 01M1EC7Y2625Q07C5386GKHZFS / U1, in one test. U1 had made
+    // Système a mere PAGE, so entering it left the project tile RINGED beside a lit Système tile —
+    // two marks in one region for one question — over a screen that is not that project's. It is a
+    // SCOPE again: one mark. What U1 got right is kept, and is checked here too: `/system` is a
+    // real route, so `Terminals` is at rest rather than lit over a foreign screen.
     installBackend();
     const { router } = renderLayout();
     const system = await screen.findByRole("button", { name: "System" });
     const alpha = await screen.findByRole("button", { name: "Project Alpha" });
     const terminals = screen.getByRole("link", { name: "Terminals" });
     await waitFor(() => expect(alpha.getAttribute("aria-current")).toBe("true"));
-    // On `/`, `Terminals` is the active nav entry — the reference the assertions below measure
-    // against, captured while it is legitimately on.
+    // On `/`, in the project scope: `Terminals` is the active nav entry and Alpha wears the ring —
+    // the reference the assertions below measure against, captured while both are legitimately on.
     expect(terminals.className).toContain("bg-muted");
+    expect(alpha.className).toContain("ring-2");
 
     fireEvent.click(system);
     await waitFor(() => expect(router.state.location.pathname).toBe("/system"));
     await waitFor(() => expect(system.getAttribute("aria-current")).toBe("true"));
-    // THE PROJECT IS STILL ENTERED. Consulting a page has never de-selected a project here, and
-    // Système is a page.
+    // THE SCOPE MOVED: the ring leaves the project, and nothing takes its place on a tile.
+    expect(alpha.className).not.toContain("ring-2");
+    // …and the project is still ENTERED — remembered, not dropped, which is what makes the way
+    // back one click (exactly what U1 was right about).
     expect(alpha.getAttribute("aria-current")).toBe("true");
-    // …and `Terminals` gave the marker back: it is at rest, exactly like the other nav entries.
-    expect(terminals.className).not.toMatch(/(^|\s|:)bg-muted(\s|$)/);
-    expect(terminals.className).toContain("text-muted-foreground");
+    // The section-nav is empty in this scope, so nothing at all is lit in the PAGE region.
+    expect(screen.queryByRole("link", { name: "Terminals" })).toBeNull();
 
-    // Back into the project: the tile lets the marker go, the project keeps its own. The landing
-    // page is the project's HOME, not `/` — entering a project shows you that project, and the
-    // screen that shows a project is its home (see `enterProject`). What this test pins is
-    // unchanged by that: the marker leaves the Système tile and a section entry takes it back.
+    // Back into the project: the tile lets the marker go, the project takes its ring back. The
+    // landing page is the project's HOME, not `/` — entering a project shows you that project, and
+    // the screen that shows a project is its home (see `enterProject`).
     fireEvent.click(alpha);
     await waitFor(() => expect(router.state.location.pathname).toBe("/home"));
     expect(alpha.getAttribute("aria-current")).toBe("true");
+    expect(alpha.className).toContain("ring-2");
     expect(system.getAttribute("aria-current")).toBe("false");
     expect(screen.getByRole("link", { name: "Home" }).className).toContain("bg-muted");
-    expect(terminals.className).not.toMatch(/(^|\s|:)bg-muted(\s|$)/);
   });
 
-  it("does not lose the entered project on the way in, nor on the way back to a project page", async () => {
+  it("does not lose the entered project on the way in, nor on the way back", async () => {
     installBackend();
     const { router } = renderLayout();
     const system = await screen.findByRole("button", { name: "System" });
@@ -258,13 +260,18 @@ describe("the Système tile in the rail", () => {
 
     fireEvent.click(system);
     await waitFor(() => expect(router.state.location.pathname).toBe("/system"));
+    // Still entered, still Beta. The singleton never BECOMES the entered project — it is absent
+    // from `useProjects` by backend contract — so there is nothing for the rail's restore effect
+    // to "recover" from, and it stays silent (the guard it carries for this scope).
     expect(beta.getAttribute("aria-current")).toBe("true");
 
-    // A section entry of that project, straight from the Système page — no detour through `/`.
-    fireEvent.click(screen.getByRole("link", { name: "Work" }));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/work"));
+    // ONE click back, straight onto Beta's own home — the way out of the scope, and the reason the
+    // entered project has to survive it. The section-nav comes back with it.
+    fireEvent.click(beta);
+    await waitFor(() => expect(router.state.location.pathname).toBe("/home"));
     expect(beta.getAttribute("aria-current")).toBe("true");
     expect(system.getAttribute("aria-current")).toBe("false");
+    expect(screen.getByRole("link", { name: "Work" })).toBeTruthy();
   });
 
   it("wears the SECTION-NAV's rule, not the project tile's skin: no background until it is active", async () => {
@@ -310,12 +317,14 @@ describe("the Système tile in the rail", () => {
     await waitFor(() => expect(system.getAttribute("aria-current")).toBe("true"));
   });
 
-  it("MASKS NOTHING: the section entries stay visible and clickable on the Système page", async () => {
-    // The inverse of what this test used to pin (finding S2, now undone by U1). Work / Knowledge /
-    // Engine / Catalogue were hidden while the scope was entered, because the scope REPLACED the
-    // project context and none of the four aggregates exists on the singleton. The project stays
-    // entered now, so those four entries still lead to that project's surfaces — hiding them only
-    // took the user's way back for the time of a visit.
+  it("MASKS THE SIX section entries — every one of them reads a project", async () => {
+    // This test has now said both things, and the second one is the human's ruling. Finding S2 hid
+    // four of them; U1 restored all six on the reasoning that the project is still entered, so they
+    // still lead to its surfaces. True — and that is precisely the objection: they lead OUT of the
+    // scope one has just entered. Système being a scope again, the rule that governs the other two
+    // governs it — an entry belongs to a scope when it READS in it, and the singleton has no Spec,
+    // no idea, no design system and no engine run. The way back is the project tile, one click,
+    // with the project still remembered (the test above).
     installBackend();
     const { router } = renderLayout();
     const system = await screen.findByRole("button", { name: "System" });
@@ -323,21 +332,20 @@ describe("the Système tile in the rail", () => {
     fireEvent.click(system);
     await waitFor(() => expect(router.state.location.pathname).toBe("/system"));
     for (const label of ["Home", "Terminals", "Work", "Ideas", "Engine", "Design"]) {
-      expect(screen.getByRole("link", { name: label })).toBeTruthy();
+      expect(screen.queryByRole("link", { name: label })).toBeNull();
     }
+    // The SCOPE region is untouched — it is the way out, so masking it would strand the user — and
+    // so is Settings, which belongs to no scope.
+    expect(screen.getByRole("link", { name: "All projects" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Project Alpha" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Settings" })).toBeTruthy();
-
-    // …and CLICKABLE, which is the half a presence check cannot prove.
-    fireEvent.click(screen.getByRole("link", { name: "Design" }));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/design"));
-    expect(await screen.findByText("CATALOGUE PAGE")).toBeTruthy();
   });
 
   it("does not redirect ANY project-scoped route — there is nothing left to redirect", async () => {
-    // The redirect of finding S3 existed because the scope made `activeProjectId` meaningless while
-    // it was on: `<CataloguePage>` reads `useComponents(activeProjectId)`, so it would have rendered
-    // the catalogue of the LAST project entered. That observation is still true of the code and is
-    // no longer a problem — the project is still entered, so `/design` shows ITS catalogue.
+    // The redirect of finding S3 armed itself off every project-scoped route to force the user back
+    // to `/`, because the page had no path of its own. It has one (U1's half that is kept), so a
+    // route change is a route change: nothing bounces, and a navigation made from outside the rail
+    // simply lands.
     installBackend();
     const { router } = renderLayout();
     fireEvent.click(await screen.findByRole("button", { name: "System" }));
@@ -360,13 +368,16 @@ describe("the Système tile in the rail", () => {
     await waitFor(() => expect(alpha.getAttribute("aria-current")).toBe("true"));
 
     fireEvent.click(await screen.findByRole("button", { name: "System" }));
-    // It used to be EJECTED to `/` from here, the scope refusing to sit on a project page. Now the
-    // catalogue is simply left for the Système page, like any other navigation.
+    // It used to be EJECTED to `/` from here, the scope refusing to sit on a project page. The
+    // catalogue is simply left for the Système screen now, like any other navigation.
     await waitFor(() => expect(router.state.location.pathname).toBe("/system"));
     expect(alpha.getAttribute("aria-current")).toBe("true");
 
-    fireEvent.click(screen.getByRole("link", { name: "Design" }));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/design"));
+    // The way back is the project TILE, not a section entry (there is none in this scope) — and it
+    // lands on the project's home, the screen that shows a project.
+    fireEvent.click(alpha);
+    await waitFor(() => expect(router.state.location.pathname).toBe("/home"));
     expect(alpha.getAttribute("aria-current")).toBe("true");
+    expect(screen.getByRole("link", { name: "Design" })).toBeTruthy();
   });
 });

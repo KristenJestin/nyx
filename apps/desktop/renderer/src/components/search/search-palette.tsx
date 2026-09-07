@@ -129,6 +129,7 @@ type PaletteRow =
 
 export function SearchPalette({
   onAddWorkspace,
+  systemProjectId = null,
 }: {
   /**
    * Add a workspace to a project: the rail's OWN flow (`useManualAdd`'s picker → name dialog →
@@ -137,9 +138,18 @@ export function SearchPalette({
    * what a palette mounted outside the shell (a test, the catalogue) sees.
    */
   onAddWorkspace?: (projectId: string) => void;
+  /**
+   * The SYSTÈME singleton's project id, or `null` when the database has none — handed down by
+   * `<BaseLayout>` for the same reason as the flow above: the shell already holds that read
+   * (`system_scope_detail`, for the rail's tile), and a second one here would be a second
+   * subscription onto one fact. It is what tells a HOST hit from a project's — see
+   * {@link SearchTargetContext.systemProjectId}. Absent ⇒ every hit resolves as a project's, which
+   * is exactly right for a database with no singleton.
+   */
+  systemProjectId?: string | null;
 } = {}) {
   const navigate = useNavigate();
-  const { setActiveProjectId } = useActiveProject();
+  const { setActiveProjectId, setScopeKind } = useActiveProject();
   const { revealWorkspace } = useRevealWorkspace();
   const { requestTerminal } = usePendingTerminal();
   const [open, setOpen] = useState(false);
@@ -281,12 +291,21 @@ export function SearchPalette({
           terminalAlive = false;
         }
       }
-      const target = resolveSearchTarget(hit, { terminalAlive });
+      const target = resolveSearchTarget(hit, { terminalAlive, systemProjectId });
       // Batched with the close below, so the popup is already rendered with `finalFocus={false}`
       // when Base UI decides where the focus goes.
       if (handOverFocus) setFocusHandoff(true);
       close();
-      setActiveProjectId(target.projectId);
+      // ACTIVATING A HIT ENTERS ITS SCOPE — the same ruling the cross-project home's rows took
+      // (review `01M1ECXAXVGHJWPWA019QAER6G`: clicking a row IS entering what holds it). A HOST hit
+      // enters the Système scope and touches the entered project not at all — the singleton has no
+      // id to put there, and the project is where the rail puts the user back.
+      if (target.to === "/system") {
+        setScopeKind("system");
+      } else {
+        setActiveProjectId(target.projectId);
+        setScopeKind("project");
+      }
       // Keyed on `workspace_id` rather than on a list of kinds: the field IS the question ("does
       // this entity live in a band?"), and the backend sets it on exactly the kinds that do — a
       // command instance, an agent session, the terminal reached through it, and a workspace hit
@@ -297,7 +316,7 @@ export function SearchPalette({
         void navigateToTarget(navigate, target);
       });
     },
-    [close, navigate, revealWorkspace, setActiveProjectId],
+    [close, navigate, revealWorkspace, setActiveProjectId, setScopeKind, systemProjectId],
   );
 
   /**
@@ -597,6 +616,10 @@ function navigateToTarget(navigate: ReturnType<typeof useNavigate>, target: Sear
       return navigate({ to: "/work/$specId", params: { specId: target.params.specId } });
     case "/knowledge":
       return navigate({ to: "/knowledge" });
+    case "/system":
+      // The Système scope's screen, with its OWN `?terminal=` / `?command=` — a different route
+      // from `/`, so an id of one is never carried into the other.
+      return navigate({ to: "/system", search: { ...target.search } });
     default:
       return navigate({ to: "/", search: { ...target.search } });
   }

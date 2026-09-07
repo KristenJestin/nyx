@@ -25,6 +25,11 @@ function scopeArgs(projectId: string | null): Record<string, string> {
  */
 function readScope(scope: ActiveScope): { projectId: string | null; enabled: boolean } {
   if (scope.kind === "all") return { projectId: null, enabled: true };
+  // SYSTÈME reads NOTHING here. The singleton is a runtime container — terminals and managed
+  // commands — and holds no idea backlog; there is no project id to narrow to either, since it is
+  // not one of the projects. The scope is not reachable from this page (its section-nav is empty),
+  // and saying so explicitly is what keeps its `null` from being read as "every project".
+  if (scope.kind === "system") return { projectId: null, enabled: false };
   return { projectId: scope.projectId, enabled: scope.projectId !== null };
 }
 

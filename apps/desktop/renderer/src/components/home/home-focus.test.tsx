@@ -63,7 +63,14 @@ const GLOBAL_SNAPSHOT: HomeSnapshot = {
       cwd: "/ws-p2",
       started_at: 0,
       workspace: { id: "ws-p2", name: "root", branch: null },
-      project: { id: "p2", name: "Beta", accent: null, icon: null, image_path: null },
+      project: {
+        id: "p2",
+        name: "Beta",
+        kind: "user" as const,
+        accent: null,
+        icon: null,
+        image_path: null,
+      },
     },
   ],
   services: [],
@@ -246,7 +253,14 @@ describe("Cross-project focus from the global home", () => {
                   exit_code: null,
                   unread: false,
                   workspace: { id: "ws-p1", name: "root", branch: null },
-                  project: { id: "p1", name: "Alpha", accent: null, icon: null, image_path: null },
+                  project: {
+                    id: "p1",
+                    name: "Alpha",
+                    kind: "user" as const,
+                    accent: null,
+                    icon: null,
+                    image_path: null,
+                  },
                 },
               ],
               specs: [
@@ -259,7 +273,14 @@ describe("Cross-project focus from the global home", () => {
                   tasks_done: 1,
                   tasks_total: 2,
                   phase: null,
-                  project: { id: "p1", name: "Alpha", accent: null, icon: null, image_path: null },
+                  project: {
+                    id: "p1",
+                    name: "Alpha",
+                    kind: "user" as const,
+                    accent: null,
+                    icon: null,
+                    image_path: null,
+                  },
                 },
               ],
               terminals: [
@@ -270,7 +291,14 @@ describe("Cross-project focus from the global home", () => {
                   exec_state: "idle",
                   exec_state_unread: false,
                   workspace: { id: "ws-p1", name: "root", branch: null },
-                  project: { id: "p1", name: "Alpha", accent: null, icon: null, image_path: null },
+                  project: {
+                    id: "p1",
+                    name: "Alpha",
+                    kind: "user" as const,
+                    accent: null,
+                    icon: null,
+                    image_path: null,
+                  },
                 },
               ],
             };
@@ -321,5 +349,177 @@ describe("Cross-project focus from the global home", () => {
     fireEvent.click(screen.getByRole("button", { name: "Project Alpha" }));
 
     await waitFor(() => expect(router.state.location.search).toEqual({}));
+  });
+});
+
+/**
+ * THE SYSTÈME ROW — the same landing, one scope over, and the bug that made this scope necessary.
+ *
+ * The cross-project home lists the Système singleton's terminals and services: `home_snapshot`'s
+ * global read joins with NO filter, deliberately — the host is exactly what one does not want to
+ * miss from a transverse view. Clicking such a row used to pose the singleton as the ENTERED
+ * project and navigate to `/`. That project is absent from `list_projects` (`kind = 'user'`), so
+ * `<BaseLayout>`'s restore effect saw an entered project that "no longer exists", fell back to the
+ * remembered one and ejected the user onto a stranger's Terminals page — the deep-link pointing at
+ * a terminal that project will never have.
+ *
+ * The row now goes where its object lives: the Système SCOPE, at `/system`, deep-link intact. What
+ * makes it possible is the backend MARKING the row (`HomeProject.kind`, joined at source) rather
+ * than the renderer comparing ids against a second read.
+ */
+describe("Focus on a SYSTÈME row from the global home", () => {
+  const SYSTEM_HOME = "/home/kris";
+  const SYSTEM_PROJECT = {
+    id: "p-sys",
+    name: "System",
+    kind: "system" as const,
+    accent: null,
+    icon: null,
+    image_path: null,
+  };
+
+  /** A global home whose only rows belong to the singleton: one bare shell, one live service. */
+  const SYSTEM_SNAPSHOT: HomeSnapshot = {
+    sessions: [],
+    services: [
+      {
+        instance_id: "sys-inst",
+        name: "docker",
+        run_state: "running",
+        exit_code: null,
+        unread: false,
+        workspace: { id: "ws-sys", name: "system", branch: null },
+        project: SYSTEM_PROJECT,
+      },
+    ],
+    specs: [],
+    terminals: [
+      {
+        terminal_id: "sys-term",
+        label: "postgres",
+        cwd: SYSTEM_HOME,
+        exec_state: "idle",
+        exec_state_unread: false,
+        workspace: { id: "ws-sys", name: "system", branch: null },
+        project: SYSTEM_PROJECT,
+      },
+    ],
+  };
+
+  beforeEach(() => {
+    mockIPC(
+      (cmd, args) => {
+        const a = (args ?? {}) as Record<string, unknown>;
+        switch (cmd) {
+          case "list_projects":
+            // USER projects only — the backend contract, reproduced faithfully: the singleton is
+            // NOT here, which is the whole reason entering it as a project could not work.
+            return [project("p1", "Alpha")];
+          case "list_workspaces":
+            return [workspace(`ws-${a.projectId as string}`, a.projectId as string)];
+          case "home_snapshot":
+            return SYSTEM_SNAPSHOT;
+          case "system_scope_detail":
+            return {
+              project: { ...project("p-sys", "System"), kind: "system" },
+              workspace: { ...workspace("ws-sys", "p-sys"), name: "system", path: SYSTEM_HOME },
+              home: SYSTEM_HOME,
+            };
+          case "workspace_runtime_snapshot": {
+            const wsId = a.workspaceId as string;
+            const terminals =
+              wsId === "ws-sys"
+                ? [
+                    {
+                      id: "sys-term",
+                      cwd: SYSTEM_HOME,
+                      label: "postgres",
+                      workspace_id: wsId,
+                      status: "alive",
+                      exec_state: "idle",
+                      exec_state_unread: false,
+                      sessions: [],
+                    },
+                  ]
+                : [];
+            const services =
+              wsId === "ws-sys"
+                ? [
+                    {
+                      id: "sys-inst",
+                      command_id: "cmd-1",
+                      workspace_id: wsId,
+                      name: "docker",
+                      command: "docker compose up",
+                      run_state: "running",
+                      exit_code: null,
+                      unread: false,
+                    },
+                  ]
+                : [];
+            return {
+              workspace: { id: wsId, name: "root", path: `/${wsId}` },
+              terminals,
+              agent_sessions: [],
+              services,
+            };
+          }
+          case "pty_spawn":
+            return 100;
+          default:
+            return [];
+        }
+      },
+      { shouldMockEvents: true },
+    );
+  });
+
+  it("takes a Système TERMINAL to `/system?terminal=`, in the Système scope, deep-link intact", async () => {
+    const router = createAppRouter(["/home?scope=all"]);
+    render(<RouterProvider router={router} />);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Project Alpha" }).getAttribute("aria-current"),
+      ).toBe("true"),
+    );
+
+    fireEvent.click(await screen.findByTestId("home-terminal-sys-term"));
+
+    await waitFor(() => expect(router.state.location.pathname).toBe("/system"));
+    // The deep-link SURVIVES the scope change — the whole reason this hook does not go through
+    // `enterProject`, one scope over.
+    expect(router.state.location.search).toEqual({ terminal: "sys-term" });
+    // The rail says Système, and NO project is selected…
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "System" }).getAttribute("aria-current")).toBe(
+        "true",
+      ),
+    );
+    expect(screen.getByRole("button", { name: "Project Alpha" }).className).not.toContain("ring-2");
+    // …while Alpha is still ENTERED, untouched: the singleton is not a project one enters, so the
+    // way back stays one click. This is exactly what the old path destroyed.
+    expect(screen.getByRole("button", { name: "Project Alpha" }).getAttribute("aria-current")).toBe(
+      "true",
+    );
+  });
+
+  it("takes a Système SERVICE to `/system?command=`, and the page selects it", async () => {
+    const router = createAppRouter(["/home?scope=all"]);
+    render(<RouterProvider router={router} />);
+    await screen.findByRole("button", { name: "System" });
+
+    fireEvent.click(await screen.findByTestId("home-service-sys-inst"));
+
+    await waitFor(() => expect(router.state.location.pathname).toBe("/system"));
+    expect(router.state.location.search).toEqual({ command: "sys-inst" });
+    // The deep-link is CONSUMED, not merely carried: the service's row is the selected one, which
+    // is what puts its live output pane on screen.
+    await waitFor(() =>
+      expect(
+        (screen.getByText("docker").closest("[data-selected]") as HTMLElement | null)?.getAttribute(
+          "data-selected",
+        ),
+      ).toBe("true"),
+    );
   });
 });

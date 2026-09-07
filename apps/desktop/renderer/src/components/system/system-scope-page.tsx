@@ -49,14 +49,24 @@ import { useSystemScope, type SystemScopeDetail } from "./use-system-scope";
  * is a PAGE OF ITS OWN — the `/system` route (human review `01M1EC7Y2625Q07C5386GKHZFS`, finding
  * U1).
  *
- * ## A page, not a scope
+ * ## A page AND a scope — and the page is what the scope shows
  *
- * It used to render in the index route's slot, switched by a `systemScope` flag that ALSO replaced
- * the project context: the entered project was de-selected, Work / Knowledge / Engine / Catalogue
- * were masked, and any project-scoped route redirected here. The user's verdict on the real app was
- * that losing one's project to consult a page makes no sense — so the page took a path, and
- * everything the flag did with the project went with the flag. The entered project stays entered
- * while this screen is up; the only thing this page owns is its own column.
+ * The two were opposed once, and the opposition was the mistake. It used to render in the index
+ * route's slot, switched by a `systemScope` flag: no path of its own, so the rail lit `Terminals`
+ * over a screen that was not the project's Terminals (finding U1). U1 gave it a path and removed
+ * the scope — which broke the other half, since the rail then showed a project entered AND
+ * selected while the host's terminals filled the screen. The human decision keeps the PATH and
+ * restores the SCOPE: `/system` is the one screen of `{kind:"system"}`.
+ *
+ * THE MIRROR THAT KEEPS THE TWO IN STEP IS THE ROUTE'S, not this component's — `SystemRouteComponent`
+ * in `router.tsx`. `/home` reads a `?scope=` param and needs it INSIDE the page (the page renders
+ * differently per scope); `/system` names its scope simply by being MATCHED, so the statement
+ * belongs to the match. It keeps this component free of the router and of the app's scope context —
+ * it is a screen, and it renders the singleton it is given.
+ *
+ * What U1 got right survives untouched: the ENTERED PROJECT is not de-selected, only unmarked. It
+ * is remembered by `<ActiveProjectProvider>` for the whole visit, so one click on its rail tile
+ * puts the user back exactly where they were.
  *
  * ## Two reads, composed HERE
  *
@@ -83,7 +93,15 @@ import { useSystemScope, type SystemScopeDetail } from "./use-system-scope";
  * `C:/Users/…`. Nothing converts the other way: `create_system_terminal` takes no path at all — the
  * use case reads the home off the bootstrapped scope — so a `~` can never reach the backend.
  */
-export function SystemScopePage() {
+export function SystemScopePage({
+  deepLinkTerminalId = null,
+  deepLinkCommandId = null,
+}: {
+  /** `?terminal=<id>` — the singleton terminal to select on arrival, else `null`. */
+  deepLinkTerminalId?: string | null;
+  /** `?command=<id>` — the singleton command INSTANCE whose output pane to open, else `null`. */
+  deepLinkCommandId?: string | null;
+} = {}) {
   const { scope, loading, error, refresh } = useSystemScope();
 
   // LOADING — the first read has not answered yet. The shell (rail + chrome) is already on screen
@@ -130,11 +148,25 @@ export function SystemScopePage() {
     );
   }
 
-  return <SystemScopeLoaded scope={scope} />;
+  return (
+    <SystemScopeLoaded
+      scope={scope}
+      deepLinkTerminalId={deepLinkTerminalId}
+      deepLinkCommandId={deepLinkCommandId}
+    />
+  );
 }
 
 /** The page once the scope is known: the runtime read, the providers, the two columns. */
-function SystemScopeLoaded({ scope }: { scope: SystemScopeDetail }) {
+function SystemScopeLoaded({
+  scope,
+  deepLinkTerminalId,
+  deepLinkCommandId,
+}: {
+  scope: SystemScopeDetail;
+  deepLinkTerminalId: string | null;
+  deepLinkCommandId: string | null;
+}) {
   const workspaceIds = useMemo(() => [scope.workspace.id], [scope.workspace.id]);
   const { runtimeByWorkspace } = useProjectRuntime(workspaceIds);
   const snapshot = runtimeByWorkspace.get(scope.workspace.id) ?? null;
@@ -153,6 +185,8 @@ function SystemScopeLoaded({ scope }: { scope: SystemScopeDetail }) {
           <SystemScopeBody
             scope={scope}
             snapshot={snapshot}
+            deepLinkTerminalId={deepLinkTerminalId}
+            deepLinkCommandId={deepLinkCommandId}
             onOpenCommands={() => setCommandsOpen(true)}
           />
         </ConsumedNotificationsProvider>
@@ -176,11 +210,17 @@ function SystemScopeLoaded({ scope }: { scope: SystemScopeDetail }) {
 function SystemScopeBody({
   scope,
   snapshot,
+  deepLinkTerminalId,
+  deepLinkCommandId,
   onOpenCommands,
 }: {
   scope: SystemScopeDetail;
   /** The Système workspace's live aggregate, or `null` until the first snapshot lands. */
   snapshot: WorkspaceRuntimeSnapshot | null;
+  /** `?terminal=<id>`, or `null`. */
+  deepLinkTerminalId: string | null;
+  /** `?command=<id>`, or `null`. */
+  deepLinkCommandId: string | null;
   /** Open the command manager (the Commands section's gear). */
   onOpenCommands: () => void;
 }) {
@@ -293,20 +333,64 @@ function SystemScopeBody({
   // perimeter. It has no renderer caller as a result — that state was flagged, and review
   // `01M1EGR1777881EQ59MWV6QYYZ` (V1) settled it: the IPC is KEPT as the human twin of the MCP tool.
 
+  // DEEP-LINK: when the url carries `?terminal=<id>` (a Système row of the cross-project home, or
+  // a hit of the search palette), select THAT terminal as soon as it appears in the singleton's
+  // runtime — overriding the auto-select below. Applied ONCE per distinct target id (a ref guards
+  // it) so the user can freely select another terminal afterwards without being yanked back.
+  //
+  // This is `<TerminalsPage>`'s rule verbatim, and deliberately so: the two screens answer the same
+  // question over the same selection provider, and a second, subtly different rule for the
+  // singleton would be a second behaviour to keep in step. The one thing that differs is which
+  // runtime the target is looked for in — this workspace's, which is the whole point.
+  const appliedDeepLinkRef = useRef<string | null>(null);
+  const deepLinkExists =
+    deepLinkTerminalId != null && terminals.some((t) => t.id === deepLinkTerminalId);
+  useEffect(() => {
+    if (
+      deepLinkTerminalId != null &&
+      deepLinkExists &&
+      appliedDeepLinkRef.current !== deepLinkTerminalId
+    ) {
+      appliedDeepLinkRef.current = deepLinkTerminalId;
+      select({ kind: "terminal", id: deepLinkTerminalId });
+    }
+  }, [deepLinkTerminalId, deepLinkExists, select]);
+
+  // The MIRROR of the terminal deep-link, for a managed COMMAND: `?command=<id>` selects that
+  // service so its live output pane shows. Same once-per-id guard.
+  const appliedCommandDeepLinkRef = useRef<string | null>(null);
+  const commandDeepLinkExists =
+    deepLinkCommandId != null && services.some((s) => s.id === deepLinkCommandId);
+  useEffect(() => {
+    if (
+      deepLinkCommandId != null &&
+      commandDeepLinkExists &&
+      appliedCommandDeepLinkRef.current !== deepLinkCommandId
+    ) {
+      appliedCommandDeepLinkRef.current = deepLinkCommandId;
+      select({ kind: "service", id: deepLinkCommandId });
+    }
+  }, [deepLinkCommandId, commandDeepLinkExists, select]);
+
   // Auto-focus a terminal on entry (restore the scope's last one, else the first), and remember the
   // selected terminal — the SAME persistence the project page uses, keyed by the singleton's own
   // project id, so returning to System reopens where the user left off. A no-op once anything is
-  // selected: the user's own choice is never overridden.
+  // selected: the user's own choice is never overridden. SUPPRESSED while a deep-link is
+  // outstanding (present but not yet applied, or still waiting for its target to appear) so it
+  // never races the deep-link onto the first terminal.
   const firstTerminalId = terminals[0]?.id ?? null;
+  const deepLinkOutstanding =
+    (deepLinkTerminalId != null && appliedDeepLinkRef.current !== deepLinkTerminalId) ||
+    (deepLinkCommandId != null && appliedCommandDeepLinkRef.current !== deepLinkCommandId);
   useEffect(() => {
-    if (selected != null || firstTerminalId == null) return;
+    if (selected != null || firstTerminalId == null || deepLinkOutstanding) return;
     const remembered = loadLastTerminalId(projectId);
     const restore =
       remembered != null && terminals.some((t) => t.id === remembered)
         ? remembered
         : firstTerminalId;
     select({ kind: "terminal", id: restore });
-  }, [selected, firstTerminalId, projectId, terminals, select]);
+  }, [selected, firstTerminalId, deepLinkOutstanding, projectId, terminals, select]);
   useEffect(() => {
     if (selected?.kind === "terminal") saveLastTerminalId(projectId, selected.id);
   }, [selected, projectId]);

@@ -16,26 +16,33 @@ import type { ProjectRecord, WorkspaceRecord } from "@/components/sidebar/use-pr
 
 import { ActiveProjectProvider, useActiveProject } from "./active-project";
 import { BaseLayout } from "./base-layout";
-import { loadGlobalScope, saveGlobalScope } from "./ui-persistence";
+import { loadScopeKind, saveScopeKind } from "./ui-persistence";
 
 /**
- * THE APP SCOPE — "all projects" as a STATE OF THE APPLICATION, not a parameter of one page.
+ * THE APP SCOPE — THREE scopes as a STATE OF THE APPLICATION, not a parameter of one page: the
+ * ENTERED PROJECT, ALL PROJECTS, and SYSTÈME.
  *
- * This is the FOUNDATION the five cross-project pages (Terminals, Work, Knowledge, Engine, Design)
- * will branch onto, so what is proven here is the CONTRACT and nothing about any page's content:
+ * This is the FOUNDATION every page branches onto, so what is proven here is the CONTRACT and
+ * nothing about any page's content:
  *
  *   1. ONE source of truth — `useActiveProject().scope` — that any page can read without knowing
  *      the home exists, let alone parsing its url;
  *   2. it SURVIVES navigation between every page;
  *   3. it is PERSISTED and restored at relaunch, exactly as the entered project is;
- *   4. entering a project LEAVES it — the two are exclusive;
- *   5. and it never gets spelled as `activeProjectId === null`, which keeps its one meaning
- *      ("no project is loaded") and the three empty states that read it.
+ *   4. the three are EXCLUSIVE — entering one leaves the other two;
+ *   5. and none of them ever gets spelled as `activeProjectId === null`, which keeps its one
+ *      meaning ("no project is loaded") and the three empty states that read it.
+ *
+ * SYSTÈME IS THE THIRD ONE since the human decision that reverses finding U1
+ * (`01M1EC7Y2625Q07C5386GKHZFS`). It had been demoted to a mere page, which left the rail marking a
+ * project as entered AND selected while the host's terminals filled the screen, and left six
+ * project entries in the section-nav over a scope that has none of them. What U1 gave it — a route
+ * of its own — is KEPT, and that route now MIRRORS the scope the way `/home?scope=` does.
  *
  * The rail is mounted for real (`<BaseLayout>`), because the rail is the scope SELECTOR: the
- * `All projects` tile enters the mode and a project tile leaves it. The pages are a PROBE (which
- * reads the contract as a page would) plus the real `<BoardPage>`, whose `activeProjectId === null`
- * empty state is one of the three the mode must not trip.
+ * `All projects` bar, the project tiles and the Système tile are the three ways in. The pages are a
+ * PROBE (which reads the contract as a page would) plus the real `<BoardPage>`, whose
+ * `activeProjectId === null` empty state is one of the three the mode must not trip.
  */
 
 function project(id: string, name: string): ProjectRecord {
@@ -56,7 +63,14 @@ function workspace(projectId: string): WorkspaceRecord {
   };
 }
 
-function installBackend() {
+/**
+ * The backend the shell reads. `withSystem` decides whether the SINGLETON exists: `false` plays the
+ * documented `null` answer of a database that never bootstrapped one (the rail then renders no
+ * Système tile at all), `true` plays a real install. The cases about the project ↔ all pair keep
+ * the former — the tile is irrelevant to them and its absence proves the rail survives it — and the
+ * Système cases take the latter.
+ */
+function installBackend(withSystem = false) {
   mockIPC(
     (cmd, args) => {
       const a = (args ?? {}) as Record<string, unknown>;
@@ -77,10 +91,16 @@ function installBackend() {
         case "spec_list":
           return [];
         case "system_scope_detail":
-          // The Système singleton is ABSENT on this fixture — the documented `null` answer of a
-          // database with no scope. The rail then renders no tile, which is what these cases are
-          // about; the catch-all below answers `[]`, and `[]` is not a `{project, workspace, home}`.
-          return null;
+          // `list_projects` above answers USER projects only — the backend contract
+          // (`db::list_projects` filters `kind = 'user'`), reproduced faithfully: the singleton
+          // reaches the rail through THIS read and lands outside the reorderable array.
+          return withSystem
+            ? {
+                project: { ...project("sys", "System"), kind: "system" },
+                workspace: { ...workspace("sys"), name: "system", path: "/home/kris" },
+                home: "/home/kris",
+              }
+            : null;
         default:
           return [];
       }
@@ -94,15 +114,22 @@ function installBackend() {
  * one `useActiveProject()` call, one branch on `scope.kind`, and NOTHING about the url.
  */
 function ScopeProbe() {
-  const { scope, globalScope, activeProjectId } = useActiveProject();
+  const { scope, globalScope, systemScope, activeProjectId } = useActiveProject();
   return (
     <div
       data-testid="probe"
       data-kind={scope.kind}
       data-global={globalScope}
-      // What the page would hand its read model: the project id in the project scope, and the
-      // absence of any id in the global one. `null` here is "no project loaded", never "all".
-      data-read={scope.kind === "all" ? "ALL" : (scope.projectId ?? "NONE")}
+      data-system={systemScope}
+      // What the page would hand its read model: the project id in the project scope, and NO id at
+      // all in the two others. `null` here is "no project loaded", never "all" and never "system".
+      data-read={
+        scope.kind === "all"
+          ? "ALL"
+          : scope.kind === "system"
+            ? "SYSTEM"
+            : (scope.projectId ?? "NONE")
+      }
       data-entered={activeProjectId ?? "NONE"}
     />
   );
@@ -152,6 +179,10 @@ function mountApp(entry = "/") {
       probe("/"),
       homeRoute,
       workRoute,
+      // The SYSTÈME scope's one screen. A probe rather than the real `<SystemScopePage>`: what is
+      // under test here is the app's scope contract, and the page's own behaviour has its own
+      // suite (`system/system-scope-page.test.tsx`).
+      probe("/system"),
       probe("/knowledge"),
       probe("/engine"),
       probe("/design"),
@@ -183,7 +214,24 @@ function railSaysGlobal(): boolean {
   return allProjectsTile().closest("li")!.getAttribute("data-active") === "true";
 }
 
-describe("The app scope — one source of truth for the six pages", () => {
+/** The rail's SYSTÈME tile — the third scope's way in. */
+function systemTile(): HTMLElement {
+  return screen.getByRole("button", { name: "System" });
+}
+
+/** Whether the rail draws the app as being in the Système scope. */
+function railSaysSystem(): boolean {
+  return systemTile().getAttribute("aria-current") === "true";
+}
+
+/** The labels the section-nav is drawing right now, in DOM order. */
+function navLabels(): string[] {
+  return ["Home", "Terminals", "Work", "Ideas", "Engine", "Design"].filter(
+    (label) => screen.queryByRole("link", { name: label }) !== null,
+  );
+}
+
+describe("The app scope — one source of truth for every page", () => {
   beforeEach(() => {
     installBackend();
   });
@@ -235,7 +283,7 @@ describe("The app scope — one source of truth for the six pages", () => {
     await entered("Alpha");
     fireEvent.click(allProjectsTile());
     await waitFor(() => expect(railSaysGlobal()).toBe(true));
-    expect(loadGlobalScope()).toBe(true);
+    expect(loadScopeKind()).toBe("all");
     first.unmount();
 
     // A RELAUNCH: a brand-new app over the same renderer storage, on the app's default route.
@@ -247,7 +295,7 @@ describe("The app scope — one source of truth for the six pages", () => {
   });
 
   it("ENTERING A PROJECT LEAVES the global scope — the two are exclusive", async () => {
-    saveGlobalScope(true);
+    saveScopeKind("all");
     mountApp("/work");
     await entered("Alpha");
     await waitFor(() => expect(railSaysGlobal()).toBe(true));
@@ -258,11 +306,11 @@ describe("The app scope — one source of truth for the six pages", () => {
     await waitFor(() => expect(p.getAttribute("data-kind")).toBe("project"));
     expect(p.getAttribute("data-read")).toBe("p2");
     expect(railSaysGlobal()).toBe(false);
-    expect(loadGlobalScope()).toBe(false);
+    expect(loadScopeKind()).toBe("project");
   });
 
   it("leaves the global scope through the rail's `Home` too — the entered project's own recap", async () => {
-    saveGlobalScope(true);
+    saveScopeKind("all");
     mountApp("/work");
     await entered("Alpha");
     await waitFor(() => expect(railSaysGlobal()).toBe(true));
@@ -344,5 +392,150 @@ describe("The app scope — one source of truth for the six pages", () => {
     fireEvent.click(screen.getByRole("link", { name: "Home" }));
     await waitFor(() => expect(p.getAttribute("data-kind")).toBe("project"));
     expect(railSaysGlobal()).toBe(false);
+  });
+});
+
+/**
+ * SYSTÈME — the THIRD scope, and the reversal of finding U1 (`01M1EC7Y2625Q07C5386GKHZFS`).
+ *
+ * These cases used to live in `system/system-rail.test.tsx` asserting the OPPOSITE: that entering
+ * Système left the project tile lit and the six section entries standing, because Système was "a
+ * page one visits, not a place one moves into". Seen in the real app, that model put two
+ * contradictory marks in the rail's scope region and offered a nav that leads out of the scope one
+ * has just entered. The human ruled the other way; this is the contract that replaces it.
+ *
+ * What U1 got right is UNCHANGED and still checked here: `/system` is a real route, and the entered
+ * project is REMEMBERED rather than dropped — one click on its tile puts the user back.
+ */
+describe("The SYSTÈME scope — the third one", () => {
+  beforeEach(() => {
+    installBackend(true);
+  });
+
+  it("the Système tile puts the WHOLE APP in the `system` scope, and carries no project id", async () => {
+    mountApp("/");
+    await entered("Alpha");
+
+    fireEvent.click(systemTile());
+
+    const p = await probe();
+    await waitFor(() => expect(p.getAttribute("data-kind")).toBe("system"));
+    // No project id, by construction — the guard that keeps a page from reading the entered
+    // project's runtime while claiming to show the host's.
+    expect(p.getAttribute("data-read")).toBe("SYSTEM");
+    expect(p.getAttribute("data-system")).toBe("true");
+    expect(p.getAttribute("data-global")).toBe("false");
+    expect(railSaysSystem()).toBe(true);
+  });
+
+  it("navigates to `/system`, and a deep-linked `/system` ENTERS the scope", async () => {
+    // The route survives U1 — a scope with no path of its own is what made the rail light
+    // `Terminals` over the host's screen. What is added is the MIRROR, both ways.
+    const first = mountApp("/");
+    await entered("Alpha");
+    fireEvent.click(systemTile());
+    await waitFor(() => expect(first.router.state.location.pathname).toBe("/system"));
+    first.unmount();
+
+    const { router } = mountApp("/system");
+    await entered("Alpha");
+    const p = await probe();
+    await waitFor(() => expect(p.getAttribute("data-kind")).toBe("system"));
+    expect(router.state.location.pathname).toBe("/system");
+    expect(railSaysSystem()).toBe(true);
+  });
+
+  it("DESELECTS every project tile — one mark in the scope region, never two", async () => {
+    mountApp("/");
+    const alpha = await entered("Alpha");
+    expect(alpha.className).toContain("ring-2");
+
+    fireEvent.click(systemTile());
+    await waitFor(() => expect(railSaysSystem()).toBe(true));
+
+    // The ring is gone from EVERY tile — the same rule the global scope already followed.
+    for (const name of ["Project Alpha", "Project Beta"]) {
+      expect(screen.getByRole("button", { name }).className).not.toContain("ring-2");
+    }
+    expect(railSaysGlobal()).toBe(false);
+    // …but the project is still ENTERED. It is remembered, not dropped: that is what makes going
+    // back one click, and what U1 was right to insist on.
+    expect(screen.getByRole("button", { name: "Project Alpha" }).getAttribute("aria-current")).toBe(
+      "true",
+    );
+    expect((await probe()).getAttribute("data-entered")).toBe("p1");
+  });
+
+  it("EMPTIES the section-nav — every entry of it reads a project", async () => {
+    mountApp("/");
+    await entered("Alpha");
+    expect(navLabels()).toEqual(["Home", "Terminals", "Work", "Ideas", "Engine", "Design"]);
+
+    fireEvent.click(systemTile());
+    await waitFor(() => expect(railSaysSystem()).toBe(true));
+
+    // NONE of the six. They read the entered project (five) or the projects as a set (three of
+    // them are `crossProject`); the singleton is in neither, so all six would lead OUT of the scope
+    // just entered. The `All projects` bar and the project tiles are untouched — they are the scope
+    // region, which is precisely the way out.
+    expect(navLabels()).toEqual([]);
+    expect(allProjectsTile()).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Project Alpha" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Settings" })).toBeTruthy();
+  });
+
+  it("is LEFT by a project tile, which restores the project scope and its nav", async () => {
+    mountApp("/");
+    await entered("Alpha");
+    fireEvent.click(systemTile());
+    await waitFor(() => expect(railSaysSystem()).toBe(true));
+
+    fireEvent.click(screen.getByRole("button", { name: "Project Beta" }));
+
+    const p = await probe();
+    await waitFor(() => expect(p.getAttribute("data-kind")).toBe("project"));
+    expect(p.getAttribute("data-read")).toBe("p2");
+    expect(railSaysSystem()).toBe(false);
+    expect(navLabels()).toEqual(["Home", "Terminals", "Work", "Ideas", "Engine", "Design"]);
+  });
+
+  it("is LEFT by the `All projects` bar too — the three are exclusive", async () => {
+    mountApp("/");
+    await entered("Alpha");
+    fireEvent.click(systemTile());
+    await waitFor(() => expect(railSaysSystem()).toBe(true));
+
+    fireEvent.click(allProjectsTile());
+
+    const p = await probe();
+    await waitFor(() => expect(p.getAttribute("data-kind")).toBe("all"));
+    expect(railSaysSystem()).toBe(false);
+    expect(railSaysGlobal()).toBe(true);
+  });
+
+  it("is PERSISTED and restored at relaunch, like the other two", async () => {
+    const first = mountApp("/");
+    await entered("Alpha");
+    fireEvent.click(systemTile());
+    await waitFor(() => expect(railSaysSystem()).toBe(true));
+    expect(loadScopeKind()).toBe("system");
+    first.unmount();
+
+    const { router } = mountApp("/system");
+    await entered("Alpha");
+    await waitFor(() => expect(railSaysSystem()).toBe(true));
+    expect(router.state.location.pathname).toBe("/system");
+  });
+
+  it("falls back to the project scope when the singleton VANISHES under the page", async () => {
+    // The tile stops being rendered on a database with no singleton, so a `/system` left standing
+    // would be a screen nothing in the rail points at — and a scope nothing in the rail marks.
+    installBackend(false);
+    const { router } = mountApp("/system");
+    await entered("Alpha");
+    await waitFor(() => expect(router.state.location.pathname).toBe("/"));
+    const p = await probe();
+    await waitFor(() => expect(p.getAttribute("data-kind")).toBe("project"));
+    expect(screen.queryByRole("button", { name: "System" })).toBeNull();
   });
 });

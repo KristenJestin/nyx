@@ -395,3 +395,67 @@ describe("SystemScopePage", () => {
     }
   });
 });
+
+/**
+ * THE DEEP-LINK — `/system?terminal=` / `?command=`, the route's own params (`router.tsx`), handed
+ * down as props.
+ *
+ * It is the exact rule `<TerminalsPage>` applies, over the singleton's runtime instead of a
+ * project's: apply ONCE per distinct target id (so a later selection is never yanked back), and
+ * SUPPRESS the auto-select-first while a target is outstanding (so the restore never races the
+ * deep-link onto the wrong pane). Written twice because the two screens are two pages; pinned twice
+ * for the same reason.
+ *
+ * The reason it exists at all: the cross-project home lists the singleton's terminals and services,
+ * and clicking one has to land ON that object rather than merely on the scope.
+ */
+describe("SystemScopePage — the deep-link", () => {
+  /** The row whose `data-selected` is `true`, by its visible label. */
+  function selectedRow(): HTMLElement | null {
+    return document.querySelector<HTMLElement>('[data-selected="true"]');
+  }
+
+  it("selects the terminal named by `?terminal=`, over the auto-select-first", async () => {
+    installBackend();
+    render(<SystemScopePage deepLinkTerminalId="sys-term-2" />);
+    await sidebar();
+    // `sys-term` is FIRST in the snapshot, so the auto-select would have taken it. It did not.
+    await waitFor(() => expect(selectedRow()).not.toBeNull());
+    expect(within(selectedRow()!).queryByText("logs")).not.toBeNull();
+  });
+
+  it("selects the service named by `?command=` — its live output pane", async () => {
+    installBackend();
+    render(<SystemScopePage deepLinkCommandId="sys-inst" />);
+    await sidebar();
+    await waitFor(() =>
+      expect(
+        (
+          screen.getByText("palbank services").closest("[data-selected]") as HTMLElement | null
+        )?.getAttribute("data-selected"),
+      ).toBe("true"),
+    );
+  });
+
+  it("WAITS for a target that is not here yet — the index route's rule, cost included", async () => {
+    // A terminal can appear a beat AFTER the page (the runtime is a second read), so the deep-link
+    // is not abandoned on a first miss — and the auto-select stays suppressed meanwhile, or it
+    // would race the deep-link onto the first pane and the arriving target would then yank the user
+    // off whatever they had started reading.
+    //
+    // The cost is real, and it is `<TerminalsPage>`'s too: an id that will NEVER appear leaves an
+    // empty deck. That is why the CALLERS keep it honest — `resolveSearchTarget` drops a
+    // `?terminal=` at a dead terminal, and nothing routes a project's id to `/system`.
+    installBackend();
+    render(<SystemScopePage deepLinkTerminalId="not-in-this-scope" />);
+    await sidebar();
+    expect(selectedRow()).toBeNull();
+  });
+
+  it("takes NO deep-link at all as the plain page — the auto-select owns the entry", async () => {
+    installBackend();
+    render(<SystemScopePage />);
+    await sidebar();
+    await waitFor(() => expect(selectedRow()).not.toBeNull());
+  });
+});

@@ -10493,6 +10493,9 @@ pub struct HomeSessionRow {
     pub workspace_branch: Option<String>,
     pub project_id: Option<String>,
     pub project_name: Option<String>,
+    /// The project's NATURE — `user` or `system` (`db::PROJECT_KIND_*`), joined at the source so
+    /// a row says what its container IS. `None` exactly where `project_id` is.
+    pub project_kind: Option<String>,
     pub project_accent: Option<String>,
     pub project_icon: Option<String>,
     pub project_image_path: Option<String>,
@@ -10513,6 +10516,8 @@ pub struct HomeServiceRow {
     pub workspace_branch: Option<String>,
     pub project_id: String,
     pub project_name: String,
+    /// The project's NATURE — `user` or `system` (`db::PROJECT_KIND_*`), joined at the source.
+    pub project_kind: String,
     pub project_accent: Option<String>,
     pub project_icon: Option<String>,
     pub project_image_path: Option<String>,
@@ -10534,6 +10539,8 @@ pub struct HomeSpecRow {
     pub project_id: String,
     pub project_key: String,
     pub project_name: String,
+    /// The project's NATURE — `user` or `system` (`db::PROJECT_KIND_*`), joined at the source.
+    pub project_kind: String,
     pub project_accent: Option<String>,
     pub project_icon: Option<String>,
     pub project_image_path: Option<String>,
@@ -10553,6 +10560,9 @@ pub struct HomeTerminalRow {
     pub workspace_branch: Option<String>,
     pub project_id: Option<String>,
     pub project_name: Option<String>,
+    /// The project's NATURE — `user` or `system` (`db::PROJECT_KIND_*`), joined at the source so
+    /// a row says what its container IS. `None` exactly where `project_id` is.
+    pub project_kind: Option<String>,
     pub project_accent: Option<String>,
     pub project_icon: Option<String>,
     pub project_image_path: Option<String>,
@@ -10598,6 +10608,7 @@ pub fn home_sessions(
             workspaces::branch.nullable(),
             projects::id.nullable(),
             projects::name.nullable(),
+            projects::kind.nullable(),
             projects::accent.nullable(),
             projects::icon.nullable(),
             projects::image_path.nullable(),
@@ -10637,6 +10648,7 @@ pub fn home_services(
             workspaces::branch,
             projects::id,
             projects::name,
+            projects::kind,
             projects::accent,
             projects::icon,
             projects::image_path,
@@ -10672,6 +10684,7 @@ pub fn home_specs(
             projects::id,
             projects::key,
             projects::name,
+            projects::kind,
             projects::accent,
             projects::icon,
             projects::image_path,
@@ -10757,6 +10770,7 @@ pub fn home_terminals(
             workspaces::branch.nullable(),
             projects::id.nullable(),
             projects::name.nullable(),
+            projects::kind.nullable(),
             projects::accent.nullable(),
             projects::icon.nullable(),
             projects::image_path.nullable(),

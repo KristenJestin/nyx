@@ -45,7 +45,7 @@ import { useHomeSnapshot } from "./use-home-snapshot";
  */
 export function HomePage({ scope = "project" }: { scope?: "project" | "all" }) {
   const global = scope === "all";
-  const { activeProjectId, setGlobalScope } = useActiveProject();
+  const { activeProjectId, setScopeKind } = useActiveProject();
   const { projects, loading: projectsLoading } = useProjects();
   // THIS PAGE'S URL IS THE APP'S SCOPE, WRITTEN DOWN — so it writes it back.
   //
@@ -54,8 +54,9 @@ export function HomePage({ scope = "project" }: { scope?: "project" | "all" }) {
   // one url that spells it out, which makes this page the app's scope BOOKMARK: arriving here
   // through `/home?scope=all` — the `All projects` tile, but also a deep link or a restored route
   // — puts the app in the global scope, and arriving on the bare `/home` puts it back in the
-  // entered project's. One direction only, and only from the route that names a scope: the four
-  // other pages never touch it, which is what lets the mode hold across them.
+  // entered project's. One direction only, and only from a route that NAMES a scope: this one and
+  // `/system` (which mirrors its own existence the same way, `system-scope-page.tsx`). The pages
+  // that name none never touch it, which is what lets a scope hold across them.
   //
   // GUARDED ON BEING THE CURRENT SCREEN, and that guard is load-bearing rather than defensive: a
   // page is still mounted while the router commits a navigation AWAY from it, and a re-render in
@@ -65,8 +66,8 @@ export function HomePage({ scope = "project" }: { scope?: "project" | "all" }) {
   const onHomeRoute = useRouterState({ select: (s) => s.location.pathname === "/home" });
   useEffect(() => {
     if (!onHomeRoute) return;
-    setGlobalScope(global);
-  }, [global, onHomeRoute, setGlobalScope]);
+    setScopeKind(global ? "all" : "project");
+  }, [global, onHomeRoute, setScopeKind]);
   // THE SCOPE, in one expression. On the project page the read WAITS for the entered project (the
   // rail resolves it one hop after mount) rather than falling through to the global read, which
   // would flash another project's rows on this one.
@@ -158,6 +159,7 @@ export function HomePage({ scope = "project" }: { scope?: "project" | "all" }) {
               onOpen={(session) =>
                 focus({
                   projectId: session.project?.id ?? null,
+                  system: session.project?.kind === "system",
                   search: { terminal: session.terminal_id },
                 })
               }
@@ -171,6 +173,7 @@ export function HomePage({ scope = "project" }: { scope?: "project" | "all" }) {
               onOpen={(service) =>
                 focus({
                   projectId: service.project.id,
+                  system: service.project.kind === "system",
                   search: { command: service.instance_id },
                 })
               }
@@ -181,6 +184,7 @@ export function HomePage({ scope = "project" }: { scope?: "project" | "all" }) {
               onOpen={(terminal) =>
                 focus({
                   projectId: terminal.project?.id ?? null,
+                  system: terminal.project?.kind === "system",
                   search: { terminal: terminal.terminal_id },
                 })
               }

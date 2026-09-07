@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { mockIPC } from "@/bridge/test-harness";
 import { createAppRouter } from "@/router";
 import { createQueryWrapper } from "@/lib/test-query";
-import { saveGlobalScope } from "@/components/terminals/ui-persistence";
+import { saveScopeKind } from "@/components/terminals/ui-persistence";
 
 import type { SpecDetail } from "./types";
 
@@ -122,11 +122,11 @@ async function rail(): Promise<HTMLElement> {
 
 describe("The Spec detail names its project in the cross-project scope", () => {
   beforeEach(() => {
-    saveGlobalScope(false);
+    saveScopeKind("project");
   });
 
   it("writes the project's NAME in the context rail, with its mark beside it", async () => {
-    saveGlobalScope(true);
+    saveScopeKind("all");
     installBackend(detail());
     mount();
 
@@ -149,7 +149,7 @@ describe("The Spec detail names its project in the cross-project scope", () => {
    * the Spec's own `project_id`.
    */
   it("names it even on a Spec with no dev workspace — where the derived context is null", async () => {
-    saveGlobalScope(true);
+    saveScopeKind("all");
     installBackend(detail({ workspace_context: null }));
     mount();
 
@@ -171,7 +171,7 @@ describe("The Spec detail names its project in the cross-project scope", () => {
   });
 
   it("names nothing for a Spec whose project row has vanished — no empty field, no filler", async () => {
-    saveGlobalScope(true);
+    saveScopeKind("all");
     installBackend(detail({ project: null }));
     mount();
 

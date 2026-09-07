@@ -28,14 +28,36 @@ import type { GlobalSearchHit } from "@/bridge/contract";
  *  - a SESSION whose terminal is gone would deep-link `?terminal=` at an id `<TerminalsPage>` will
  *    wait for forever, and that pending deep-link also SUPPRESSES the page's last-terminal restore
  *    — i.e. an empty deck. Dropping the search param is what makes it a landing instead of a trap.
+ *
+ * ## THE SYSTÈME SIDE-DOOR
+ *
+ * `global_search` filters no project, so a hit can belong to the Système singleton — a terminal
+ * hosting an agent at the platform home, one of the host's managed commands, the singleton's own
+ * workspace or project row. Those have no `/` to land on: `/` is the ENTERED project's Terminals,
+ * and the singleton is absent from `list_projects` (`kind = 'user'`), so posing it as the entered
+ * project made the rail's restore effect "recover" onto a stranger's page. They land on `/system`
+ * instead, in the Système SCOPE, carrying the same deep-links — the exact correction
+ * `use-home-focus` makes for the cross-project home's rows.
+ *
+ * The three knowledge kinds are unreachable there by construction: the singleton holds no Spec, no
+ * task and no idea.
  */
 
-/** Where a hit lands: the project to ENTER first, plus the route (and its params/search). */
+/** Where a hit lands: the scope to enter first, plus the route (and its params/search). */
 export type SearchTarget =
   | {
       readonly projectId: string;
       readonly to: "/";
       /** The `/` deep-links. `{}` = the page's own default (restore the last terminal). */
+      readonly search: { readonly terminal?: string; readonly command?: string };
+    }
+  | {
+      /**
+       * NO `projectId` — deliberately. The Système scope carries none (`ActiveScope`'s
+       * `{kind:"system"}`), and a branch that offered one would invite back the very
+       * `setActiveProjectId(<the singleton>)` this route exists to replace.
+       */
+      readonly to: "/system";
       readonly search: { readonly terminal?: string; readonly command?: string };
     }
   | {
@@ -54,6 +76,18 @@ export interface SearchTargetContext {
    * costs a deep-link, never an error.
    */
   readonly terminalAlive: boolean;
+  /**
+   * The SYSTÈME singleton's project id, or `null` on a database that has none — handed down by
+   * `<BaseLayout>`, which already holds the `system_scope_detail` read the rail's tile needs.
+   *
+   * A hit whose `project_id` is this one belongs to the HOST, not to a project. This is an
+   * IDENTITY comparison against the singleton's own authoritative read, never a guess about names
+   * or paths — but it is still a comparison, and the home's rows do better: `home_snapshot` marks
+   * each row's project `kind` at join time, so nothing there has to be compared at all. The search
+   * payload (`SearchHit`) carries no such mark yet; giving it one means threading a column through
+   * the seven candidate queries and the protocol contract, which is a change of its own.
+   */
+  readonly systemProjectId: string | null;
 }
 
 /**
@@ -63,9 +97,26 @@ export interface SearchTargetContext {
  */
 export function resolveSearchTarget(
   hit: GlobalSearchHit,
-  { terminalAlive }: SearchTargetContext,
+  { terminalAlive, systemProjectId }: SearchTargetContext,
 ): SearchTarget {
   const projectId = hit.project_id;
+  // THE HOST'S OWN ENTITIES, routed to the host's own screen. Resolved BEFORE the kind switch: the
+  // kinds that can land here would otherwise each need the same branch, and one of them would
+  // eventually be forgotten.
+  if (systemProjectId != null && projectId === systemProjectId) {
+    switch (hit.kind) {
+      case "command":
+        return { to: "/system", search: { command: hit.id } };
+      case "session":
+        return hit.terminal_id != null && hit.terminal_id !== "" && terminalAlive
+          ? { to: "/system", search: { terminal: hit.terminal_id } }
+          : { to: "/system", search: {} };
+      default:
+        // The singleton's own workspace / project row — and, defensively, any kind that ever
+        // reaches here: the scope's screen is the honest landing, with no deep-link.
+        return { to: "/system", search: {} };
+    }
+  }
   // `search` is stated on the branches landing on `/`, and only there: that route is the one
   // carrying `?command=` / `?terminal=`, so a target that means "no deep-link" has to SAY the empty
   // search rather than leave the previous one standing. `/work/$specId` and `/knowledge` accept no

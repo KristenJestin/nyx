@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { mockIPC } from "@/bridge/test-harness";
 import { createAppRouter } from "@/router";
-import { saveGlobalScope } from "@/components/terminals/ui-persistence";
+import { saveScopeKind } from "@/components/terminals/ui-persistence";
 import type { ProjectRecord, WorkspaceRecord } from "@/components/sidebar/use-projects";
 
 import type { IdeaListItem, IdeaThemeGroup } from "./types";
@@ -183,7 +183,7 @@ async function openDrawer(ideaId: string): Promise<HTMLElement> {
 
 describe("The Ideas table follows the scope", () => {
   beforeEach(() => {
-    saveGlobalScope(false);
+    saveScopeKind("project");
     installBackend();
   });
 
@@ -199,7 +199,7 @@ describe("The Ideas table follows the scope", () => {
   });
 
   it("lists EVERY project's ideas in ONE read, each row marked with its project", async () => {
-    saveGlobalScope(true);
+    saveScopeKind("all");
     mount();
     await waitFor(() =>
       expect(listedTitles()).toEqual([
@@ -228,7 +228,7 @@ describe("The Ideas table follows the scope", () => {
    * size is the CALLER's half of `<ProjectMark>`'s contract, so it is this file's to pin.
    */
   it("draws the mark large enough to be seen — the homes' badge is the floor", async () => {
-    saveGlobalScope(true);
+    saveScopeKind("all");
     mount();
     const marks = await screen.findAllByTestId("idea-project-mark");
     expect(marks).toHaveLength(2);
@@ -250,7 +250,7 @@ describe("The Ideas table follows the scope", () => {
    * text; the mark riding beside it is welcome but is not what satisfies the criterion.
    */
   it("names the idea's project IN CLEAR in the drawer, in the cross-project scope", async () => {
-    saveGlobalScope(true);
+    saveScopeKind("all");
     mount();
     await waitFor(() => expect(listedTitles()).toHaveLength(3));
 
@@ -277,7 +277,7 @@ describe("The Ideas table follows the scope", () => {
 
   /** The orphan: no project field, no filler label — exactly as its row wears no mark. */
   it("names nothing for an orphaned idea, even in the cross-project scope", async () => {
-    saveGlobalScope(true);
+    saveScopeKind("all");
     mount();
     await waitFor(() => expect(listedTitles()).toHaveLength(3));
 
@@ -289,7 +289,7 @@ describe("The Ideas table follows the scope", () => {
   });
 
   it("SEARCHES the scope the list shows — the trap this page must not set", async () => {
-    saveGlobalScope(true);
+    saveScopeKind("all");
     mount();
     await waitFor(() => expect(listedTitles()).toHaveLength(3));
 
@@ -337,14 +337,14 @@ describe("The Ideas table follows the scope", () => {
     expect(await screen.findByText("Enter a project to see its ideas.")).toBeTruthy();
     unmount();
 
-    saveGlobalScope(true);
+    saveScopeKind("all");
     mount();
     expect(await screen.findByTestId("ideas-empty")).toBeTruthy();
     expect(screen.queryByText("Enter a project to see its ideas.")).toBeNull();
   });
 
   it("changes ONLY the list and the marks when the scope flips", async () => {
-    saveGlobalScope(true);
+    saveScopeKind("all");
     mount();
     await waitFor(() => expect(listedTitles()).toHaveLength(3));
     // The chrome the two scopes share, captured before the switch.

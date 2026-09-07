@@ -11,10 +11,24 @@ import type { HomeSessionState } from "./home-state";
  * secondary text and the sort — see `crates/nyx-core/src/home.rs`.
  */
 
-/** A project as a row wears it — the identity `<ProjectMark>` paints. */
+/** A project as a row wears it — the identity `<ProjectMark>` paints, plus what it IS. */
 export interface HomeProject {
   readonly id: string;
   readonly name: string;
+  /**
+   * THE CONTAINER'S NATURE, as the backend joined it (`nyx_core::home::HomeProject::kind` — the
+   * `projects.kind` column, verbatim). It is a ROUTING fact, not a display one: the cross-project
+   * home lists the Système singleton's rows (the global `home_snapshot` filters nothing, so the
+   * host is never missing from a transverse view), and a `system` row opens in the Système SCOPE
+   * at `/system` — not by entering a project the rail cannot even see.
+   *
+   * Read here and NOT re-derived. The renderer could compare `id` against the singleton's, from
+   * `system_scope_detail`: a second read, a second race, and one copy of the rule per call site.
+   *
+   * The sibling mirrors of this shape (`IdeaProject`, `SpecProject`) deliberately do NOT carry it:
+   * they exist for the MARK, and neither an idea nor a Spec can belong to the singleton.
+   */
+  readonly kind: "user" | "system";
   readonly accent: string | null;
   readonly icon: string | null;
   readonly image_path: string | null;

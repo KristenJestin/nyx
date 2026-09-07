@@ -411,6 +411,25 @@ impl Default for HomeOverlays<'_> {
 pub struct HomeProject {
     pub id: String,
     pub name: String,
+    /// THE CONTAINER'S NATURE — [`crate::db::PROJECT_KIND_USER`] or
+    /// [`crate::db::PROJECT_KIND_SYSTEM`] — joined at the source, so a row SAYS what it belongs to
+    /// instead of leaving the other side of the wire to work it out.
+    ///
+    /// It exists because the CROSS-PROJECT home lists the Système singleton's terminals and
+    /// services: [`HomeScope::Global`] joins with no filter at all, deliberately — the host is
+    /// exactly what one does not want to miss from a transverse view. But the singleton is ABSENT
+    /// from [`crate::db::list_projects`] (`kind = 'user'`), so a renderer that treated its rows
+    /// like any other project's would try to ENTER a project the rail cannot see. That is the bug
+    /// this field closes: such a row routes to the Système scope's own screen instead.
+    ///
+    /// It is a FIELD and not a deduction on the other side. The renderer could compare this `id`
+    /// against the singleton's, read through `system_scope_detail` — a second read, a second race,
+    /// and a rule re-derived at every call site. The backend already holds the answer at join
+    /// time; it carries it.
+    ///
+    /// The vocabulary is the DATABASE's, verbatim: one name for one nature, from the column to the
+    /// screen, rather than a second spelling to keep in step with the first.
+    pub kind: String,
     pub accent: Option<String>,
     pub icon: Option<String>,
     pub image_path: Option<String>,
@@ -582,6 +601,7 @@ pub fn snapshot(
                     project: home_project(
                         row.project_id.as_deref(),
                         row.project_name.as_deref(),
+                        row.project_kind.as_deref(),
                         row.project_accent.as_deref(),
                         row.project_icon.as_deref(),
                         row.project_image_path.as_deref(),
@@ -636,6 +656,7 @@ pub fn snapshot(
                 project: HomeProject {
                     id: row.project_id,
                     name: row.project_name,
+                    kind: row.project_kind,
                     accent: row.project_accent,
                     icon: row.project_icon,
                     image_path: row.project_image_path,
@@ -682,6 +703,7 @@ pub fn snapshot(
                 project: HomeProject {
                     id: row.project_id,
                     name: row.project_name,
+                    kind: row.project_kind,
                     accent: row.project_accent,
                     icon: row.project_icon,
                     image_path: row.project_image_path,
@@ -705,6 +727,7 @@ pub fn snapshot(
             project: home_project(
                 row.project_id.as_deref(),
                 row.project_name.as_deref(),
+                row.project_kind.as_deref(),
                 row.project_accent.as_deref(),
                 row.project_icon.as_deref(),
                 row.project_image_path.as_deref(),
@@ -743,6 +766,7 @@ fn home_workspace(
 fn home_project(
     id: Option<&str>,
     name: Option<&str>,
+    kind: Option<&str>,
     accent: Option<&str>,
     icon: Option<&str>,
     image_path: Option<&str>,
@@ -750,6 +774,11 @@ fn home_project(
     Some(HomeProject {
         id: id?.to_string(),
         name: name.unwrap_or_default().to_string(),
+        // A row that HAS a project always has its `kind` — the column is NOT NULL and both come
+        // from the same join — so the fallback is unreachable. It is `user` rather than a panic
+        // because the one thing that must never happen is a stray `None` reading as "system" and
+        // routing a project's terminal onto the host's screen.
+        kind: kind.unwrap_or(db::PROJECT_KIND_USER).to_string(),
         accent: accent.map(str::to_string),
         icon: icon.map(str::to_string),
         image_path: image_path.map(str::to_string),
@@ -1141,6 +1170,106 @@ mod tests {
         assert_eq!(all.services.len(), 2);
         assert_eq!(all.specs.len(), 2);
         assert_eq!(all.terminals.len(), 1, "only A has a bare shell");
+    }
+
+    /// EVERY ROW SAYS WHAT ITS CONTAINER IS — `user` or `system`, joined at the source.
+    ///
+    /// The cross-project home reaches into the Système singleton on purpose ([`HomeScope::Global`]
+    /// filters nothing: the host is what one least wants to miss from a transverse view), and the
+    /// singleton is absent from [`crate::db::list_projects`]. Without this mark a caller could only
+    /// tell the two apart by asking a SECOND read for the singleton's id and comparing — a rule
+    /// re-derived at every call site, and a race. So the mark travels ON the row, for every family
+    /// that carries a project.
+    #[test]
+    fn every_row_carries_its_project_kind() {
+        use crate::system_scope::{ensure_system_scope, FixedHomeDirProvider};
+
+        let mut conn = open_in_memory();
+        let (user_project, ws) = project(&mut conn, "Alpha", "kinded");
+        let scope = ensure_system_scope(&mut conn, &FixedHomeDirProvider::at(root_path("sys")))
+            .expect("bootstrap the Système scope");
+
+        // One AGENT session and one BARE terminal on each side of the boundary…
+        let user_agent = agent_terminal(&mut conn, Some(&ws), "kinded-user");
+        let system_agent = agent_terminal(&mut conn, Some(&scope.workspace), "kinded-sys");
+        let user_bare =
+            crate::db::create_terminal(&mut conn, &root_path("kinded-ub"), None).unwrap();
+        crate::db::attach_terminal(&mut conn, &user_bare.id, &ws.id, "auto").unwrap();
+        let system_bare =
+            crate::db::create_terminal(&mut conn, &root_path("kinded-sb"), None).unwrap();
+        crate::db::attach_terminal(&mut conn, &system_bare.id, &scope.workspace.id, "manual")
+            .unwrap();
+        // …and a running SERVICE on each, the third family that carries a project.
+        for (project_id, workspace, name) in [
+            (&user_project.id, &ws, "dev-user"),
+            (&scope.project.id, &scope.workspace, "dev-system"),
+        ] {
+            crate::db::create_template(
+                &mut conn,
+                project_id,
+                name,
+                "npm run dev",
+                None,
+                CommandSource::default(),
+            )
+            .unwrap();
+            let instance = crate::db::list_instances_for_workspace(&mut conn, &workspace.id)
+                .unwrap()[0]
+                .id
+                .clone();
+            crate::db::set_run_state(&mut conn, &instance, "running", None).unwrap();
+        }
+
+        let overlays = HomeOverlays::default();
+        let all = snapshot(&mut conn, HomeScope::Global, &overlays).unwrap();
+
+        let session_kind = |terminal_id: &str| {
+            all.sessions
+                .iter()
+                .find(|s| s.terminal_id == terminal_id)
+                .and_then(|s| s.project.as_ref())
+                .map(|p| p.kind.clone())
+        };
+        let terminal_kind = |terminal_id: &str| {
+            all.terminals
+                .iter()
+                .find(|t| t.terminal_id == terminal_id)
+                .and_then(|t| t.project.as_ref())
+                .map(|p| p.kind.clone())
+        };
+        let service_kind = |name: &str| {
+            all.services
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.project.kind.clone())
+        };
+
+        // Asserted against the db CONSTANTS, never against literals: one name for one nature, from
+        // the column to the screen, so a rename cannot leave the two halves saying different words.
+        assert_eq!(
+            session_kind(&user_agent.id).as_deref(),
+            Some(db::PROJECT_KIND_USER)
+        );
+        assert_eq!(
+            session_kind(&system_agent.id).as_deref(),
+            Some(db::PROJECT_KIND_SYSTEM)
+        );
+        assert_eq!(
+            terminal_kind(&user_bare.id).as_deref(),
+            Some(db::PROJECT_KIND_USER)
+        );
+        assert_eq!(
+            terminal_kind(&system_bare.id).as_deref(),
+            Some(db::PROJECT_KIND_SYSTEM)
+        );
+        assert_eq!(
+            service_kind("dev-user").as_deref(),
+            Some(db::PROJECT_KIND_USER)
+        );
+        assert_eq!(
+            service_kind("dev-system").as_deref(),
+            Some(db::PROJECT_KIND_SYSTEM)
+        );
     }
 
     /// A LOOSE terminal has no workspace, so its session has no project — and it is returned

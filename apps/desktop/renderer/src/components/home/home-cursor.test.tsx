@@ -31,7 +31,14 @@ import type { HomeProject, HomeSnapshot } from "./types";
  * (review `01M069MWRNR1PEZZW7YTPAHSKK`, pinned by `home-focus.test.tsx`).
  */
 
-const NYX: HomeProject = { id: "p1", name: "nyx", accent: null, icon: null, image_path: null };
+const NYX: HomeProject = {
+  id: "p1",
+  name: "nyx",
+  kind: "user" as const,
+  accent: null,
+  icon: null,
+  image_path: null,
+};
 
 const SNAPSHOT: HomeSnapshot = {
   sessions: [

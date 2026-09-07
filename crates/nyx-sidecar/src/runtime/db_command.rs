@@ -1610,6 +1610,7 @@ impl Ctx<'_> {
                                                 Some(nyx_core::home::HomeProject {
                                                     id: p.id,
                                                     name: p.name,
+                                                    kind: p.kind,
                                                     accent: p.accent,
                                                     icon: p.icon,
                                                     image_path: p.image_path,
@@ -1712,6 +1713,7 @@ impl Ctx<'_> {
                             nyx_core::home::HomeProject {
                                 id: p.id,
                                 name: p.name,
+                                kind: p.kind,
                                 accent: p.accent,
                                 icon: p.icon,
                                 image_path: p.image_path,
@@ -2794,6 +2796,7 @@ impl Ctx<'_> {
                                         nyx_core::home::HomeProject {
                                             id: p.id,
                                             name: p.name,
+                                            kind: p.kind,
                                             accent: p.accent,
                                             icon: p.icon,
                                             image_path: p.image_path,
