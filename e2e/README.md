@@ -2,8 +2,10 @@
 
 > **⚠️ Staleness — ce README précède plusieurs pivots plateforme, à re-porter.** Certaines descriptions ci-dessous
 > datent du portage Tauri et n'ont pas suivi la V2 : (1) le **`core-host` Node est supprimé** (PDR-0007) — c'est
-> désormais le **sidecar Rust** qui possède PTY/commandes ; (2) **xterm est remplacé par wterm (rendu DOM)**
-> (PDR-0026) — le texte du terminal est maintenant **dans le DOM** ; (3) l'**écran cockpit et la route `#/cockpit/…`
+> désormais le **sidecar Rust** qui possède PTY/commandes ; (2) le terminal est **`@xterm/xterm` 6 en rendu DOM**
+> — le texte du terminal est bien **dans le DOM**, mais PAS parce qu'on est passé à wterm : la bascule décrite par
+> PDR-0026 n'a jamais été livrée (ce PDR est **superseded**), xterm 6 rend en DOM par lui-même ; (3) l'**écran
+> cockpit et la route `#/cockpit/…`
 > sont supprimés** (PDR-0025, shell multi-pages Terminals/Work/Knowledge) → les specs `cockpit-0*` visent un écran
 > disparu et sont **à re-câbler**. La section **Prerequisites** (sidecar) est, elle, à jour. Corrections partielles
 > appliquées ; le re-port complet des specs reste à faire.
@@ -129,11 +131,12 @@ The app exposes an **inert** control seam on `window.__nyx`
 (under `apps/desktop/renderer/src/…` — the exact module may have moved with the
 navigation-shell rewrite) plus per-terminal read/input seams on `window.__nyxDeck` /
 `window.__nyxDeckInput`, all keyed by record id. **Historical rationale:** these seams
-date from **xterm**, which painted to a **WebGL canvas** — the text was not in the DOM,
-so a WebDriver could not type into or query it directly. Since the **wterm (DOM render)**
-switch (PDR-0026) the terminal text *is* in the DOM, but the seams are **retained** for
-**deterministic, id-keyed** driving (typing into a specific terminal without racing the
-DOM). They are **gated behind the build-time flag `VITE_NYX_E2E=1`**, so they never ship
+date from the days when the terminal painted to a **WebGL canvas** — the text was not in
+the DOM, so a WebDriver could not type into or query it directly. The terminal is still
+**`@xterm/xterm`** (the wterm/ghostty switch of PDR-0026 was never made — that PDR is
+**superseded**), but it now uses xterm's **DOM renderer**, so the text *is* in the DOM.
+The seams are nonetheless **retained** for **deterministic, id-keyed** driving (typing
+into a specific terminal without racing the DOM). They are **gated behind the build-time flag `VITE_NYX_E2E=1`**, so they never ship
 to real production; the Electron `bun run build:e2e` script builds the renderer with that
 flag.
 

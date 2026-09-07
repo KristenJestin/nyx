@@ -77,7 +77,7 @@ Mapping des identités, historique à conserver, pièces jointes, chemins WSL/Wi
 
 Le **socle** est posé et canonique (`technical-architecture.md`) : la reprise des sessions agents est un opt-in **projet** (`projects.resume_agent_sessions`), la relance des services un flag **par commande** (`managed_commands.restart_on_startup`) ; un `running` invérifiable au boot passe à `unknown`/`interrupted` et l'utilisateur choisit. Le sidecar ne crée pas de troisième système de reprise.
 
-**UX tranchée (v2.5.5) :** la granularité par workspace passe par `workspace_restore_plan` ; la reprise est **silencieuse en mode LAZY à l'ouverture d'un terminal** (pas eager au boot) tandis que les sessions interrompues ouvrent un **écran de restauration** ; les états `unknown` / `resume_failed` sont présentés explicitement. L'unload / lazy-resume des sessions idle (ex-idée v2.7) est également cadré en v2.5.5. Voir la tranche **v2.5.5** de [`roadmap.md`](roadmap.md) et son PRD `01KX8Z4E7B3PYW2DGCTTKXCHYC`.
+**UX tranchée (v2.5.5) :** la granularité par workspace passe par `workspace_restore_plan` ; la reprise est **silencieuse en mode LAZY à l'ouverture d'un terminal** (pas eager au boot) tandis que les sessions interrompues ouvrent un **écran de restauration** ; les états `unknown` / `resume_failed` sont présentés explicitement. L'**unload des sessions idle** (ex-idée v2.7), cadré puis livré en v2.5.5, a depuis été **RETIRÉ** : décharger une session au repos revenait à tuer son shell (`[process exited with code 1]`), et nyx ne tue plus rien sur inactivité. Voir la tranche **v2.5.5** de [`roadmap.md`](roadmap.md) et son PRD `01KX8Z4E7B3PYW2DGCTTKXCHYC`.
 
 ## Q-012 - Limite du produit
 

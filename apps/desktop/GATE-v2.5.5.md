@@ -1,5 +1,13 @@
 # GATE — v2.5.5 : cycle de vie agent (reprise LAZY + interrupted/restore + unload idle + plugin)
 
+> **RAPPORT DATÉ — la clause (3) ne décrit plus le produit.** L'**unload des sessions idle** a été
+> **RETIRÉ** depuis : le balayage fermait le PTY d'une session Claude simplement laissée au repos,
+> ce qui s'affichait comme `[process exited with code 1]`. Tout ce que la section « (3) idle →
+> unload → resume » cite (`use-idle-unload.ts`, `unload_idle_sessions`, `agent_unload.rs`,
+> `idle_unload_and_revisit_resume_over_the_real_pipe`) **n'existe plus dans le code**. Les clauses
+> (1), (2) et (4) sont inchangées, et la reprise `claude --resume` au boot (ResumePark) aussi :
+> elle ne dépendait pas de l'unload. Le reste du document est conservé tel qu'il a été rendu.
+
 > Tâche depot : `01KX8Z6TH9RW19XYDK74CAD8BT` (PRD `01KX8Z4E7B3PYW2DGCTTKXCHYC`, Phase 5, `kind=gate`).
 > Ce document EST le rapport du gate. Comme `GATE-PHASE4.md` / `GATE-PHASE7.md`, il porte
 > la **moitié exécutable** (un test de gate Rust pilotant le VRAI binaire sidecar sur le VRAI

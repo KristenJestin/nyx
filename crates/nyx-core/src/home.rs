@@ -111,10 +111,10 @@ impl Attention {
 ///     `unknown` and `resume_failed` are not (a session nyx cannot vouch for is not a session one
 ///     can act on), and neither is `ended`.
 ///   * `pty_alive` — whether a PTY is still registered for the hosting terminal. THE DORMANT
-///     FILTER: the idle-unload closes the PTY of a dormant session but deliberately leaves its row
-///     `active` in the DB so a revisit can resume it. Such a session has no live process behind
-///     it, so it is out of the flow — with no dedicated "off" state, because it is not a state,
-///     it is an absence.
+///     FILTER: a dormant session's PTY is gone (its shell exited, or the app was killed) but
+///     its row deliberately stays `active` in the DB so a revisit can resume it. Such a session
+///     has no live process behind it, so it is out of the flow — with no dedicated "off" state,
+///     because it is not a state, it is an absence.
 ///   * `activity` — the runtime [`ActivitySnapshot`], `None` for a terminal with no live entry
 ///     (the boot state, and every terminal between turns with nothing unread) → [`Attention::Idle`].
 ///
@@ -345,8 +345,8 @@ where
 
 /// The PTY-liveness seam — whether a terminal record still has a live shell behind it. This is
 /// what separates a working session from a DORMANT one, and it exists nowhere in the DB: the
-/// idle-unload closes the PTY and leaves the row `active` on purpose, so only the process layer
-/// can answer.
+/// PTY of a dead/exited shell is gone while the row stays `active` on purpose, so only the
+/// process layer can answer.
 pub trait TerminalAliveOverlay {
     fn is_alive(&self, terminal_id: &str) -> bool;
 }
@@ -356,7 +356,7 @@ pub trait TerminalAliveOverlay {
 ///
 /// Deliberately "alive" and not "dead": a caller that cannot see processes cannot tell a dormant
 /// session from a live one, and answering "dead" would empty the whole home for it — a far worse
-/// lie than showing a session that happens to be unloaded. The sidecar, which owns the PTYs,
+/// lie than showing a session that happens to be dormant. The sidecar, which owns the PTYs,
 /// always passes the real answer.
 pub struct AllTerminalsAlive;
 
@@ -891,7 +891,7 @@ mod tests {
         );
     }
 
-    /// THE DORMANT FILTER. The idle-unload closes the PTY and LEAVES the row `active` so a revisit
+    /// THE DORMANT FILTER. A dormant session's PTY is gone and its row stays `active` so a revisit
     /// can resume it — that row has no live process behind it and must not appear. There is no
     /// "off" state for it: it is simply out of the flow.
     #[test]

@@ -3529,11 +3529,11 @@ pub fn close_terminal(
 /// It ALSO states the buffer's FRESHNESS, because that buffer is not always the terminal's present
 /// state and the difference is invisible in the text: the scrollback is serialized by the shell's
 /// front end and only for a terminal it currently has MOUNTED. A terminal in another project, or
-/// one the idle-unload closed, keeps its last saved buffer for as long as it stays out of view —
+/// one whose shell has exited, keeps its last saved buffer for as long as it stays out of view —
 /// arbitrarily long. So the answer carries:
 ///   * `live` — a shell is running behind this record right now;
 ///   * `stale` — what you are reading is NOT the terminal's present state, either because no shell
-///     is running any more (`live: false`, a closed or unloaded terminal: the buffer is its final
+///     is running any more (`live: false`, a closed or exited terminal: the buffer is its final
 ///     saved output) or because its shell has printed things nyx has not saved yet
 ///     (`scrollback_is_behind`: the terminal is not mounted in the UI, or the save debounce is
 ///     still in flight right after a `send_to_terminal`).

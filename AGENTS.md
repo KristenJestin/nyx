@@ -12,7 +12,7 @@ embarque `crates/nyx-core`).
 
 ```text
 apps/desktop            shell Electron (main/preload) + renderer React
-apps/desktop/renderer   UI React (TanStack Router, wterm/ghostty)
+apps/desktop/renderer   UI React (TanStack Router, @xterm/xterm en rendu DOM)
 crates/nyx-core         backend métier Rust (PTY, SQLite, MCP, domaine)
 crates/nyx-sidecar      exécutable sidecar supervisé par Electron
 contract                tests de parité du protocole Rust ↔ TS (MessagePack)
@@ -51,7 +51,7 @@ bun run test:sim       # rejoue les six, en test d'intégration (voir ci-dessous
 ```
 
 Dans `apps/desktop/renderer`, la suite se scinde en deux projets vitest : `test:unit` (jsdom) et
-`test:browser` (Vitest Browser Mode — vrai Chromium via Playwright, vrai cœur ghostty en WASM).
+`test:browser` (Vitest Browser Mode — vrai Chromium via Playwright, vrai xterm en rendu DOM).
 
 `test:core:e2e` est **le** point d'entrée des e2e de `crates/nyx-core/tests/`, et il est appelé par
 `bun run test`. Il nomme ses cibles une à une plutôt que de balayer le dossier, parce que trois

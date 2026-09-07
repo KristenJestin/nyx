@@ -28,7 +28,6 @@ import { TerminalCloseProvider } from "./use-terminal-close";
 import { TerminalGroupsProvider } from "./use-terminal-groups";
 import { TerminalReorderProvider } from "./use-terminal-reorder";
 import { useLazyResume } from "./use-lazy-resume";
-import { useIdleUnload } from "./use-idle-unload";
 import { loadLastTerminalId, saveLastTerminalId } from "./ui-persistence";
 import type {
   WorkspaceRuntimeService,
@@ -434,16 +433,6 @@ function TerminalsBody({
     },
     [closeTerminal],
   );
-
-  // IDLE-SESSION UNLOAD (v2.5.5): on a timer, ask the sidecar to unload DORMANT agent sessions to
-  // free resources — never a VISITED terminal, and never an ACTIVE one (the sidecar enforces
-  // that). A revisit re-spawns + resumes via the phase-2 lazy park+inject.
-  //
-  // THE VISITED SET IS EVERY VISIBLE PANE, not the selection. With the tiling, four terminals can
-  // be on screen while ONE holds the focus; protecting only the focused one would let the sidecar
-  // unload the sessions of three panes the user is looking at. That is a correctness condition,
-  // not an optimisation — hence `visibleTerminalIds` (every leaf of the tree).
-  useIdleUnload(tiling.visibleTerminalIds);
 
   // THE COMMAND GROUPS of the project — the DB-backed twin of the terminal groups (an agent drives
   // the very same operations over MCP, and MCP cannot see the renderer's `localStorage`). Mounted

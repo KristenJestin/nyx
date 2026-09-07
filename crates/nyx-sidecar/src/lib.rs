@@ -7,6 +7,7 @@
 //! these into the actual stdin/stdout process loop.
 
 pub mod lifecycle;
+pub mod log;
 pub mod pipe;
 pub mod protocol;
 pub mod runtime;

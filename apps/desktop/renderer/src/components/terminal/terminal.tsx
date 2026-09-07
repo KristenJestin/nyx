@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useStore } from "@tanstack/react-store";
 import { ArrowDownIcon } from "lucide-react";
 import type { ITerminalOptions, Terminal as XTerm } from "@xterm/xterm";
 
@@ -7,9 +8,18 @@ import { Button } from "@/components/ui/button";
 import { buildDeadHistory } from "./dead-history";
 import { copySelection, pasteFromClipboard } from "./terminal-clipboard";
 import { TerminalContextMenu } from "./terminal-context-menu";
+import { TerminalExitBar } from "./terminal-exit-bar";
+import { openTerminalLink } from "./terminal-links";
 import { useAtBottom } from "./use-at-bottom";
 import { useScrollbackPersist } from "./scrollback-persist";
-import { attachTerminal, detachTerminal, ensureTerminal, getTerminal } from "./terminal-store";
+import {
+  attachTerminal,
+  detachTerminal,
+  ensureTerminal,
+  getTerminal,
+  respawnTerminal,
+  terminalStore,
+} from "./terminal-store";
 import { FALLBACK_THEME, resolveCssColor } from "./xterm-theme";
 
 export interface TerminalProps {
@@ -169,6 +179,14 @@ export function Terminal({
   // scrolled up.
   const { atBottom, scrollToBottom } = useAtBottom(term);
 
+  // THE EXIT this pane is sitting in, read from the STORE and not from local state: the instance
+  // outlives every mount of this component, so a shell that dies while the route is unmounted must
+  // still be reported when the pane comes back. `undefined` ⇒ a shell is live.
+  const exit = useStore(terminalStore, (s) => s.exits[id]);
+  const relaunch = useCallback(() => {
+    void respawnTerminal(id);
+  }, [id]);
+
   // RIGHT-CLICK copy/paste — the same clipboard helpers as the keyboard chords
   // (which live in the instance), surfaced through `<TerminalContextMenu>`. Stable
   // callbacks so the menu's props don't churn; each is a no-op while `term` is null.
@@ -180,6 +198,14 @@ export function Terminal({
     if (term) void pasteFromClipboard(term);
   }, [term]);
 
+  // RIGHT-CLICK ON A LINK. xterm has no "what link is at this point" query, so the instance keeps
+  // the last hovered one (both link paths feed it) and the menu reads it at the instant it opens —
+  // which is precisely when the cursor is still on the link.
+  const linkAtCursor = useCallback(() => getTerminal(id)?.hoveredLink ?? null, [id]);
+  const handleOpenLink = useCallback((url: string) => {
+    openTerminalLink(url);
+  }, []);
+
   // The container carries the padding + background; `attachTerminal` `appendChild`s
   // the instance's persistent node (`el`, 100%×100%) INTO it, so the terminal fills
   // the padded content box. The FitAddon measures that node — no edge row/col is
@@ -189,6 +215,8 @@ export function Terminal({
       hasSelection={handleHasSelection}
       onCopy={handleCopy}
       onPaste={handlePaste}
+      linkAtCursor={linkAtCursor}
+      onOpenLink={handleOpenLink}
     >
       <div
         ref={containerRef}
@@ -196,7 +224,9 @@ export function Terminal({
         className={cn("relative h-full w-full overflow-hidden bg-background p-2.5", className)}
       >
         {/* Jump-to-bottom: hidden (and click-through) while pinned to the bottom, so
-            it never blocks the terminal when there is nothing to scroll back to. */}
+            it never blocks the terminal when there is nothing to scroll back to.
+            It steps UP over the exit bar when one is showing, so the two affordances
+            never sit on top of each other. */}
         <Button
           size="icon-sm"
           variant="secondary"
@@ -205,12 +235,16 @@ export function Terminal({
           tabIndex={atBottom ? -1 : 0}
           onClick={scrollToBottom}
           className={cn(
-            "absolute right-3 bottom-3 z-10 rounded-full shadow-md transition-opacity duration-150",
+            "absolute right-3 z-10 rounded-full shadow-md transition-opacity duration-150",
+            exit ? "bottom-12" : "bottom-3",
             atBottom ? "pointer-events-none opacity-0" : "opacity-100",
           )}
         >
           <ArrowDownIcon />
         </Button>
+        {/* The process is gone: say so, and offer the ONE way back (a new shell in this same
+            pane and record). Absent while a shell is live. */}
+        {exit ? <TerminalExitBar exit={exit} onRelaunch={relaunch} /> : null}
       </div>
     </TerminalContextMenu>
   );

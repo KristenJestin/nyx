@@ -1,10 +1,16 @@
 import { FitAddon } from "@xterm/addon-fit";
+import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal as XTerm, type ITerminalOptions } from "@xterm/xterm";
 
 import { nyxBridge, type Unsubscribe } from "@/bridge";
 import { isTerminalNavChord } from "@/components/sidebar/use-terminal-shortcuts";
 import { copySelection, isCopyChord, isPasteChord, pasteFromClipboard } from "./terminal-clipboard";
 import { reconcileTerminalGeometry } from "./terminal-geometry";
+import {
+  createTerminalLinkHandler,
+  isExternalHttpUrl,
+  openTerminalLink,
+} from "./terminal-links";
 import { ensureTerminalFontLoaded, resolveThemeFromCss } from "./xterm-theme";
 
 /**
@@ -52,6 +58,15 @@ function isShiftEnterChord(e: KeyboardEvent): boolean {
   return isEnterKey && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey;
 }
 
+/**
+ * Whether `e` is a BARE Enter — no modifier at all. The relaunch chord of an exited pane, kept
+ * apart from {@link isShiftEnterChord} so the two can never both claim the same keystroke.
+ */
+export function isPlainEnter(e: KeyboardEvent): boolean {
+  const isEnterKey = e.code === "Enter" || e.code === "NumpadEnter" || e.key === "Enter";
+  return isEnterKey && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey;
+}
+
 /** Payload of the backend `pty://output` event (raw bytes as a JSON number[]). */
 interface PtyOutputPayload {
   id: number;
@@ -62,6 +77,22 @@ interface PtyOutputPayload {
 interface PtyExitPayload {
   id: number;
   code: number | null;
+}
+
+/**
+ * WHAT IS LEFT of a terminal whose process is GONE — the state the pane's "Exited" bar reads.
+ *
+ * A pane whose shell exited used to be a DEAD END: the instance wrote its grey `[process exited]`
+ * line, dropped its `ptyId`, and the `spawned` latch made a second shell impossible for the life
+ * of the record. The only way back was to close the terminal and lose the pane. So the exit is
+ * now a STATE the instance publishes rather than a terminus it falls into, and {@link
+ * XtermInstance.respawn} is the way out of it — same pane, same record.
+ */
+export interface TerminalExit {
+  /** The process exit code, or `null` when the backend could not read one. */
+  readonly code: number | null;
+  /** Whether a RELAUNCH was attempted from this state and failed (the bar says so, and stays). */
+  readonly relaunchFailed?: boolean;
 }
 
 /** Options to build one live terminal instance. */
@@ -82,6 +113,13 @@ export interface XtermInstanceOptions {
   onPtyId?: (id: number | null) => void;
   /** Notified with the terminal's title as OSC 0/2 updates it. */
   onTitle?: (title: string) => void;
+  /**
+   * Notified when the process EXITS (with the {@link TerminalExit}) and again with `null` the
+   * moment a {@link XtermInstance.respawn} takes the pane back to a live shell. The store mirrors
+   * it into its reactive slice, which is what the pane's bar renders from — so the bar survives a
+   * detach/reattach and a route change exactly as the buffer does.
+   */
+  onExit?: (exit: TerminalExit | null) => void;
 }
 
 /**
@@ -243,6 +281,17 @@ export class XtermInstance {
   private readonly hasDeadHistory: boolean;
   private onPtyId?: (id: number | null) => void;
   private onTitle?: (title: string) => void;
+  private onExit?: (exit: TerminalExit | null) => void;
+  /** The exit this pane is SITTING IN, or `null` while a shell is live. See {@link TerminalExit}. */
+  private exit: TerminalExit | null = null;
+  /** Whether a {@link respawn} is in flight — the re-entrancy guard on the relaunch. */
+  private respawning = false;
+  /**
+   * The link the mouse is currently OVER, or `null`. Maintained by both link paths (the regex
+   * scanner and the OSC 8 handler) and read by the right-click menu, which has coordinates and no
+   * way to ask xterm "what link is at this point".
+   */
+  private hovered: string | null = null;
 
   private unlistenOutput?: Unsubscribe;
   private unlistenExit?: Unsubscribe;
@@ -264,6 +313,7 @@ export class XtermInstance {
     this.hasDeadHistory = !!options.deadHistory;
     this.onPtyId = options.onPtyId;
     this.onTitle = options.onTitle;
+    this.onExit = options.onExit;
 
     // The persistent host. `100% × 100%` so it fills whatever pane it is
     // reattached into; `data-terminal-node` so it never collides with the deck
@@ -274,8 +324,36 @@ export class XtermInstance {
     this.el.dataset.terminalNode = this.recordId;
 
     this.fitAddon = new FitAddon();
-    this.term = new XTerm({ ...DEFAULT_OPTIONS, ...options.options });
+    this.term = new XTerm({
+      ...DEFAULT_OPTIONS,
+      // OSC 8 HYPERLINKS — the ones an emitting program marks up explicitly. xterm parses them
+      // itself and asks this handler what to do; the regex scanner below covers the other kind
+      // (a URL a shell merely printed). Both end in `openTerminalLink`.
+      linkHandler: createTerminalLinkHandler((uri) => {
+        this.hovered = uri;
+      }),
+      ...options.options,
+    });
     this.term.loadAddon(this.fitAddon);
+    // PLAIN URLs in the output. The addon scans the text and makes a match clickable — xterm
+    // decorates a link with an underline + pointer cursor on hover by itself, so there is no
+    // styling to add here. Its `hover`/`leave` feed the same "what is under the cursor" cell the
+    // OSC 8 handler does, which is what the right-click menu reads.
+    this.term.loadAddon(
+      new WebLinksAddon(
+        (_event, uri) => {
+          openTerminalLink(uri);
+        },
+        {
+          hover: (_event, text) => {
+            this.hovered = isExternalHttpUrl(text) ? text : null;
+          },
+          leave: () => {
+            this.hovered = null;
+          },
+        },
+      ),
+    );
     // Open into the (still detached) host ONCE. xterm builds its DOM (incl. the
     // hidden helper textarea) inside `el`; a later `appendChild(el)` moves the
     // whole subtree into the pane. Output written before/after open lands in the
@@ -315,6 +393,19 @@ export class XtermInstance {
     return this.ptyId;
   }
 
+  /** The exit this pane is sitting in, or `null` while a shell is live. */
+  get exitState(): TerminalExit | null {
+    return this.exit;
+  }
+
+  /**
+   * The link the mouse is over right now, or `null`. Read by the right-click menu at the instant
+   * it opens, which is the only moment the answer is meaningful.
+   */
+  get hoveredLink(): string | null {
+    return this.hovered;
+  }
+
   /** Set up the PTY listeners and spawn the shell exactly once. */
   private async startPty(): Promise<void> {
     if (this.spawned || this.disposed) return;
@@ -339,7 +430,12 @@ export class XtermInstance {
         `\r\n\x1b[90m[process exited${code === null ? "" : ` with code ${code}`}]\x1b[0m\r\n`,
       );
       this.ptyId = null;
+      // PUBLISH the exit rather than merely fall silent: the pane draws its "Exited · code N"
+      // bar from this, and `respawn` is the way back out. The grey line above stays where it is —
+      // it is scrollback, and a relaunched shell prints BELOW it, so the pane keeps its history.
+      this.exit = { code };
       this.onPtyId?.(null);
+      this.onExit?.(this.exit);
     });
 
     if (this.disposed) {
@@ -347,6 +443,54 @@ export class XtermInstance {
       return;
     }
 
+    await this.spawnShell({ rehydrate: true });
+  }
+
+  /**
+   * RELAUNCH a shell in THIS instance, after its process exited — the way out of the dead end.
+   *
+   * Same instance, same host node, same RECORD: the `pty_spawn` carries `terminalId`, so the
+   * sidecar opens the new shell against the very same `terminals` row. That is what re-arms
+   * everything keyed on the record — a parked `claude --resume` drains at this spawn exactly as it
+   * would at the first one, with nothing here knowing about resumes.
+   *
+   * The buffer is NOT cleared and the screen is NOT re-hydrated: what the dead shell printed is
+   * this pane's history, the grey `[process exited]` line is its epitaph, and the new shell prints
+   * under both. (Re-hydration would begin with a screen clear and erase them.)
+   *
+   * Returns whether a shell is live afterwards. A failed relaunch RESTORES the bar — flagged
+   * `relaunchFailed`, so the pane says so instead of silently offering the same dead button.
+   */
+  async respawn(): Promise<boolean> {
+    if (this.disposed || this.respawning) return false;
+    if (this.ptyId !== null) return false; // already live — nothing to relaunch.
+    const previous = this.exit;
+    this.respawning = true;
+    // Clear the bar AT THE CLICK, not one round-trip later: the spawn can take a moment, and a
+    // button that stays under the cursor invites a second press.
+    this.exit = null;
+    this.onExit?.(null);
+    // Whatever was buffered belongs to the dead session's id and can never match the new one.
+    this.pendingOutput = [];
+    try {
+      await this.spawnShell({ rehydrate: false });
+    } catch {
+      // Swallowed exactly like the construction spawn: the failure is REPORTED below.
+    } finally {
+      this.respawning = false;
+    }
+    if (this.ptyId !== null || this.disposed) return this.ptyId !== null;
+    // The relaunch did not land. Put the pane back where it was, and say so.
+    this.exit = { code: previous?.code ?? null, relaunchFailed: true };
+    this.onExit?.(this.exit);
+    return false;
+  }
+
+  /**
+   * Measure, size and SPAWN the shell — the half of the boot that a {@link respawn} repeats. The
+   * listeners are armed once, by {@link startPty}, and outlive every shell this pane hosts.
+   */
+  private async spawnShell({ rehydrate }: { rehydrate: boolean }): Promise<void> {
     // Give a pane that is being laid out RIGHT NOW its few macrotasks before judging its box: a leaf
     // born from a split is mounted in the same commit as its rectangle, so the box is 0×0 at this
     // instant and would send the shell to the 80×24 fallback in a pane that is nothing like it
@@ -372,7 +516,10 @@ export class XtermInstance {
     // did not exist. The backend streams a terminal's output only once a view is attached, so
     // doing it here means the repaint can neither duplicate nor be duplicated by the live stream
     // that starts at the attach. A record with nothing to restore answers with no bytes.
-    await this.rehydrateScreen();
+    //
+    // SKIPPED on a relaunch: the pane is already showing this record's whole life, and the
+    // repaint's leading screen-clear would wipe it (see `respawn`).
+    if (rehydrate) await this.rehydrateScreen();
 
     const id = await nyxBridge.invoke<number>("pty_spawn", {
       cwd: this.cwd,
@@ -501,6 +648,14 @@ export class XtermInstance {
    */
   private handleKey(e: KeyboardEvent): boolean {
     if (e.type === "keydown") {
+      // A pane sitting in an EXIT reads Enter as "relaunch" — the keyboard twin of the bar's
+      // button, so a user who never leaves the keyboard is not sent hunting for the mouse. Checked
+      // FIRST: there is no shell to send anything to, so nothing below could apply anyway.
+      if (this.exit !== null && isPlainEnter(e)) {
+        e.preventDefault();
+        void this.respawn();
+        return false;
+      }
       if (isCopyChord(e)) {
         // preventDefault so Chromium's native Ctrl+Shift+C can't fire alongside.
         e.preventDefault();
@@ -685,6 +840,10 @@ export class XtermInstance {
       void nyxBridge.invoke("pty_close", { id }).catch(() => {});
     }
     this.onPtyId?.(null);
+    // A CLOSED terminal is not a finished one waiting to be relaunched: drop the exit so nothing
+    // downstream keeps offering a "Relaunch" for a record that is on its way out.
+    this.exit = null;
+    this.onExit?.(null);
     try {
       this.term.dispose();
     } catch {
@@ -693,6 +852,7 @@ export class XtermInstance {
     this.el.remove();
     this.onPtyId = undefined;
     this.onTitle = undefined;
+    this.onExit = undefined;
   }
 
   private safeUnlisten(): void {

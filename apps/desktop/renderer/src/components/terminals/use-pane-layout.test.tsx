@@ -836,7 +836,7 @@ describe("usePaneLayout — close, reconcile, selection", () => {
     expect(controller.visibleTerminalIds).toEqual(["t1", "t2"]);
   });
 
-  it("exposes EVERY visible terminal (the idle-unload's visited set), not just the focused one", async () => {
+  it("exposes EVERY visible terminal (every leaf of the tree), not just the focused one", async () => {
     await twoPaneSetup();
     expect(controller.visibleTerminalIds).toEqual(["t1", "t2"]);
     expect(controller.visibleTerminalIds).toContain(controller.focusedTerminalId as string);

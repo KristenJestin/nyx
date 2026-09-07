@@ -214,7 +214,7 @@ export interface PaneLayoutController {
    * changes nothing at all.
    */
   readonly showGroup: (groupId: string) => void;
-  /** Every terminal ON SCREEN — the set the idle-unload must treat as visited. */
+  /** Every terminal ON SCREEN — every leaf of the pane tree, not just the focused one. */
   readonly visibleTerminalIds: readonly string[];
   readonly focusPane: (paneId: string) => void;
   readonly splitPane: (paneId: string, direction: SplitDirection) => void;

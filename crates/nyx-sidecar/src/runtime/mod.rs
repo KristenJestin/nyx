@@ -36,11 +36,9 @@ pub mod resume_parks;
 pub mod snapshot_store;
 pub mod stats_poll;
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use nyx_core::agent_activity::AgentActivityStore;
 use nyx_core::command::CommandRunner;
@@ -167,6 +165,11 @@ impl Runtime {
     /// propagates so the sidecar refuses to start rather than serving a broken schema.
     pub fn boot() -> anyhow::Result<Self> {
         let data_dir = db::resolve_data_dir()?;
+        // OPEN THE LOG FILE as soon as we know where it goes, and BEFORE anything that can fail:
+        // the boot's own refusals (a foreign data dir, a migration error) are exactly the lines
+        // worth having on disk afterwards. `stderr` keeps everything it had (see `crate::log`).
+        crate::log::init(&data_dir);
+        crate::slog!("[nyx-sidecar] runtime booting (data_dir {})", data_dir.display());
         // HARD GUARD (review #38): BEFORE opening/migrating SQLite, refuse a data dir that
         // belongs to another nyx version (a v1 `nyx.db` with no `nyx-v2` ownership marker).
         // A fresh dir is claimed (marker written) and proceeds; a foreign dir fails loudly so
@@ -545,8 +548,8 @@ impl Runtime {
     /// [`inject_resume`](Runtime::inject_resume) liveness gate: it stops a stale `claude --resume
     /// <external_id>` (a session id from a PREVIOUS run) from ever sitting parked against a terminal
     /// that is already running its agent — so it can never be injected into that live agent, even by
-    /// a later drain. Only a terminal with NO live agent (a bare/relaunch shell, or an unloaded one
-    /// whose PTY is closed) is parked/offered. Keyed on the real process tree, so a live-idle Claude
+    /// a later drain. Only a terminal with NO live agent (a bare/relaunch shell, or one whose PTY
+    /// is closed) is parked/offered. Keyed on the real process tree, so a live-idle Claude
     /// (Idle BETWEEN turns) is filtered exactly like a Working one.
     ///
     /// WHEN THIS RUNS — the answer to "why is there no resume in my BOOT log". Never at boot: the
@@ -632,7 +635,7 @@ impl Runtime {
         // [`pty::PtyManager::agent_alive_in_record`] / [`nyx_core::agent_liveness`]): a live agent in
         // ANY state (Working, Waiting OR Idle-between-turns) reads `true` here and is SKIPPED, while a
         // crashed/absent agent (the stale-`Idle` case the old gate mis-injected) — and a genuinely
-        // bare terminal (a fresh relaunch shell, or a revisit after an idle-unload closed the PTY) —
+        // bare terminal (a fresh relaunch shell, or a revisit after its PTY was closed) —
         // reads `false` and IS injected. On a skip we DELIBERATELY leave the park PENDING and
         // un-attempted (we do NOT `take_for_inject`), so a later bare spawn can still drain it — the
         // resume is deferred, never lost.
@@ -678,134 +681,6 @@ impl Runtime {
         eprintln!(
             "[nyx-sidecar] resume INJECTED into terminal {record_id} (session {session_id})."
         );
-    }
-
-    /// UNLOAD the idle agent sessions (v2.5.5 — task `01KX8Z6T1J2AC65DHHZTCQ26Z4`): close the PTY
-    /// of every agent-hosting terminal that is safe to unload, freeing its resources / dropping it
-    /// out of the TUI, and RETURN the record ids unloaded. The renderer drives this on a timer,
-    /// passing the currently-`visited` (focused) terminal record ids and an inactivity `threshold`.
-    ///
-    /// A terminal is unloaded ONLY when BOTH gates pass:
-    ///   1. [`nyx_core::agent_unload::decide_unload`] says so — its runtime activity is `Idle`
-    ///      (NEVER `Working`/`Waiting` — the central "une session ACTIVE n'est JAMAIS unloadée"
-    ///      invariant AND the "action en cours" exception, both enforced by the activity gate since
-    ///      a long in-flight action keeps `Working` 0-stale), it is NOT visited, and it has had NO
-    ///      PTY I/O for at least `threshold`; AND
-    ///   2. the session is RESUME-ELIGIBLE — the SAME `agent_resume::decide_resume` policy the
-    ///      restore plan uses would resume it (the project toggle is ON, the session is a live
-    ///      candidate with a transcript on disk, the shell/adapter can host the resume). This is the
-    ///      "toggle = interrupteur maître" decision extended to unload (review
-    ///      `01KX9CP96KVK6BTHY3ZSWY1E67`, finding 2): a session we could NOT bring back on revisit
-    ///      (e.g. a `resume_agent_sessions`-OFF project, the default) is NEVER unloaded — it stays
-    ///      loaded rather than being killed without recourse.
-    ///
-    /// Only ACTIVE/UNKNOWN agent sessions on `alive` terminals are candidates (a bare shell is not a
-    /// resumable session), read from `resume_candidates_on_boot` (which also carries the toggle +
-    /// transcript + external id gate 2 needs).
-    ///
-    /// The unload does NOT end the DB session (it stays `active`, exactly like a session left after
-    /// an app kill), so a revisit RESUMES it through the SAME phase-2 lazy path: closing the PTY +
-    /// [`resume_parks::ResumeParks::rearm`] RE-PARKS the exact `claude --resume <id>` (rebuilt HERE
-    /// via `decide_resume`), so on the terminal's next spawn — an IN-RUN revisit — the resume is
-    /// re-injected automatically, WITHOUT depending on the renderer re-pushing the plan (it pushes a
-    /// workspace's plan at most once per run — review finding 1). The runtime activity entry is
-    /// cleared (the anti-phantom reflex on unload).
-    pub fn unload_idle_sessions(
-        &self,
-        threshold: Duration,
-        visited: &HashSet<String>,
-        events: &EventSink,
-    ) -> Vec<String> {
-        // Only ACTIVE/UNKNOWN agent sessions on `alive` terminals are unload candidates — a plain
-        // shell with no session is not a resumable thing to unload. Read them via
-        // `resume_candidates_on_boot` (keyed by record id), which ALSO carries the resume-eligibility
-        // inputs (project toggle, transcript path, external id, agent kind) gate 2 below needs — so
-        // the unload never kills a session it could not bring back.
-        let candidates: std::collections::HashMap<String, nyx_core::db::ResumeCandidate> = self
-            .db
-            .with_conn(nyx_core::db::resume_candidates_on_boot)
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|c| (c.terminal_id.clone(), c))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Resolve the run-constant resume inputs ONCE: the kind→adapter registry (the single source
-        // of truth) and the target shell classification. Reused per candidate by `decide_resume`.
-        let registry = nyx_core::agent::AgentRegistry::default();
-        let target =
-            nyx_core::agent_resume::ResumeTarget::classify_shell(&nyx_core::pty::resolve_shell());
-
-        let mut unloaded = Vec::new();
-        for (record_id, idle_for) in self.pty.agent_idle_durations() {
-            let Some(candidate) = candidates.get(&record_id) else {
-                continue; // a live terminal that does not host an active agent session — skip.
-            };
-            // GATE 1 — safety/focus/threshold. The authoritative live activity (missing entry ⇒
-            // Idle — the anti-phantom default). Never unload Working/Waiting, the visited terminal,
-            // or one still within the grace window.
-            let activity = self
-                .activity
-                .snapshot(&record_id)
-                .map(|s| s.activity)
-                .unwrap_or(nyx_core::agent_activity::Activity::Idle);
-            let unload_candidate = nyx_core::agent_unload::UnloadCandidate {
-                record_id: record_id.clone(),
-                activity,
-                visited: visited.contains(&record_id),
-                idle_for,
-            };
-            if !nyx_core::agent_unload::decide_unload(&unload_candidate, threshold).is_unload() {
-                continue;
-            }
-            // GATE 2 — resume-eligibility (master switch). Only unload a session the SAME
-            // `decide_resume` policy would resume on revisit; else keep it loaded (never kill
-            // without recourse — a toggle-OFF project is the common case).
-            let Some(command) = resume_command_for_candidate(candidate, target, &registry) else {
-                continue;
-            };
-            // GATE 1b — RE-CHECK the LIVE activity IMMEDIATELY before the irreversible close
-            // (finding #28, the idle-unload ↔ reactivation race). Gate 1's `decide_unload` ran on a
-            // snapshot taken BEFORE gate 2's command build — and gate 2 does real work (an FS `stat`
-            // of the transcript, an adapter lookup), so a concurrent MCP hook thread (a new
-            // `UserPromptSubmit`, a tool/sub-agent starting) could have flipped the session to
-            // `Working`/`Waiting` in that window. Re-read the activity as tightly as possible here so
-            // a session that reactivated mid-sweep is SPARED rather than killed — the "une session
-            // qui travaille n'est JAMAIS déchargée" invariant holds even under a race, not just for
-            // an in-order snapshot.
-            let still_idle = self
-                .activity
-                .snapshot(&record_id)
-                .map(|s| s.activity)
-                .unwrap_or(nyx_core::agent_activity::Activity::Idle)
-                == nyx_core::agent_activity::Activity::Idle;
-            if !still_idle {
-                continue;
-            }
-            // Free the resources / take it out of the TUI. The DB session stays `active`.
-            self.pty.close_record(&record_id);
-            // Anti-phantom reflex: drop the (Idle) runtime activity entry for the gone PTY.
-            self.activity.clear(&record_id);
-            // RE-PARK the exact resume so an IN-RUN revisit re-injects `claude --resume <id>` via
-            // the phase-2 spawn-drain — no dependence on the renderer re-pushing the plan.
-            self.resume_parks.rearm(
-                &record_id,
-                resume_parks::ResumePark {
-                    session_id: candidate.session_id.clone(),
-                    command,
-                },
-            );
-            unloaded.push(record_id);
-        }
-        if !unloaded.is_empty() {
-            // Nudge the renderer to re-pull the agent sessions / terminals so the unloaded ones
-            // drop out of the deck (and can be re-mounted → resumed on revisit).
-            events.emit(crate::pipe::wire::Event::Changed {
-                topic: "agent-sessions".to_string(),
-            });
-        }
-        unloaded
     }
 
     /// The managed-command runtime (once [`attach_events`](Runtime::attach_events) ran).
@@ -1088,47 +963,6 @@ impl Runtime {
             // Stateless requests never reach here (routed by handle_request_stateless).
             _ => err(0, "stateless request routed to dispatch_runtime".into()),
         }
-    }
-}
-
-/// The exact resume command for a candidate IFF the SHARED `agent_resume::decide_resume` policy
-/// would resume it (project toggle ON, live candidate, transcript on disk, resumable target +
-/// adapter), else `None`. It REUSES `decide_resume` verbatim — the SAME gate the workspace restore
-/// plan applies (no new policy, no duplication) — so the idle-session UNLOAD (v2.5.5, review
-/// `01KX9CP96KVK6BTHY3ZSWY1E67`):
-///   * gates unloading on resume-eligibility (finding 2 — never kill a session it could not bring
-///     back: a `resume_agent_sessions`-OFF project yields `Skip(OptionOff)` → `None` → kept), and
-///   * rebuilds the `claude --resume <id>` to RE-PARK at unload (finding 1 — the in-run revisit
-///     re-injects it) from the SAME string `decide_resume` returns.
-///
-/// A free fn (not a method): it needs none of the runtime state, only the plain candidate + the
-/// run-constant target/registry the caller resolves once.
-fn resume_command_for_candidate(
-    candidate: &nyx_core::db::ResumeCandidate,
-    target: nyx_core::agent_resume::ResumeTarget,
-    registry: &nyx_core::agent::AgentRegistry,
-) -> Option<String> {
-    let session_state = nyx_core::agent_resume::SessionState::from_db(&candidate.session_state)?;
-    // `stat` the captured transcript (finding #53 parity): a missing file → not resumable.
-    let transcript_exists = candidate
-        .transcript_path
-        .as_deref()
-        .map(|p| std::path::Path::new(p).exists())
-        .unwrap_or(false);
-    let inputs = nyx_core::agent_resume::ResumeInputs {
-        project_resume_on: candidate.project_resume_on,
-        // A terminal reached by the sweep is `alive` (a voluntary close leaves it `closed`, so it
-        // never reaches here) — the voluntary-close gate is structural, exactly as the restore plan.
-        closed_voluntarily: false,
-        session_state,
-        external_session_id: &candidate.external_session_id,
-        transcript_exists,
-        target,
-    };
-    let adapter = registry.get(&candidate.agent_kind)?;
-    match nyx_core::agent_resume::decide_resume(&inputs, adapter) {
-        nyx_core::agent_resume::ResumeDecision::Resume { command, .. } => Some(command),
-        nyx_core::agent_resume::ResumeDecision::Skip(_) => None,
     }
 }
 

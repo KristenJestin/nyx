@@ -2081,7 +2081,7 @@ mod tests {
     /// a sub-agent starting — WITHOUT a fresh `UserPromptSubmit` (an agentic continuation, or a
     /// `UserPromptSubmit` REORDERED behind the work hook by the best-effort, unordered hook-POST
     /// transport) MUST re-enter `Working` and DROP the now-stale turn-end notification. A
-    /// resumed-and-working session must never read `Idle` (which would let the idle-unload / lazy
+    /// resumed-and-working session must never read `Idle` (which would let the lazy
     /// resume treat it as dormant and inject a `claude --resume` into a live agent — the #28 bug),
     /// nor keep a stale green/red while it is demonstrably working again.
     #[test]

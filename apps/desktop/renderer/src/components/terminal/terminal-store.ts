@@ -1,6 +1,10 @@
 import { Store } from "@tanstack/react-store";
 
-import { XtermInstance, type XtermInstanceOptions } from "./xterm-instance";
+import {
+  XtermInstance,
+  type TerminalExit,
+  type XtermInstanceOptions,
+} from "./xterm-instance";
 
 /**
  * THE MODULE-LEVEL TERMINAL STORE.
@@ -27,13 +31,23 @@ export interface TerminalStoreState {
   readonly ids: readonly string[];
   /** Per-record live title (from OSC 0/2), for views that show it. */
   readonly titles: Readonly<Record<string, string>>;
+  /**
+   * Per-record EXIT — present only while that terminal's process is gone and no relaunch has put a
+   * shell back. This is what the pane's "Exited · code N" bar renders from.
+   *
+   * It lives HERE, next to the ids and titles, for the same reason they do: the instance outlives
+   * every React mount, so a pane that exits while its route is unmounted must still show its bar
+   * on return. A `useState` in `<Terminal>` would be born empty on that remount and the pane would
+   * come back looking alive with a dead shell in it.
+   */
+  readonly exits: Readonly<Record<string, TerminalExit>>;
 }
 
 /** The imperative Map of instances — module-level, outside React. */
 const instances = new Map<string, XtermInstance>();
 
-/** The reactive metadata slice (ids + titles). */
-export const terminalStore = new Store<TerminalStoreState>({ ids: [], titles: {} });
+/** The reactive metadata slice (ids + titles + exits). */
+export const terminalStore = new Store<TerminalStoreState>({ ids: [], titles: {}, exits: {} });
 
 function publishIds(): void {
   terminalStore.setState((s) => ({ ...s, ids: Array.from(instances.keys()) }));
@@ -41,6 +55,16 @@ function publishIds(): void {
 
 function setTitle(recordId: string, title: string): void {
   terminalStore.setState((s) => ({ ...s, titles: { ...s.titles, [recordId]: title } }));
+}
+
+/** Publish (or clear, on `null`) one record's exit. */
+function setExit(recordId: string, exit: TerminalExit | null): void {
+  terminalStore.setState((s) => {
+    const exits = { ...s.exits };
+    if (exit === null) delete exits[recordId];
+    else exits[recordId] = exit;
+    return { ...s, exits };
+  });
 }
 
 /**
@@ -59,6 +83,10 @@ export function ensureTerminal(options: XtermInstanceOptions): XtermInstance {
     onTitle: (title) => {
       setTitle(options.recordId, title);
       options.onTitle?.(title);
+    },
+    onExit: (exit) => {
+      setExit(options.recordId, exit);
+      options.onExit?.(exit);
     },
   });
   instances.set(options.recordId, instance);
@@ -108,8 +136,24 @@ export function disposeTerminal(recordId: string): void {
   terminalStore.setState((s) => {
     const titles = { ...s.titles };
     delete titles[recordId];
-    return { ids: Array.from(instances.keys()), titles };
+    const exits = { ...s.exits };
+    delete exits[recordId];
+    return { ids: Array.from(instances.keys()), titles, exits };
   });
+}
+
+/**
+ * RELAUNCH the shell of a terminal whose process exited, IN THE SAME instance and against the
+ * SAME record (see {@link XtermInstance.respawn}). Returns whether a shell is live afterwards;
+ * `false` for an unknown record, one that never exited, or a relaunch that failed.
+ *
+ * This is the store-level verb the pane's bar (and the Enter chord inside the emulator) calls, so
+ * a caller never has to reach for the instance itself.
+ */
+export function respawnTerminal(recordId: string): Promise<boolean> {
+  const instance = instances.get(recordId);
+  if (!instance) return Promise.resolve(false);
+  return instance.respawn();
 }
 
 /**

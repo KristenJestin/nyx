@@ -257,8 +257,67 @@ impl ScrollbackOwner {
     }
 }
 
+/// WHY a PTY was closed — the word the log writes next to the record id.
+///
+/// From the process's point of view every close is the same kill, and from the reader's they are
+/// three unrelated events: a terminal the user closed, a workspace that was deleted under it, and
+/// an app that went down. The distinction only exists at the CALL SITE, so it is carried from
+/// there rather than guessed afterwards. The fourth case — the shell exiting ON ITS OWN — never
+/// goes through a close at all and is logged by the pump, with its exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseCause {
+    /// An EXPLICIT close of this terminal: the UI's `pty_close` / `close_terminal`, or the MCP
+    /// tool of the same name.
+    Explicit,
+    /// The ordered SHUTDOWN ([`PtyManager::close_all`]) — the app is going down and takes every
+    /// shell with it.
+    Shutdown,
+    /// A WORKSPACE TEARDOWN ([`PtyManager::close_records`]) — the workspace holding these
+    /// terminals is being deleted.
+    WorkspaceDelete,
+}
+
+impl CloseCause {
+    /// The word written in the log. Stable, lower-case, greppable.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CloseCause::Explicit => "close",
+            CloseCause::Shutdown => "shutdown",
+            CloseCause::WorkspaceDelete => "workspace_delete",
+        }
+    }
+}
+
+/// The line a CLOSED pty writes to the log. One `record=… pty=… cause=…` shape for all four
+/// causes, so the file greps as one family; a record-less terminal (an MCP/bare shell) says `-`
+/// rather than dropping the field and breaking the shape.
+///
+/// A pure formatter, so the vocabulary the log promises can be pinned by a test instead of read
+/// off a running shell.
+fn close_log_line(record_id: Option<&str>, terminal_id: u32, cause: CloseCause) -> String {
+    format!(
+        "[nyx-sidecar] pty closed: record={} pty={terminal_id} cause={}",
+        record_id.unwrap_or("-"),
+        cause.as_str()
+    )
+}
+
+/// The line a pty that ended ON ITS OWN writes — the same shape, plus the exit CODE, which is the
+/// one thing only this path knows. `?` when the status could not be read (the same "unknown code"
+/// the `pty-exit` event already carries).
+fn exit_log_line(record_id: Option<&str>, terminal_id: u32, code: Option<i32>) -> String {
+    format!(
+        "[nyx-sidecar] pty closed: record={} pty={terminal_id} cause=exit code={}",
+        record_id.unwrap_or("-"),
+        code.map(|c| c.to_string()).unwrap_or_else(|| "?".to_string())
+    )
+}
+
 /// One live interactive terminal: the kill/write/resize handles plus its flow state.
 struct LiveTerminal {
+    /// The live pty id — its key in the registry, carried on the value too so a DETACHED terminal
+    /// (which no longer has a key) can still name itself in the close log.
+    terminal_id: u32,
     pty: Arc<Mutex<Pty>>,
     pause_gate: PauseGate,
     flow: Arc<Mutex<FlowState>>,
@@ -291,10 +350,9 @@ struct LiveTerminal {
     /// has taken it to trigger that shutdown.
     feed_tx: Option<Sender<Vec<u8>>>,
     /// The instant of the LAST PTY I/O — updated on every output chunk (the pump) and on every
-    /// keystroke/write ([`PtyManager::write`]). Its elapsed time is the "inactivité I/O du PTY"
-    /// signal the idle-session UNLOAD (v2.5.5) uses as its inactivity THRESHOLD: a session with
-    /// no output nor keystroke for N minutes is a candidate to unload (gated first by the
-    /// `agent_activity == Idle` safety check). Shared with the pump thread by `Arc`.
+    /// keystroke/write ([`PtyManager::write`]). A plain per-terminal activity clock, shared with
+    /// the pump thread by `Arc`; NOTHING acts on it. It is the only OBSERVABLE proof that the pump
+    /// really consumed a chunk, which is what the close-under-flood test settles on.
     last_io: Arc<Mutex<Instant>>,
     /// WHO owns this terminal's scrollback (and therefore whether its output is streamed or
     /// persisted here) — see [`ScrollbackOwner`]. Holds:
@@ -330,7 +388,10 @@ pub struct PtyManager {
     /// HERE (see [`HeadlessScrollback`]) — the sidecar owns that buffer for exactly as long as
     /// no pane does.
     db: Arc<Db>,
-    terminals: Mutex<HashMap<u32, LiveTerminal>>,
+    /// The live terminals, by pty id. In its OWN `Arc<Mutex>` for the same reason `live_records`
+    /// is: the PUMP THREAD retracts its own entry when its shell ends ON ITS OWN (see
+    /// [`run_pump`]'s teardown), and it cannot borrow the manager to do it.
+    terminals: Arc<Mutex<HashMap<u32, LiveTerminal>>>,
     /// record-id -> live pty id. The sidecar registers this join itself when a PTY is
     /// spawned WITH a `record_id` (the v1 `register_terminal_pty`), so the MCP terminal
     /// tools can resolve a record to a LIVE shell synchronously: `send_to_terminal`
@@ -352,7 +413,7 @@ impl PtyManager {
     pub fn new(db: Arc<Db>) -> Self {
         Self {
             db,
-            terminals: Mutex::new(HashMap::new()),
+            terminals: Arc::new(Mutex::new(HashMap::new())),
             live_records: Arc::new(Mutex::new(HashMap::new())),
             opening_commands: Mutex::new(HashMap::new()),
         }
@@ -558,7 +619,7 @@ impl PtyManager {
         // Headless VT screen model (v2.2.5): sized to match the spawn geometry so its grid is
         // the same shape the renderer paints.
         let screen = Arc::new(Mutex::new(VtScreen::new(rows, cols)));
-        // Last-I/O clock (v2.5.5 unload): starts "now" at spawn — a fresh terminal is not idle.
+        // Last-I/O clock: starts "now" at spawn — a fresh terminal is not idle.
         let last_io = Arc::new(Mutex::new(Instant::now()));
         // WHO owns the scrollback. A shell spawned WITHOUT a view carries the sidecar's own
         // persistence: the record it belongs to was created by the `create_terminal` that opened
@@ -599,11 +660,17 @@ impl PtyManager {
         let pump_scrollback = scrollback.clone();
         let closing = Arc::new(AtomicBool::new(false));
         let pump_closing = Arc::clone(&closing);
+        let pump_record_id = record_opt.map(|r| r.to_string());
+        let pump_terminals = Arc::clone(&self.terminals);
+        let pump_live_records = Arc::clone(&self.live_records);
         let pump = std::thread::Builder::new()
             .name(format!("nyx-sidecar-pty-pump-{terminal_id}"))
             .spawn(move || {
                 run_pump(PumpParams {
                     terminal_id,
+                    record_id: pump_record_id,
+                    terminals: pump_terminals,
+                    live_records: pump_live_records,
                     rx,
                     events,
                     flow: pump_flow,
@@ -619,6 +686,7 @@ impl PtyManager {
         self.terminals.lock().unwrap().insert(
             terminal_id,
             LiveTerminal {
+                terminal_id,
                 pty,
                 pause_gate,
                 flow,
@@ -704,23 +772,6 @@ impl PtyManager {
         w.write_all(data)?;
         w.flush()?;
         Ok(())
-    }
-
-    /// The per-record PTY INACTIVITY durations (v2.5.5 unload): for every live terminal that
-    /// carries a persistent RECORD id, `(record_id, time since its last PTY I/O)`. The idle-
-    /// session unload sweep reads this as the "pas de frappe ni d'output depuis N min" threshold
-    /// signal (gated first by `agent_activity == Idle`). Record-less terminals are omitted (they
-    /// cannot be correlated back to a resumable session).
-    pub fn agent_idle_durations(&self) -> Vec<(String, Duration)> {
-        let terms = self.terminals.lock().unwrap();
-        terms
-            .values()
-            .filter_map(|t| {
-                let rec = t.record_id.clone()?;
-                let idle_for = t.last_io.lock().unwrap().elapsed();
-                Some((rec, idle_for))
-            })
-            .collect()
     }
 
     /// The OS BUSY bit of a live terminal by its persistent RECORD id (v2.5.5 review T1):
@@ -829,7 +880,7 @@ impl PtyManager {
     /// recognizes (`claude`, extensibly `codex`/`opencode`). CROSS-PLATFORM (a `sysinfo` PPID
     /// walk, not `/proc`).
     ///
-    /// Returns `false` when NO live PTY backs the record (a bare/unloaded/absent terminal — no
+    /// Returns `false` when NO live PTY backs the record (a bare/absent terminal — no
     /// hosted agent) OR the shell pid is unavailable, so the lazy-resume gate treats such a
     /// terminal as resumable. The point: a `record` whose PTY still runs a live `claude` (Idle
     /// BETWEEN turns, or Working/Waiting) reads `true` here — distinguishing it from a crashed
@@ -918,7 +969,7 @@ impl PtyManager {
     /// A close of ONE is a close of a group of one ([`close_many`](Self::close_many)) — same
     /// phases, same per-terminal order, one implementation.
     pub fn close(&self, terminal_id: u32) {
-        self.close_many(&[terminal_id]);
+        self.close_many(&[terminal_id], CloseCause::Explicit);
     }
 
     /// PHASE 1a of a close — DETACH and SIGNAL, the acts that are irreversible and cannot be
@@ -1019,11 +1070,25 @@ impl PtyManager {
     /// window, whatever N is. Per terminal the ORDER of the irreversible acts is UNCHANGED
     /// (detach, kill, reap, flag, join) — which is what keeps the reported exit codes and the
     /// teardown semantics identical to a one-by-one close.
-    fn close_many(&self, terminal_ids: &[u32]) {
+    ///
+    /// `cause` is carried purely so the LOG can say WHY each shell went (see [`CloseCause`]): a
+    /// closed terminal, a deleted workspace and an app shutdown are indistinguishable from the
+    /// process's point of view and are three very different things to read about afterwards.
+    fn close_many(&self, terminal_ids: &[u32], cause: CloseCause) {
         let signalled: Vec<LiveTerminal> = terminal_ids
             .iter()
             .filter_map(|id| self.detach_and_kill(*id))
             .collect();
+        for live in &signalled {
+            // Logged HERE and not in `detach_and_kill`: this is the one place that knows the cause,
+            // and it is past the point of no return (the terminal is out of the registry and the
+            // kill is sent), so a line here can never describe a close that did not happen.
+            crate::log::line(&close_log_line(
+                live.record_id.as_deref(),
+                live.terminal_id,
+                cause,
+            ));
+        }
         Self::reap_all(&signalled);
         Self::signal_closing(&signalled);
         for live in signalled {
@@ -1050,7 +1115,7 @@ impl PtyManager {
                 .filter_map(|r| live_records.get(r).copied())
                 .collect()
         };
-        self.close_many(&ids);
+        self.close_many(&ids, CloseCause::WorkspaceDelete);
     }
 
     /// FLOW-CONTROL ACK: the renderer consumed `bytes` of `terminal_id`'s output. Free
@@ -1097,7 +1162,7 @@ impl PtyManager {
     /// therefore pays ~one poll window, not one per terminal.
     pub fn close_all(&self) {
         let ids: Vec<u32> = self.terminals.lock().unwrap().keys().copied().collect();
-        self.close_many(&ids);
+        self.close_many(&ids, CloseCause::Shutdown);
     }
 }
 
@@ -1158,6 +1223,14 @@ fn read_terminal_info(
 struct PumpParams {
     /// The live pty id (the wire terminal id all emitted frames carry).
     terminal_id: u32,
+    /// The persistent terminal RECORD id, when this shell was spawned for one — the name the exit
+    /// is LOGGED under (a pty id means nothing once the process is gone) and the key the teardown
+    /// RETRACTS from `live_records`.
+    record_id: Option<String>,
+    /// The manager's registries, shared so the teardown can take THIS terminal out of them when
+    /// the shell ends on its own. See the retraction at the end of [`run_pump`].
+    terminals: Arc<Mutex<HashMap<u32, LiveTerminal>>>,
+    live_records: Arc<Mutex<HashMap<String, u32>>>,
     /// The core reader channel: raw PTY chunks arrive here until the child exits / master closes.
     rx: Receiver<Vec<u8>>,
     /// The unsolicited-event sink the coalesced binary output / OSC state / exit ride.
@@ -1170,7 +1243,7 @@ struct PumpParams {
     pty: Arc<Mutex<Pty>>,
     /// The O(1) hand-off into the headless-VT feeder thread.
     feed_tx: Sender<Vec<u8>>,
-    /// The last-PTY-I/O clock (v2.5.5 unload): refreshed on every output chunk.
+    /// The last-PTY-I/O activity clock: refreshed on every output chunk.
     last_io: Arc<Mutex<Instant>>,
     /// WHO owns the scrollback ([`ScrollbackOwner`]): the freshness bit the pump RAISES on every
     /// chunk, and — while no pane is attached — the sidecar's own accumulation + save. Its
@@ -1189,6 +1262,9 @@ struct PumpParams {
 fn run_pump(params: PumpParams) {
     let PumpParams {
         terminal_id,
+        record_id,
+        terminals,
+        live_records,
         rx,
         events,
         flow,
@@ -1263,7 +1339,7 @@ fn run_pump(params: PumpParams) {
         match recv {
             Ok(chunk) => {
                 // OUTPUT is I/O: refresh the idle clock so a terminal actively printing (Claude
-                // streaming its answer, a build logging) is never seen as idle by the unload sweep.
+                // streaming its answer, a build logging) is never seen as idle on that clock.
                 *last_io.lock().unwrap() = Instant::now();
                 // The screen just moved on: whatever was last SAVED as this terminal's scrollback
                 // is now behind it, until the next save says otherwise.
@@ -1372,7 +1448,55 @@ fn run_pump(params: PumpParams) {
             pty.wait()
         }
     };
+    if !closed {
+        // A NATURAL exit — the shell ended on its own (an `exit`, a crash, a hangup). Logged here
+        // and nowhere else: no close ran, so `close_many`'s line was never written, and this is
+        // the only place that knows the code. An explicit close has its own line, with its cause.
+        crate::log::line(&exit_log_line(record_id.as_deref(), terminal_id, code));
+        retract_registrations(&terminals, &live_records, terminal_id, record_id.as_deref());
+    }
     events.emit(Event::PtyExit { terminal_id, code });
+}
+
+/// TAKE A DEAD TERMINAL OUT OF THE REGISTRIES — the teardown half a NATURAL exit never had.
+///
+/// An explicit close retracts in [`PtyManager::detach_and_kill`]; a shell that ends ON ITS OWN
+/// went through no close at all, so its `record -> pty` join and its registry entry survived it.
+/// Everything keyed on those then answered about a process that no longer exists: `is_live_record`
+/// said `true`, `list_terminals` reported the record LIVE, the home's dormant filter kept it in the
+/// flow — and, worst, [`PtyManager::spawn`] took the ATTACH branch and handed a mount the id of the
+/// dead shell instead of starting a new one. That last one is what makes the pane's "Relancer"
+/// impossible: the renderer asks for a shell, gets `pty=<the dead one>` back, and sits in front of
+/// a terminal that answers nothing. Observed in the real app (`.shots/terrain-terminal/`).
+///
+/// GUARDED ON IDENTITY. The record may already have been re-spawned by the time this runs — the
+/// relaunch is one round-trip and this thread is winding down — so the join is removed ONLY while
+/// it still points at THIS pty. Otherwise a slow teardown would retract the LIVE successor and
+/// break the very relaunch it exists to enable. Pty ids are monotonic and never reused
+/// (`nyx_core::pty`'s `NEXT_ID`), so the comparison is exact.
+///
+/// Called only on the natural path: on an explicit close the entry is already gone, and the
+/// closer is joining this thread.
+fn retract_registrations(
+    terminals: &Mutex<HashMap<u32, LiveTerminal>>,
+    live_records: &Mutex<HashMap<String, u32>>,
+    terminal_id: u32,
+    record_id: Option<&str>,
+) {
+    // The JOIN first: while it stands, a mount can still be handed this dead pty.
+    if let Some(rec) = record_id {
+        let mut joins = live_records.lock().unwrap();
+        if joins.get(rec).copied() == Some(terminal_id) {
+            joins.remove(rec);
+        }
+    }
+    // Then the entry itself. Dropped OUTSIDE the registry lock: it owns this very thread's
+    // `JoinHandle` (dropping detaches, which is right — nobody is joining a thread that is
+    // returning) and the feeder's, and dropping the stored `feed_tx` is what lets the feeder
+    // drain and exit. Holding the lock across that is a lock held during a `Drop` that touches
+    // channels; there is no reason to.
+    let gone = terminals.lock().unwrap().remove(&terminal_id);
+    drop(gone);
 }
 
 /// The canned replies a VIEW-LESS terminal owes its own shell for this chunk — and an EMPTY
@@ -1579,6 +1703,87 @@ fn last_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// EVERY WAY A SHELL CAN GO IS IN THE LOG, AND SAYS WHICH ONE IT WAS.
+    ///
+    /// A terminal the user closed, a workspace deleted under it, an app shutting down and a shell
+    /// that simply ended are the same kill to the OS and four different things to read about
+    /// afterwards — which is the whole reason the cause is carried from the call site rather than
+    /// inferred. The vocabulary is pinned here because it is what a human (or an agent) will grep
+    /// the file for; changing a word is changing a contract with the reader.
+    #[test]
+    fn a_closed_pty_is_logged_with_the_cause_that_closed_it() {
+        assert_eq!(
+            close_log_line(Some("term-7"), 3, CloseCause::Explicit),
+            "[nyx-sidecar] pty closed: record=term-7 pty=3 cause=close"
+        );
+        assert_eq!(
+            close_log_line(Some("term-7"), 3, CloseCause::Shutdown),
+            "[nyx-sidecar] pty closed: record=term-7 pty=3 cause=shutdown"
+        );
+        assert_eq!(
+            close_log_line(Some("term-7"), 3, CloseCause::WorkspaceDelete),
+            "[nyx-sidecar] pty closed: record=term-7 pty=3 cause=workspace_delete"
+        );
+        // A NATURAL exit carries the code, which is the one thing no close can report.
+        assert_eq!(
+            exit_log_line(Some("term-7"), 3, Some(1)),
+            "[nyx-sidecar] pty closed: record=term-7 pty=3 cause=exit code=1"
+        );
+        // An unreadable status says so rather than inventing a 0 — the same "unknown code" the
+        // `pty-exit` event already carries.
+        assert_eq!(
+            exit_log_line(Some("term-7"), 3, None),
+            "[nyx-sidecar] pty closed: record=term-7 pty=3 cause=exit code=?"
+        );
+        // A record-less shell (an MCP/bare spawn) keeps the SHAPE, so one grep finds every close.
+        assert_eq!(
+            close_log_line(None, 9, CloseCause::Explicit),
+            "[nyx-sidecar] pty closed: record=- pty=9 cause=close"
+        );
+    }
+
+    /// A SHELL THAT ENDS ON ITS OWN LETS GO OF ITS RECORD — and only of its own.
+    ///
+    /// Before this, the `record -> pty` join outlived the process: `is_live_record` said `true`
+    /// about a dead shell, and `PtyManager::spawn` took its ATTACH branch and handed the next
+    /// mount the id of that corpse instead of starting a shell. The pane's "Relancer" then did
+    /// nothing observable — a new pty was asked for and the dead one came back.
+    ///
+    /// The guard is the other half: by the time this teardown runs, the record may ALREADY have
+    /// been re-spawned (the relaunch is one round-trip and this thread is winding down). Retracting
+    /// blindly would then unregister the LIVE successor and break the relaunch it exists to enable.
+    #[test]
+    fn a_natural_exit_retracts_its_own_record_join_and_never_a_successors() {
+        let terminals = Mutex::new(HashMap::new());
+        let joins = Mutex::new(HashMap::from([
+            ("mine".to_string(), 7u32),
+            ("other".to_string(), 8u32),
+        ]));
+
+        retract_registrations(&terminals, &joins, 7, Some("mine"));
+
+        assert_eq!(joins.lock().unwrap().get("mine"), None, "the dead pty lets its record go");
+        assert_eq!(
+            joins.lock().unwrap().get("other"),
+            Some(&8),
+            "…and touches nobody else's"
+        );
+
+        // THE SUCCESSOR IS SAFE: the record now points at a NEWER pty, so the late teardown of the
+        // old one must leave it exactly where it is.
+        joins.lock().unwrap().insert("mine".to_string(), 9);
+        retract_registrations(&terminals, &joins, 7, Some("mine"));
+        assert_eq!(
+            joins.lock().unwrap().get("mine"),
+            Some(&9),
+            "a late teardown must never unregister the shell that replaced it"
+        );
+
+        // A record-less shell (an MCP/bare spawn) has no join to retract and must not panic.
+        retract_registrations(&terminals, &joins, 7, None);
+        assert_eq!(joins.lock().unwrap().len(), 2);
+    }
 
     #[test]
     fn incomplete_tail_carries_split_introducer() {
@@ -1872,9 +2077,9 @@ mod tests {
 
     // --- close never blocks the caller ---------------------------------------------------
 
-    /// [`PtyManager::close`] runs ON THE SIDECAR'S REQUEST LOOP (`close_terminal`, the idle-unload
-    /// sweep, `close_all` at shutdown), so a close that blocks freezes the whole pipe — no reply
-    /// to any request, ever.
+    /// [`PtyManager::close`] runs ON THE SIDECAR'S REQUEST LOOP (`close_terminal`,
+    /// `workspace_delete`, `close_all` at shutdown), so a close that blocks freezes the whole pipe
+    /// — no reply to any request, ever.
     ///
     /// It CAN block: `close` joins the pump, the pump only exits when the PTY master EOFs, and the
     /// master only EOFs when the shell dies — while `portable-pty`'s Unix killer sends exactly one
@@ -1980,6 +2185,11 @@ mod tests {
         let started = *last_io.lock().unwrap();
         let params = PumpParams {
             terminal_id: 1,
+            record_id: None,
+            // Empty registries: this pump was never registered in any, and it exits on the CLOSE
+            // flag, so the natural-exit retraction never runs here anyway.
+            terminals: Arc::new(Mutex::new(HashMap::new())),
+            live_records: Arc::new(Mutex::new(HashMap::new())),
             rx,
             events: discard_sink(),
             flow: Arc::new(Mutex::new(FlowState {

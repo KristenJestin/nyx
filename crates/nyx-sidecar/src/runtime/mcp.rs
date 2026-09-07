@@ -1224,7 +1224,7 @@ mod tests {
             "new output with no save puts the buffer behind the shell again"
         );
 
-        // No shell at all (closed, or the idle-unload took it): the buffer is that terminal's
+        // No shell at all (closed, or its shell exited): the buffer is that terminal's
         // FINAL output, never its present state.
         pty.close(pty_id);
         let out = read(&disp);

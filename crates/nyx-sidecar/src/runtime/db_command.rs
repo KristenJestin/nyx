@@ -1210,36 +1210,6 @@ impl Ctx<'_> {
                 self.runtime.park_resumes(&parks, self.events);
                 Ok("null".to_string())
             }
-            // v2.5.5 IDLE-SESSION UNLOAD: the sidecar half of the renderer's timer sweep
-            // (`use-idle-unload.ts`). Reclaim the resources of DORMANT agent sessions by closing the
-            // PTY of every agent-hosting terminal that is Idle (NEVER Working/Waiting — an ACTIVE
-            // session is never unloaded), NOT currently `visited` (focused), idle beyond
-            // `thresholdSecs`, AND resume-eligible. The authoritative safety + eligibility decision
-            // lives in [`Runtime::unload_idle_sessions`](super::Runtime::unload_idle_sessions)
-            // (`decide_unload` gate + the `decide_resume` master switch); this arm ONLY maps the
-            // renderer's args to it. This is the transport half the `NyxBridge` `unload_idle_sessions`
-            // invocation drives — WITHOUT it the sweep fell into the fallback Error and NEVER ran over
-            // the wire (the in-process method was unreachable from the dispatch, exactly the class of
-            // bug fixed for `set_resume_parks`). `{ thresholdSecs?, visited: string[] }` → the unloaded
-            // terminal record ids (parity with the contract's documented return). The DB sessions stay
-            // `active`, so an in-run revisit RESUMES each via the phase-2 lazy park+inject.
-            "unload_idle_sessions" => {
-                // `thresholdSecs` is OPTIONAL (contract default = `DEFAULT_UNLOAD_THRESHOLD_SECS`,
-                // 15 min); `visited` is the REQUIRED list of focused terminal record ids (a readable
-                // error if missing — never a silent drop, as with `arg_resume_parks`).
-                let threshold = std::time::Duration::from_secs(
-                    self.args
-                        .get("thresholdSecs")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(nyx_core::agent_unload::DEFAULT_UNLOAD_THRESHOLD_SECS),
-                );
-                let visited: std::collections::HashSet<String> =
-                    self.arg_str_vec("visited")?.into_iter().collect();
-                let unloaded = self
-                    .runtime
-                    .unload_idle_sessions(threshold, &visited, self.events);
-                Self::json(&unloaded)
-            }
             // --- workspaces ----------------------------------------------------
             "list_workspaces" => {
                 let project_id = self.arg_str("projectId")?;
@@ -1451,8 +1421,8 @@ impl Ctx<'_> {
             // the three live overlays the sidecar (and only the sidecar) can supply:
             //   * the runtime AGENT ACTIVITY — the shared `AgentActivityStore` the per-turn hooks
             //     write, which is where both the row's state and its secondary text come from;
-            //   * PTY LIVENESS — the DORMANT filter. The idle-unload closes a dormant session's PTY
-            //     and leaves its row `active` on purpose, so nothing in the DB can tell the two
+            //   * PTY LIVENESS — the DORMANT filter. A dormant session's PTY is gone
+            //     while its row stays `active` on purpose, so nothing in the DB can tell the two
             //     apart; only this layer can.
             //   * the managed-command runner's FACTUAL outcome — never `last_state` alone.
             // Deliberately NOT a per-workspace fan-out: `workspace_runtime_snapshot` costs one IPC
@@ -6205,7 +6175,7 @@ mod tests {
         let b_home = home(serde_json::json!({ "projectId": proj_b }));
         assert_eq!(terminals_of(&b_home), vec![term_b.clone()]);
 
-        // THE DORMANT FILTER, end to end: retract A's PTY (what the idle-unload does) and leave
+        // THE DORMANT FILTER, end to end: retract A's PTY (what an exited shell leaves) and leave
         // its `agent_sessions` row `active`. A drops out of the flow, B does not — which is only
         // possible if `is_live_record` is being asked about the terminal id `home_sessions` returns.
         h.runtime

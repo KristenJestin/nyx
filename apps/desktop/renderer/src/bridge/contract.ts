@@ -1248,14 +1248,6 @@ export type BackendCommand =
   // if already live). `{ parks: ResumePark[] }`. Idempotent (a one-shot guard per record id);
   // an injection whose write fails marks the session `resume_failed` (no retry loop).
   | "set_resume_parks"
-  // v2.5.5 IDLE-SESSION UNLOAD: reclaim the resources of dormant agent sessions. The renderer
-  // sweeps on a timer, passing the currently-visited (focused) terminal record ids and an
-  // inactivity `thresholdSecs` (default 15 min). The sidecar closes the PTY of every agent-hosting
-  // terminal that is Idle (NEVER Working/Waiting — an ACTIVE session is never unloaded), unvisited,
-  // and idle beyond the threshold; the DB session stays `active` so a revisit RESUMES it via the
-  // same lazy park+inject (phase 2). `{ thresholdSecs?, visited: string[] }` → the unloaded record
-  // ids. Best-effort: a failed sweep just means no unload this tick.
-  | "unload_idle_sessions"
   // v2.4 review — the Git DIFF read model (task 01KX0F6GY96096AHWD8RZ2BMM0, PDR-0007/0015).
   // `repo_diff` is the line-level diff of ONE `(workspace, repository)` for a review surface
   // (working_tree/staged/unstaged/untracked/commit/range/branches), LIVING or PINNED — the

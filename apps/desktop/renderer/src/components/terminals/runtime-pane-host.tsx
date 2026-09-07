@@ -56,8 +56,8 @@ export function RuntimePaneHost({
   services: readonly WorkspaceRuntimeService[];
   /**
    * The page's TILING state (`usePaneLayout`) — which terminals are on screen, where, and which
-   * pane is focused. It is owned ABOVE this component because the page also feeds it to the
-   * idle-unload sweep (whose protected set is every VISIBLE pane, not the selection).
+   * pane is focused. It is owned ABOVE this component because the page drives it (splits, focus,
+   * the visible set) and several surfaces read it.
    *
    * OMITTED ⇒ there is no tiling and therefore nothing to show: the terminal region falls back to
    * its placeholder. The service surfaces below are unaffected — they do not tile.

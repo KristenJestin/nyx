@@ -1,6 +1,22 @@
 # PDR-0026 - Stack terminal : wterm (@wterm/dom) + core ghostty en remplacement de xterm, store no-host
 
-**Status: validated**
+**Status: SUPERSEDED — la moitié « wterm/ghostty » n'a pas été livrée ; la moitié « store no-host » l'a été.**
+
+> **Ce que dit le code aujourd'hui.** Le terminal est **`@xterm/xterm` 6.0.0** avec son **rendu DOM**
+> (`apps/desktop/renderer/src/components/terminal/xterm-instance.ts`), plus `@xterm/addon-fit`,
+> `@xterm/addon-serialize` et `@xterm/addon-web-links` ; `package.json` du renderer ne porte aucune
+> dépendance `@wterm/*`. La bascule de bibliothèque décidée ici **n'a jamais eu lieu** : xterm 6 a son
+> propre rendu DOM, ce qui retirait l'essentiel du motif (les contournements WebGL, le keep-alive,
+> l'a11y) sans changer de stack.
+>
+> **Ce qui reste vrai et fait toujours foi**, parce que c'est ce qui a été construit : le **store
+> module-level no-host** (`terminal-store.ts` — une `Map` impérative hors React et hors du cycle du
+> routeur, attach/detach du nœud DOM persistant, `dispose()` uniquement à la fermeture réelle), les
+> **métadonnées réactives** dans un `Store` `@tanstack/react-store`, et les **garde-fous de sizing**
+> (`ResizeObserver` applicatif + garde `0×0`). Ces clauses se lisent en remplaçant « wterm » par
+> « xterm » ; les instances, l'attach/detach et le no-host sont identiques.
+>
+> Ne pas re-litiger la bascule à partir de ce document : le nom de la bibliothèque y est périmé.
 
 Introduit des dépendances (`@wterm/core`, `@wterm/dom`, `@wterm/ghostty`, `@tanstack/react-store`) dans `apps/desktop/renderer` et retire la famille xterm (`@xterm/xterm`, `@xterm/addon-fit`, `@xterm/addon-serialize`, `@xterm/addon-webgl`, `react-xtermjs`). Sert de référence ADR pour la bascule de stack terminal de v2.2.5.
 

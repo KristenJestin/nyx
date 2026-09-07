@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from "react";
 import { Menu as BaseMenu } from "@base-ui/react/menu";
-import { ClipboardCopy, ClipboardPaste } from "lucide-react";
+import { ClipboardCopy, ClipboardPaste, ExternalLink } from "lucide-react";
 import { motion, useReducedMotion } from "motion/react";
 
 import { cn } from "@/lib/utils";
@@ -35,6 +35,13 @@ export interface TerminalContextMenuProps {
   onCopy: () => void;
   /** Paste the clipboard contents into the terminal. */
   onPaste: () => void;
+  /**
+   * The link under the cursor RIGHT NOW, or `null` — read once, at open time, exactly like
+   * {@link hasSelection}. Omitted ⇒ this surface has no links and the item never appears.
+   */
+  linkAtCursor?: () => string | null;
+  /** Open a link externally. Called only with what `linkAtCursor` returned. */
+  onOpenLink?: (url: string) => void;
   className?: string;
 }
 
@@ -43,6 +50,8 @@ export function TerminalContextMenu({
   hasSelection,
   onCopy,
   onPaste,
+  linkAtCursor,
+  onOpenLink,
   className,
 }: TerminalContextMenuProps) {
   const reduced = useReducedMotion();
@@ -52,6 +61,9 @@ export function TerminalContextMenu({
   const point = useRef({ x: 0, y: 0 });
   // Snapshot of "is there a selection?" taken at open time — drives the Copy item.
   const [copyEnabled, setCopyEnabled] = useState(false);
+  // …and of the link under the cursor, for the same reason: once the menu is open the pointer has
+  // moved onto the popup, so asking later would always answer "no link". `null` ⇒ no link item.
+  const [link, setLink] = useState<string | null>(null);
 
   const onContextMenu = useCallback(
     (e: React.MouseEvent) => {
@@ -59,10 +71,15 @@ export function TerminalContextMenu({
       e.preventDefault();
       point.current = { x: e.clientX, y: e.clientY };
       setCopyEnabled(hasSelection());
+      setLink(linkAtCursor?.() ?? null);
       setOpen(true);
     },
-    [hasSelection],
+    [hasSelection, linkAtCursor],
   );
+
+  const openLink = useCallback(() => {
+    if (link) onOpenLink?.(link);
+  }, [link, onOpenLink]);
 
   // A zero-size virtual anchor at the cursor; Floating UI positions the popup
   // against it exactly like a real element.
@@ -105,6 +122,13 @@ export function TerminalContextMenu({
               />
             }
           >
+            {/* Only when the right-click actually landed on a link — an item that is present but
+                permanently disabled would be noise on every other click. */}
+            {link ? (
+              <MenuItem icon={<ExternalLink />} onClick={openLink}>
+                Open link
+              </MenuItem>
+            ) : null}
             <MenuItem icon={<ClipboardCopy />} disabled={!copyEnabled} onClick={onCopy}>
               Copy
             </MenuItem>

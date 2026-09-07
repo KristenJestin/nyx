@@ -192,9 +192,9 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 - rebrancher l'**UI Integrations** (install du plugin Claude, dont dépendent détection d'agent + icône + statut) + le toggle `resume_agent_sessions` dans le shell actif ;
 - **EXÉCUTER la reprise en mode LAZY** (à l'ouverture d'un terminal, pas eager au boot) : consommer `workspace_restore_plan`, re-porter park+inject `claude --resume` (réutilise `decide_resume` / `workspace_resume_plan`) ;
 - afficher les états post-crash `interrupted` / `unknown` + une UI de restauration ;
-- **UNLOAD des sessions idle non visitées** + resume au retour (spike sur la détection d'activité réelle) — c'est ici que vit l'idée parquée `01KX0X3ZZQMEPKBQX30SX47HJF` (déplacée depuis v2.7).
+- ~~**UNLOAD des sessions idle non visitées** + resume au retour (spike sur la détection d'activité réelle) — c'est ici que vit l'idée parquée `01KX0X3ZZQMEPKBQX30SX47HJF` (déplacée depuis v2.7).~~ **RETIRÉ** : le balayage tuait le shell d'une session simplement laissée au repos (symptôme `[process exited with code 1]` sur une session Claude inactive). Décision humaine : **aucun kill sur inactivité**. Le toggle `resume_agent_sessions` et la reprise `claude --resume` au boot (ResumePark) restent, ils ne dépendaient pas de l'unload.
 
-**Gate :** toggle ON → relance → reprise à l'ouverture ; crash → interrupted + restore ; idle → unload + resume ; plugin installable depuis l'UI.
+**Gate :** toggle ON → relance → reprise à l'ouverture ; crash → interrupted + restore ; plugin installable depuis l'UI.
 
 ## v2.5.6 - Cockpit de pilotage : close-warning, CRUD, stats (non-inline), reorder (dnd-kit)
 

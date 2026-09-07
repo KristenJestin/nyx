@@ -1,12 +1,16 @@
 //! v2.5.5 VALIDATION GATE — end-to-end smoke of the AGENT-LIFECYCLE parcours
 //! (task `01KX8Z6TH9RW19XYDK74CAD8BT`, PRD `01KX8Z4E7B3PYW2DGCTTKXCHYC`, Phase 5).
 //!
-//! This is the executable half of the gate: it drives the four v2.5.5 lifecycle journeys the
-//! PRD calls out — **lazy resume on relaunch, crash → SILENT resume (crash-UI reverted), idle
-//! unload + resume-on-revisit, plugin installable** — through the REAL `nyx-sidecar` binary over the
+//! This is the executable half of the gate: it drives the v2.5.5 lifecycle journeys the
+//! PRD calls out — **lazy resume on relaunch, crash → SILENT resume (crash-UI reverted),
+//! plugin installable** — through the REAL `nyx-sidecar` binary over the
 //! REAL framed pipe, EXACTLY as Electron main speaks to it. It exercises, in real runs, the
-//! four done-criteria points the checklist (`apps/desktop/GATE-v2.5.5.md`) otherwise proves by
+//! done-criteria points the checklist (`apps/desktop/GATE-v2.5.5.md`) otherwise proves by
 //! `file:line`:
+//!
+//! The PRD's third journey — the IDLE-SESSION UNLOAD — no longer exists: the mechanism was
+//! REMOVED (it killed the shell of a session merely left at rest, surfacing as
+//! `[process exited with code 1]`). `resume_agent_sessions` and the boot resume are unaffected.
 //!
 //!   1. **Reprise LAZY (toggle ON → relance → ouverture → resume ; OFF → rien)** — a
 //!      resume-eligible session's `workspace_restore_plan` (read over the pipe) yields
@@ -19,12 +23,7 @@
 //!      `workspace_restore_plan` (over the pipe) offers it as a CONFIDENT resume
 //!      (`resume=true, uncertain=false`) with NO `interrupted` set — parking + spawning then
 //!      injects `claude --resume <id>` SILENTLY, exactly like a clean relaunch. No card.
-//!   3. **Idle unload → resume-au-retour ; ACTIVE jamais unloadée** — `unload_idle_sessions`
-//!      (the db-command the renderer's sweep drives) KEEPS a session within its threshold and
-//!      the currently-visited one, UNLOADS an idle one past the threshold (its PTY closed →
-//!      resources freed), and the sidecar's unload re-parks the resume so RE-SPAWNING the
-//!      terminal re-injects `claude --resume <id>` — all over the real pipe.
-//!   4. **Plugin installable depuis l'UI** — `integration_list` (over the pipe) lists the four
+//!   3. **Plugin installable depuis l'UI** — `integration_list` (over the pipe) lists the four
 //!      providers with Claude Code `available`, and `integration_install` is DISPATCHED to the
 //!      real integrations core over the wire (proven via the `codex` "not supported" arm, which
 //!      short-circuits before touching any real config).
@@ -46,10 +45,6 @@
 //!     specs, the restore panel and lifecycle badges rendering) needs a real display (xvfb) and
 //!     a network install of the WDIO toolchain — the phase-7 gate's CI matrix, per
 //!     `e2e/README.md` and `apps/desktop/GATE-PHASE7.md`.
-//!   * "ACTIVE (Working) session jamais unloadée": setting a session `Working` is an MCP
-//!     turn-hook signal (HTTP loopback, off the pipe), so the safety invariant is proven GREEN
-//!     by the in-process real-PTY test `agent_unload.rs::active_session_is_never_unloaded`; this
-//!     gate proves the transport-reachable unload gating (threshold / visited / toggle-OFF).
 //!   * The full Claude plugin install/remove round-trip shells out to the real `claude` CLI and
 //!     writes Claude's real config; it is proven by `nyx_core::integrations` unit tests (a fake
 //!     CLI on temp paths) + the Windows-validated `smoke:bridge-e2e` (GATE-PHASE7 item #6). This
@@ -404,15 +399,6 @@ impl Harness {
         }
         std::fs::remove_dir_all(&self.data_dir).ok();
     }
-
-    /// Parse an `unload_idle_sessions` JSON result (a `string[]` of unloaded record ids).
-    fn unload(&mut self, threshold_secs: u64, visited: &[&str]) -> Vec<String> {
-        let out = self.db_command(
-            "unload_idle_sessions",
-            serde_json::json!({ "thresholdSecs": threshold_secs, "visited": visited }),
-        );
-        serde_json::from_value(out).expect("unload_idle_sessions returns a JSON string[]")
-    }
 }
 
 /// DONE-CRITERION 1 (toggle ON) — a resume-eligible session's `workspace_restore_plan` (read
@@ -617,69 +603,6 @@ fn crash_resumes_silently_no_interrupted_over_the_real_pipe() {
     assert!(
         out.contains(&format!("claude --resume {ext}")),
         "after a crash the session resumes SILENTLY on terminal open (no card): {out:?}"
-    );
-
-    h.shutdown();
-}
-
-/// DONE-CRITERION 3 — idle UNLOAD (resources freed) + resume-au-retour, all over the real pipe.
-/// `unload_idle_sessions` (the db-command the renderer's sweep drives): KEEPS within the
-/// threshold, SPARES the visited terminal, UNLOADS an idle one past the threshold, and the
-/// sidecar's unload re-parks the resume so RE-SPAWNING re-injects `claude --resume <id>`.
-#[test]
-fn idle_unload_and_revisit_resume_over_the_real_pipe() {
-    let data_dir = temp_data_dir("unload");
-    let ext = "ext-gate-unload";
-    let seed = seed_resumable_session(&data_dir, "/tmp/nyx-gate-unload", ext, true);
-    write_recovery_marker(&data_dir, true);
-
-    let mut h = Harness::spawn(data_dir, &[]);
-
-    // OPEN the terminal → its PTY is live (a loaded, idle agent session).
-    let _tid = h.spawn_pty_record(&seed.record_id);
-
-    // WITHIN the threshold (large `thresholdSecs`) → KEPT (the sweep respects the grace window).
-    let kept = h.unload(3600, &[]);
-    assert!(
-        kept.is_empty(),
-        "within the threshold the idle session is KEPT: {kept:?}"
-    );
-
-    // VISITED (focused) → spared even past the threshold.
-    let kept = h.unload(0, &[seed.record_id.as_str()]);
-    assert!(
-        kept.is_empty(),
-        "the visited terminal is never unloaded: {kept:?}"
-    );
-
-    // PAST the threshold, unvisited → UNLOADED (its PTY closed → resources freed). The db-command
-    // returns the unloaded record id (contract parity) and the unload re-parks the resume.
-    let unloaded = h.unload(0, &[]);
-    assert_eq!(
-        unloaded,
-        vec![seed.record_id.clone()],
-        "the idle session is unloaded THROUGH the `unload_idle_sessions` db-command over the pipe"
-    );
-
-    // The DB session STAYS active (unload does not end it → still a resume candidate): the plan
-    // still offers its resume after the unload.
-    let plan = h.db_command(
-        "workspace_restore_plan",
-        serde_json::json!({ "workspaceId": seed.workspace_id }),
-    );
-    assert_eq!(
-        plan["resume_sessions"][0]["resume"],
-        serde_json::json!(true),
-        "the unloaded session stays active + resume-eligible"
-    );
-
-    // REVISIT: re-open the terminal → the sidecar's unload re-park drains at the spawn and
-    // re-injects `claude --resume <ext>` (resume-au-retour) — WITH NO renderer re-push.
-    let _tid2 = h.spawn_pty_record(&seed.record_id);
-    let out = h.read_until_marker(&format!("claude --resume {ext}"));
-    assert!(
-        out.contains(&format!("claude --resume {ext}")),
-        "revisiting the unloaded terminal re-injected `claude --resume <id>` over the real spawn path: {out:?}"
     );
 
     h.shutdown();

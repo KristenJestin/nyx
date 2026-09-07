@@ -129,8 +129,8 @@ export function paneLeaves(node: PaneNode): PaneLeaf[] {
 }
 
 /**
- * Every terminal id VISIBLE in the tree, in leaf order — the tiling's live set (what the page
- * hands to the idle-unload sweep). `null` (no layout yet) has nothing on screen: `[]`.
+ * Every terminal id VISIBLE in the tree, in leaf order — the tiling's live set. `null` (no layout
+ * yet) has nothing on screen: `[]`.
  */
 export function paneTerminalIds(node: PaneNode | null): string[] {
   return node == null ? [] : paneLeaves(node).map((leaf) => leaf.terminalId);
