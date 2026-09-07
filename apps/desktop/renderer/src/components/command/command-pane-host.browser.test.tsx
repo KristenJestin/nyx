@@ -49,6 +49,8 @@ function service(commandId: string): WorkspaceRuntimeService {
     workspace_id: "ws1",
     name: commandId,
     command: `run ${commandId}`,
+    subfolder: null,
+    description: null,
     run_state: "idle",
     exit_code: null,
     unread: false,

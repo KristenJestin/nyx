@@ -102,7 +102,15 @@ function mountTerminalsPage(opts: {
 }
 
 function project(id: string, name: string): ProjectRecord {
-  return { id, name, collapsed: false, created_at: 0, updated_at: 0, resume_agent_sessions: false };
+  return {
+    id,
+    name,
+    key: "P",
+    collapsed: false,
+    created_at: 0,
+    updated_at: 0,
+    resume_agent_sessions: false,
+  };
 }
 
 function workspace(id: string, projectId: string, name: string, isRoot: boolean): WorkspaceRecord {
@@ -144,6 +152,8 @@ function snapshot(
         workspace_id: wsId,
         name: `${wsId}-dev`,
         command: "npm run dev",
+        subfolder: null,
+        description: null,
         run_state: "running",
         exit_code: null,
         unread: false,

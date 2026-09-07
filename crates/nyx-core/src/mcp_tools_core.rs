@@ -519,6 +519,11 @@ fn template_json(t: &db::ManagedCommand) -> Value {
         // way to observe the grouping was to MUTATE it and read the `groups` of the reply, which is
         // no way for an agent to inspect before acting.
         "group_id": t.group_id,
+        // THE NOTE FOR THE AGENT — the human's sentence about WHEN and WHY to run this command
+        // (`null` when there is none). UNTRUNCATED here, unlike in the SessionStart block: the
+        // block pays for every character in every session's first tokens and cuts at 200, this is
+        // the call an agent makes when it wants the whole thing.
+        "description": t.description,
     })
 }
 
@@ -686,6 +691,12 @@ pub fn list_commands<S: RunnerSink>(
                     // list_commands" would mean "go read something poorer".
                     "group_id": row.group_id,
                     "nature": command_nature(nature),
+                    // THE NOTE FOR THE AGENT, on BOTH forms of this tool (`null` when there is
+                    // none). The instance form is the one an agent reaches for before starting
+                    // something — it is where the sentence saying whether to start it at all has
+                    // to be readable, or the note would exist only for the template listing
+                    // nobody calls at that moment.
+                    "description": row.description,
                 });
                 if let (Some(map), Some(status_map)) = (entry.as_object_mut(), status.as_object()) {
                     for (k, v) in status_map {
@@ -1475,11 +1486,15 @@ fn optional_env_column(args: &Value, key: &str) -> Result<Option<Option<String>>
     }
 }
 
-/// `add_command` — `{ project_id, name, command, subfolder?, env? }` → `{ command }`. Parity
-/// with the Tauri `add_command` (reuses `pkgjson::infer_command_source` + `db::create_template`).
+/// `add_command` — `{ project_id, name, command, subfolder?, env?, description? }` → `{ command }`.
+/// Parity with the Tauri `add_command` (reuses `pkgjson::infer_command_source` +
+/// `db::create_template`).
 ///
 /// `env` persists the command's OWN environment (N31): the base every spawn path applies — an
 /// agent start/relaunch, the boot restore, and a `gate_check` nyx runs itself. Omitted → none.
+///
+/// `description` persists the NOTE FOR THE AGENT — when and why to run this command, the sentence
+/// the SessionStart block puts under it in every future session. Omitted (or blank) → none.
 pub fn add_command(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     db.with_conn(|c| add_command_on_conn(c, args))
 }
@@ -1495,6 +1510,10 @@ pub(crate) fn add_command_on_conn(
     let command = require_str(args, "command")?;
     let subfolder = optional_str(args, "subfolder")?;
     let env = optional_env_column(args, "env")?;
+    // On a CREATION the three states of `clearable_str` collapse to two — there is nothing yet to
+    // leave alone — so absent and explicit-null both mean "no note", which is what a fresh row
+    // already holds.
+    let description = clearable_str(args, "description")?.flatten();
     let (source_kind, package_manager) = crate::pkgjson::infer_command_source(command, None, None);
     let source = db::CommandSource {
         source_kind,
@@ -1505,14 +1524,22 @@ pub(crate) fn add_command_on_conn(
     };
     let template = (|| -> Result<db::ManagedCommand, diesel::result::Error> {
         let created = db::create_template(conn, project_id, name, command, subfolder, source)?;
-        match env.flatten() {
-            // Only a non-empty map is written: an absent / cleared env leaves the column NULL,
-            // which is already the state a fresh row is in.
-            Some(env) => {
-                db::set_template_env(conn, &created.id, Some(&env))?;
-                Ok(db::get_template(conn, &created.id)?.unwrap_or(created))
-            }
-            None => Ok(created),
+        // Only a non-empty value is written on either column: an absent / cleared env or note
+        // leaves the column NULL, which is already the state a fresh row is in. The re-read is
+        // shared — one round-trip whichever of the two landed.
+        let env = env.flatten();
+        let wrote_env = env.is_some();
+        if let Some(env) = env {
+            db::set_template_env(conn, &created.id, Some(&env))?;
+        }
+        let wrote_note = description.map(str::trim).is_some_and(|s| !s.is_empty());
+        if wrote_note {
+            db::set_template_description(conn, &created.id, description)?;
+        }
+        if wrote_env || wrote_note {
+            Ok(db::get_template(conn, &created.id)?.unwrap_or(created))
+        } else {
+            Ok(created)
         }
     })()
     .map_err(|e| map_template_write_err(project_id, e))?;
@@ -1522,10 +1549,11 @@ pub(crate) fn add_command_on_conn(
     ))
 }
 
-/// `set_project_settings` — `{ project_id, name?, resume_agent_sessions?, worktrees_root?,
+/// `set_project_settings` — `{ project_id, name?, key?, resume_agent_sessions?, worktrees_root?,
 /// accent?, icon?, image? }` → `{ project }`. Modify an EXISTING project's mutable settings
-/// (rename, the PRD-5 #5 resume opt-in, the worktrees root and the project's visual identity), the
-/// MCP mirror of the UI's project-settings modal. It reuses the SAME `db::update_project` /
+/// (rename, the canonical Spec key, the PRD-5 #5 resume opt-in, the worktrees root and the
+/// project's visual identity), the MCP mirror of the UI's project-settings modal. It reuses the
+/// SAME `db::update_project` / `db::set_project_key` /
 /// `db::set_project_resume_agent_sessions` / `db::set_project_worktrees_root` /
 /// `db::set_project_accent` / `db::set_project_mark` writes the UI bridge drives, so both surfaces
 /// converge on one code path. Partial update: only the supplied fields change. Returns the
@@ -1544,6 +1572,7 @@ pub(crate) fn add_command_on_conn(
 pub fn set_project_settings(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let project_id = require_str(args, "project_id")?;
     let new_name = optional_str(args, "name")?;
+    let new_key = optional_str(args, "key")?;
     let new_resume = optional_bool(args, "resume_agent_sessions")?;
     let new_worktrees_root = clearable_str(args, "worktrees_root")?;
     let new_accent = clearable_str(args, "accent")?;
@@ -1584,6 +1613,25 @@ pub fn set_project_settings(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErr
         }
         db.with_conn(|c| db::update_project(c, project_id, trimmed))
             .map_err(internal_db)?;
+    }
+
+    // THE KEY — the prefix every Spec of this project is referenced by (`NYX-42`). It goes through
+    // `db::set_project_key`, the SAME verb the settings modal's Key field drives, so the shape rule
+    // and the uniqueness rule exist once for both surfaces. Its two refusals are the caller's
+    // mistake, not an internal failure, so they surface as `invalid_argument` carrying the domain's
+    // own sentence rather than a raw SQLite constraint message.
+    if let Some(key) = new_key {
+        db.with_conn(|c| db::set_project_key(c, project_id, key.trim()))
+            .map_err(|e| match e {
+                db::ProjectKeyError::Db(e) => internal_db(e),
+                db::ProjectKeyError::UnknownProject => {
+                    RpcError::new(RpcCode::InvalidId, format!("unknown project {project_id}"))
+                }
+                other => RpcError::new(
+                    RpcCode::InvalidArgument,
+                    format!("cannot use the key '{}': {other}", key.trim()),
+                ),
+            })?;
     }
 
     if let Some(resume) = new_resume {
@@ -1712,13 +1760,18 @@ pub fn project_set_repos(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError>
     ))
 }
 
-/// `update_command` — `{ command_id, name?, command?, subfolder?, env? }` → `{ command }`.
-/// Partial update; the package.json source-detach rule runs; refused while any instance
-/// is running. Parity with the Tauri `update_command`.
+/// `update_command` — `{ command_id, name?, command?, subfolder?, env?, description? }` →
+/// `{ command }`. Partial update; the package.json source-detach rule runs; refused while any
+/// instance is running. Parity with the Tauri `update_command`.
 ///
 /// `env` REPLACES the command's persisted environment WHOLE (it is not a per-key patch — a partial
 /// merge would leave no way to remove a key), and an explicit `null` or `{}` CLEARS it. Omitted, it
 /// is left untouched like every other field.
+///
+/// `description` is the NOTE FOR THE AGENT, and it is read through [`clearable_str`] rather than
+/// [`optional_str`] for the same reason `worktrees_root` is on `set_project_settings`: an EMPTY note
+/// is a value, not a silence. An explicit `null` (or a blank string) ERASES the note; omitting the
+/// field leaves whatever is stored alone.
 pub fn update_command<S: RunnerSink>(
     db: &Db,
     runner: &CommandRunner<S>,
@@ -1739,6 +1792,7 @@ pub(crate) fn update_command_on_conn<S: RunnerSink>(
     let subfolder_present = args.get("subfolder").map(|v| !v.is_null()).unwrap_or(false);
     let new_subfolder = optional_str(args, "subfolder")?;
     let new_env = optional_env_column(args, "env")?;
+    let new_description = clearable_str(args, "description")?;
 
     assert_template_not_running(conn, runner, command_id)?;
 
@@ -1761,6 +1815,12 @@ pub(crate) fn update_command_on_conn<S: RunnerSink>(
         }
         if let Some(env) = new_env {
             db::set_template_env(conn, command_id, env.as_deref())?;
+        }
+        // `Some(None)` — an explicit null — reaches the setter as `None` and CLEARS the note; a
+        // blank string is normalised to the same thing there, so both spellings of "no note" land
+        // on NULL rather than on an empty line in the ambient block.
+        if let Some(description) = new_description {
+            db::set_template_description(conn, command_id, description)?;
         }
         db::get_template(conn, command_id)
     })()
@@ -6927,6 +6987,116 @@ pub(crate) mod tests {
         assert_eq!(stored(&db, &cmd_id), None);
     }
 
+    /// THE NOTE FOR THE AGENT travels the whole agent surface: `add_command` stores it,
+    /// `update_command` replaces it, an explicit `null` (or a blank string) ERASES it, an omitted
+    /// field leaves it alone — and BOTH forms of `list_commands` read it back, in full.
+    ///
+    /// The two halves of that last sentence are the point of the test. The note exists so an agent
+    /// knows WHEN and WHY to run a command; the moment it needs to know is when it is about to
+    /// start one, and what it holds then is an `instance_id` — the `{ workspace_id }` form. A note
+    /// readable only on the `{ project_id }` form would be a note nothing reads.
+    #[test]
+    fn add_and_update_command_set_then_erase_the_agent_note() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (project, root) = db
+            .with_conn(|c| db::create_project(c, "P", "/tmp/cmdnote", None))
+            .unwrap();
+        let runner = noop_runner();
+
+        let added = add_command(
+            &db,
+            &json!({
+                "project_id": project.id,
+                "name": "check",
+                "command": "bun run check",
+                "description": "The gate before any commit — run it and read it, never skip it.",
+            }),
+        )
+        .unwrap();
+        let cmd_id = added.result["command"]["command_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            added.result["command"]["description"],
+            json!("The gate before any commit — run it and read it, never skip it."),
+            "add_command echoes the note it stored"
+        );
+
+        // The TEMPLATE form of the listing carries it…
+        let templates = list_commands(&db, &runner, &json!({ "project_id": project.id })).unwrap();
+        assert_eq!(
+            templates["commands"][0]["description"],
+            json!("The gate before any commit — run it and read it, never skip it."),
+        );
+        // …and so does the INSTANCE form, which is the one an agent reads before starting.
+        let instances = list_commands(&db, &runner, &json!({ "workspace_id": root.id })).unwrap();
+        assert_eq!(
+            instances["commands"][0]["description"],
+            json!("The gate before any commit — run it and read it, never skip it."),
+            "the note reaches the form that hands out instance_id"
+        );
+
+        // A REPLACEMENT is whole, like every other field of this tool.
+        let replaced = update_command(
+            &db,
+            &runner,
+            &json!({ "command_id": cmd_id, "description": "Slow. Ask before starting it." }),
+        )
+        .unwrap();
+        assert_eq!(
+            replaced.result["command"]["description"],
+            json!("Slow. Ask before starting it."),
+        );
+
+        // An OMITTED field leaves the note alone — the third state `clearable_str` exists for.
+        let untouched = update_command(
+            &db,
+            &runner,
+            &json!({ "command_id": cmd_id, "name": "check-renamed" }),
+        )
+        .unwrap();
+        assert_eq!(
+            untouched.result["command"]["description"],
+            json!("Slow. Ask before starting it."),
+            "renaming a command must not silently erase its note"
+        );
+
+        // A BLANK string erases it — the same fact as `null`, spelled the way a cleared textarea
+        // spells it, and the reason the column can never hold `""`.
+        let blanked = update_command(
+            &db,
+            &runner,
+            &json!({ "command_id": cmd_id, "description": "   " }),
+        )
+        .unwrap();
+        assert_eq!(blanked.result["command"]["description"], json!(null));
+        assert_eq!(
+            db.with_conn(|c| db::get_template(c, &cmd_id))
+                .unwrap()
+                .unwrap()
+                .description,
+            None,
+            "the column is NULL, not a blank string"
+        );
+
+        // …and so does an explicit null.
+        update_command(
+            &db,
+            &runner,
+            &json!({ "command_id": cmd_id, "description": "back" }),
+        )
+        .unwrap();
+        let erased = update_command(
+            &db,
+            &runner,
+            &json!({ "command_id": cmd_id, "description": null }),
+        )
+        .unwrap();
+        assert_eq!(erased.result["command"]["description"], json!(null));
+    }
+
     /// N31 — the WRITE boundary is where a caller mistake is still named: a non-string env value is
     /// refused as `invalid_argument` naming ONLY the key, never the value (which may be a secret).
     #[test]
@@ -7177,6 +7347,67 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.name, "Keep");
+    }
+
+    /// THE KEY IS WRITABLE FROM THE AGENT SURFACE, through the very verb the settings modal's Key
+    /// field drives (`db::set_project_key`) — so the two surfaces share the shape rule and the
+    /// uniqueness rule rather than each holding a copy.
+    ///
+    /// Both refusals arrive as `invalid_argument` CARRYING the domain's own sentence: an agent that
+    /// gets "another project already uses that key" can choose a different one, where a bare
+    /// `invalid_argument` would leave it retrying the same call.
+    #[test]
+    fn set_project_settings_changes_the_key_and_refuses_a_malformed_or_taken_one() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let (alpha, _root) = db
+            .with_conn(|c| db::create_project(c, "Alpha", "/tmp/spk-a", None))
+            .unwrap();
+        let (beta, _root) = db
+            .with_conn(|c| db::create_project(c, "Beta", "/tmp/spk-b", None))
+            .unwrap();
+
+        let out =
+            set_project_settings(&db, &json!({ "project_id": alpha.id, "key": "NYX" })).unwrap();
+        assert_eq!(out.result["project"]["key"], json!("NYX"));
+        assert_eq!(
+            db.with_conn(|c| db::get_project(c, &alpha.id))
+                .unwrap()
+                .unwrap()
+                .key,
+            "NYX"
+        );
+
+        // MALFORMED — the sentence says what a key IS, so the next attempt can be right.
+        let err =
+            set_project_settings(&db, &json!({ "project_id": alpha.id, "key": "nyx" })).unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(
+            err.message.contains("uppercase"),
+            "the refusal must state the shape, got: {}",
+            err.message
+        );
+
+        // TAKEN — a different sentence, for a different correction.
+        let err =
+            set_project_settings(&db, &json!({ "project_id": beta.id, "key": "NYX" })).unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(
+            err.message.contains("already uses"),
+            "the refusal must say the key is taken, got: {}",
+            err.message
+        );
+
+        // An OMITTED key leaves it alone — a rename must not re-key the project's Specs.
+        set_project_settings(&db, &json!({ "project_id": alpha.id, "name": "Alpha renamed" }))
+            .unwrap();
+        assert_eq!(
+            db.with_conn(|c| db::get_project(c, &alpha.id))
+                .unwrap()
+                .unwrap()
+                .key,
+            "NYX"
+        );
     }
 
     /// FINDING #27: the `project_set_repos` tool configures a project's repos EXPLICITLY,

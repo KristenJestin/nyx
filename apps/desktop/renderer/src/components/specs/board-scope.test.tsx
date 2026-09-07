@@ -82,7 +82,7 @@ const ALL_SPECS: SpecListEntry[] = [
 ];
 
 function project(id: string, name: string): ProjectRecord {
-  return { id, name, collapsed: false, created_at: 0, updated_at: 0, resume_agent_sessions: false };
+  return { id, name, key: "P", collapsed: false, created_at: 0, updated_at: 0, resume_agent_sessions: false };
 }
 
 function workspace(projectId: string): WorkspaceRecord {

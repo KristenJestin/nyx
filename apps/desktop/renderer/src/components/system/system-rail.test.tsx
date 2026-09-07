@@ -22,6 +22,8 @@ function project(id: string, name: string): ProjectRecord {
     collapsed: false,
     created_at: 0,
     updated_at: 0,
+    key: "P",
+
     resume_agent_sessions: false,
     kind: "user",
   };

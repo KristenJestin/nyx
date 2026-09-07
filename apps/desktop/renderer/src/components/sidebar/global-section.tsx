@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { toast } from "@/components/ui/toast";
 import { ProjectIdentity } from "./project-identity";
+import { ProjectKeyField } from "./project-key-field";
 
 /**
  * The project's VISUAL IDENTITY, as this pane needs it: the three stored fields plus the two
@@ -32,6 +33,16 @@ export interface GlobalSectionProps {
   projectId: string | null;
   /** The project's current display name (seeds the rename field). */
   projectName: string;
+  /**
+   * The project's current KEY — the prefix its Specs are referenced by (`NYX-42`). Threaded from
+   * the caller (which owns `useProjects`) like the name, so the field re-seeds from the tree once
+   * the write lands rather than from a local copy that could outlive a refusal.
+   *
+   * OPTIONAL, and its absence DROPS the field — the same rule this dialog already applies to whole
+   * sections: a caller with no key to wire (and therefore no `onKeyChange`) gets no input, never a
+   * disabled one.
+   */
+  projectKey?: string;
   /** The project's current `resume_agent_sessions` opt-in. */
   resumeAgentSessions: boolean;
   /**
@@ -39,6 +50,13 @@ export interface GlobalSectionProps {
    * section can surface it inline and keep the edited value for a retry.
    */
   onRename: (name: string) => Promise<void>;
+  /**
+   * Persist a KEY change. Resolves on success; REJECTS with the backend's own sentence (malformed,
+   * or already taken) so the field prints it under the input. Required alongside
+   * {@link GlobalSectionProps.projectKey} — a key on screen with no way to write it is the
+   * disabled control this dialog does not do.
+   */
+  onKeyChange?: (key: string) => Promise<void>;
   /**
    * Persist a resume-opt-in toggle (takes effect immediately, independent of Save).
    * May return a promise so this section can toast the real reason on failure.
@@ -68,6 +86,10 @@ export interface GlobalSectionProps {
  *  - **Name** — an editable field with a Save action. Validation mirrors the rename
  *    dialog: a trimmed, non-empty value is required (Save is disabled otherwise), and
  *    a no-op rename (unchanged after trim) is also disabled.
+ *  - **Key** — the prefix every Spec of the project is referenced by (`NYX-42`), until now derived
+ *    from the name at creation and changeable only by editing the database. See
+ *    [`ProjectKeyField`] for what it validates, what it warns about, and why the write is the one
+ *    on this pane that is NOT optimistic.
  *  - **Identity** — the accent + mark block ([`ProjectIdentity`]), the only surface through which
  *    a human dresses a project. It is the pane's DOMINANT object (the one framed element, and the
  *    largest) but it sits UNDER the name, which is what the round-2 feedback settled: the section
@@ -84,8 +106,10 @@ export interface GlobalSectionProps {
 export function GlobalSection({
   projectId,
   projectName,
+  projectKey,
   resumeAgentSessions,
   onRename,
+  onKeyChange,
   onResumeChange,
   showRename = true,
   identity,
@@ -172,6 +196,14 @@ export function GlobalSection({
         </form>
       )}
 
+      {/* THE KEY, right under the NAME — the project's two identifiers, one for humans reading the
+          sidebar and one for everything that references a Spec. Above the identity block for the
+          same reason the name is: the section opens on what the project IS, then on what it looks
+          like. Absent (with no `onKeyChange`) it renders nothing, the same rule as the rename. */}
+      {projectKey !== undefined && onKeyChange && (
+        <ProjectKeyField projectId={projectId} projectKey={projectKey} onSave={onKeyChange} />
+      )}
+
       {/* Identity — the pane's dominant object, under the name and above the toggle (the order
           arbitrated on the round-3 prototype). */}
       <ProjectIdentity
@@ -185,7 +217,10 @@ export function GlobalSection({
       />
 
       {/* Resume agent sessions */}
-      <label htmlFor="resume-agent-sessions" className="mt-5 flex items-start justify-between gap-3">
+      <label
+        htmlFor="resume-agent-sessions"
+        className="mt-5 flex items-start justify-between gap-3"
+      >
         <span className="flex flex-col gap-0.5">
           <span className="text-sm font-medium text-foreground">Resume agent sessions</span>
           <span className="text-xs text-muted-foreground">

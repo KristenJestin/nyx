@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { errorText, nyxBridge } from "@/bridge";
 
 import { toast } from "@/components/ui/toast";
@@ -41,6 +41,19 @@ export interface CommandsSectionProps {
    * `subfolder`. `null` when no workspace is known.
    */
   workspacePath?: string | null;
+  /**
+   * WHAT THE SCREEN OPENS ON. Defaults to {@link NO_SELECTION} — the catalogue summary, which is
+   * what every entry point wanted until one entry point wanted a command.
+   *
+   * The sidebar's per-command "Details" opens this modal ON that command: without a seed the user
+   * would land on the summary and have to find, in a list they were just pointing at, the line
+   * they had already chosen. It is a SEED and not a controlled value: once the screen is open the
+   * selection is the user's, and re-imposing the caller's would fight every click.
+   *
+   * Applied on ACTIVATION rather than on mount, because the host dialog keeps this body mounted
+   * across opens; the reset-on-close effect below is what makes a re-open re-seed.
+   */
+  initialSelection?: CommandsSelection;
 }
 
 /**
@@ -73,12 +86,16 @@ export function CommandsSection({
   projectName = "this project",
   importWorkspaceId,
   workspacePath,
+  initialSelection = NO_SELECTION,
 }: CommandsSectionProps) {
   const { templates, loading, refresh, create, update, remove, resyncSource, unlinkSource } =
     useCommands(projectId);
 
   /** THE one piece of transient state this screen turns on — see `commands-selection.ts`. */
-  const [selection, setSelection] = useState<CommandsSelection>(NO_SELECTION);
+  const [selection, setSelection] = useState<CommandsSelection>(initialSelection);
+  // The latest seed, for the reset-on-close effect to read WITHOUT depending on it (see there).
+  const seedRef = useRef(initialSelection);
+  seedRef.current = initialSelection;
   // `formKey` re-mounts the form so it re-seeds from the stored template — after a create, after a
   // source mutation, and after a REFUSED edit (which is how a committed field comes back to what
   // the backend still holds).
@@ -110,11 +127,22 @@ export function CommandsSection({
     };
   }, [active, importWorkspaceId]);
 
-  // Reset the transient UI when the host surface closes, so a reopen starts clean
-  // without a stale-state intermediate render (same contract as the old modal).
+  // Reset the transient UI on every OPEN and every CLOSE of the host surface, so a reopen starts
+  // clean without a stale-state intermediate render (the old modal's contract).
+  //
+  // "Clean" means BACK TO THE SEED, not back to nothing, and the seed is re-applied on BOTH
+  // transitions. An entry point that opens this screen on one command (the sidebar's per-command
+  // Details) must land on it EVERY time it is used, not only the first — and its host is not
+  // always remounted between two opens, so seeding at mount alone would show the second Details
+  // click the catalogue summary.
+  //
+  // The seed is read through a REF, deliberately absent from the deps: a caller that builds it
+  // inline (`{ kind: "command", id }`) hands a new object every render, and depending on it would
+  // re-set the selection on every one of them — clobbering whatever the user had clicked, and
+  // looping. `active` is the only thing that legitimately re-seeds.
   useEffect(() => {
+    setSelection(seedRef.current);
     if (active) return;
-    setSelection(NO_SELECTION);
     setFormError(null);
     setScripts([]);
   }, [active]);

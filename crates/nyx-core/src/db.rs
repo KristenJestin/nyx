@@ -5494,6 +5494,21 @@ pub struct ManagedCommand {
     /// DERIVED from the ordered member list, so re-ordering the members IS re-arranging the
     /// panes. Meaningless (and left at 0) for a command with no group.
     pub group_order: i32,
+    /// THE NOTE FOR THE AGENT — free prose saying WHEN and WHY to run this command.
+    ///
+    /// `command` says WHAT runs and `subfolder` says WHERE; neither says whether `check` is the
+    /// suite to replay before concluding or a two-hour job nobody wants started by accident. The
+    /// human writes that sentence ONCE here and every agent surface reads it back: both listings
+    /// carry it as a `description` field, and the SessionStart ambient block renders it as one
+    /// indented line under the command (truncated THERE, by
+    /// [`crate::mcp_context::session_commands_block`] — the column itself is unbounded, because a
+    /// rendering budget is not a storage rule).
+    ///
+    /// `None` = no note, and no line anywhere: an absent note is never rendered as an empty one.
+    /// Write it with [`set_template_description`], a dedicated setter for the SAME reason as
+    /// [`set_template_env`] — the column stays writable without threading a parameter through
+    /// `create_template` / `update_template` and their ~40 call sites.
+    pub description: Option<String>,
 }
 
 /// Optional package.json provenance for a template — passed as a group to
@@ -6079,6 +6094,7 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "managed_commands",
     "managed_commands.command",
     "managed_commands.created_at",
+    "managed_commands.description",
     "managed_commands.env",
     "managed_commands.group_id",
     "managed_commands.group_order",
@@ -7567,6 +7583,139 @@ pub fn update_project(conn: &mut SqliteConnection, id: &str, name: &str) -> Quer
         .execute(conn)
 }
 
+/// The SHORTEST a project key may be, and the LONGEST — the two ends of the shape
+/// [`validate_project_key`] enforces. A one-character key would make `N-12` unreadable next to a
+/// task number; past ten the prefix stops being a prefix and starts being the title again.
+pub const PROJECT_KEY_MIN_LEN: usize = 2;
+pub const PROJECT_KEY_MAX_LEN: usize = 10;
+
+/// Why a project key was refused — the ONE vocabulary both surfaces render.
+///
+/// It exists so the UI's inline message and the MCP tool's error say the same thing about the same
+/// refusal. Two hand-written sentences, one per surface, is how "already taken" ends up meaning
+/// "invalid" on one of them.
+#[derive(Debug)]
+pub enum ProjectKeyError {
+    /// The key does not have the SHAPE a key has (see [`validate_project_key`]).
+    Malformed,
+    /// The shape is right but ANOTHER project already answers to it. The unique index would refuse
+    /// it anyway; naming it here is what lets a caller say WHICH constraint was hit.
+    Taken,
+    /// The project id is unknown — checked here rather than left to a silent zero-row update.
+    UnknownProject,
+    /// The write itself failed.
+    Db(diesel::result::Error),
+}
+
+impl std::fmt::Display for ProjectKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed => write!(
+                f,
+                "a project key is {PROJECT_KEY_MIN_LEN} to {PROJECT_KEY_MAX_LEN} characters: an \
+                 uppercase letter, then uppercase letters or digits (e.g. NYX, WEB2)"
+            ),
+            Self::Taken => write!(f, "another project already uses that key"),
+            Self::UnknownProject => write!(f, "unknown project"),
+            Self::Db(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<diesel::result::Error> for ProjectKeyError {
+    fn from(e: diesel::result::Error) -> Self {
+        Self::Db(e)
+    }
+}
+
+/// Whether `key` has the SHAPE of a project key: an uppercase ASCII letter, then
+/// [`PROJECT_KEY_MIN_LEN`]-1 to [`PROJECT_KEY_MAX_LEN`]-1 more uppercase letters or digits.
+///
+/// PURE, and deliberately so: it is the same rule the renderer applies as the user types (to keep
+/// the field's error live rather than round-tripping every keystroke), so it has to be stateable in
+/// one sentence and testable without a database.
+///
+/// LEADING LETTER, not a digit: the key is the prefix of a Spec's human reference (`NYX-42`), and
+/// `1-42` reads as a range. UPPERCASE ONLY rather than case-folded: the unique index on
+/// `projects.key` is case-SENSITIVE, so accepting `nyx` next to `NYX` would create two keys the
+/// index calls different and every human calls the same.
+pub fn validate_project_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    key.len() >= PROJECT_KEY_MIN_LEN
+        && key.len() <= PROJECT_KEY_MAX_LEN
+        && first.is_ascii_uppercase()
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+/// Set a project's canonical `key` — the prefix every Spec of that project is referenced by
+/// (`NYX-42`). THE single write path for the column, and the reason it is a function rather than an
+/// `update_project` argument.
+///
+/// ## Why this is one verb, and not two implementations
+///
+/// The key was derived from the name at creation and never writable again: `update_project` touches
+/// `name` alone, the MCP `set_project_settings` did not expose it, and the settings modal had no
+/// field. Opening it means TWO surfaces write it (a human in the modal, an agent through
+/// `set_project_settings`), and the two rules that govern it — the SHAPE and the UNIQUENESS — are
+/// exactly the kind that get implemented once, well, and once again, badly. So both surfaces call
+/// this, and neither owns a rule.
+///
+/// ## What it refuses, and in what order
+///
+/// The shape first ([`validate_project_key`]), because a malformed key is the caller's mistake and
+/// naming it costs no query. Then the project's existence, so an unknown id is
+/// [`ProjectKeyError::UnknownProject`] rather than a silent zero-row no-op. Then the collision,
+/// EXCLUDING the project itself — re-saving a project's own key is a no-op, not a conflict, which
+/// is what a settings form does every time the user presses Save without touching the field.
+///
+/// The read-then-write runs INSIDE a transaction: SQLite gives nyx a single writer, so the check
+/// cannot be raced, and the unique index remains the last word if it ever were.
+///
+/// ## What it does NOT do
+///
+/// It does not rewrite anything. A Spec's human reference is DERIVED (`key || '-' || number`), so
+/// changing the key changes every reference at once and nothing is stored to migrate — which is
+/// also why the surfaces warn before saving: `NYX-12` printed in a commit message yesterday no
+/// longer resolves. That warning is the UI's job; the refusal set is this function's.
+pub fn set_project_key(
+    conn: &mut SqliteConnection,
+    id: &str,
+    key: &str,
+) -> Result<Project, ProjectKeyError> {
+    if !validate_project_key(key) {
+        return Err(ProjectKeyError::Malformed);
+    }
+    conn.transaction(|conn| {
+        if projects::table
+            .find(id)
+            .select(projects::id)
+            .first::<String>(conn)
+            .optional()?
+            .is_none()
+        {
+            return Err(ProjectKeyError::UnknownProject);
+        }
+        let taken = projects::table
+            .filter(projects::key.eq(key))
+            .filter(projects::id.ne(id))
+            .select(projects::id)
+            .first::<String>(conn)
+            .optional()?
+            .is_some();
+        if taken {
+            return Err(ProjectKeyError::Taken);
+        }
+        diesel::update(projects::table.find(id))
+            .set((projects::key.eq(key), projects::updated_at.eq(now_millis())))
+            .returning(Project::as_returning())
+            .get_result(conn)
+            .map_err(ProjectKeyError::from)
+    })
+}
+
 /// Delete a project and ALL its workspaces (the workspaces cascade via the FK
 /// `workspaces.project_id REFERENCES projects(id) ON DELETE CASCADE`). Terminals
 /// bound to those workspaces are NOT deleted — they are DETACHED (their
@@ -8620,6 +8769,31 @@ pub fn set_template_env(
     diesel::update(managed_commands::table.find(id))
         .set((
             managed_commands::env.eq(env),
+            managed_commands::updated_at.eq(now_millis()),
+        ))
+        .execute(conn)
+}
+
+/// Set (or clear) a template's NOTE FOR THE AGENT ([`ManagedCommand::description`]), bumping
+/// `updated_at`. `None` CLEARS the column (the command goes back to carrying no note, and the
+/// ambient block back to rendering no line for it). Returns rows updated (0 if the id is unknown).
+///
+/// A BLANK note is a CLEARED note: the caller trims, and a value that trims to nothing arrives here
+/// as `None`. Both surfaces converge on that rule — an empty textarea and an explicit `null` mean
+/// the same thing to a reader, and storing `""` would make the block render an empty line.
+///
+/// A dedicated setter, like [`set_template_env`] and [`set_template_source`]: the column is
+/// writable without threading a parameter through `create_template` / `update_template` and their
+/// ~40 call sites.
+pub fn set_template_description(
+    conn: &mut SqliteConnection,
+    id: &str,
+    description: Option<&str>,
+) -> QueryResult<usize> {
+    let description = description.map(str::trim).filter(|s| !s.is_empty());
+    diesel::update(managed_commands::table.find(id))
+        .set((
+            managed_commands::description.eq(description),
             managed_commands::updated_at.eq(now_millis()),
         ))
         .execute(conn)
@@ -9977,6 +10151,11 @@ pub struct InstanceWithTemplate {
     /// The RESOLVED run directory (`workspace_path` + `subfolder`), filled by the
     /// bridge for the front's info bar. `None` straight out of the DB query.
     pub cwd: Option<String>,
+    /// The template's NOTE FOR THE AGENT ([`ManagedCommand::description`]), or `None`. Joined
+    /// like the rest of the template's display fields, so the two forms of `list_commands` — this
+    /// one over instances and the one over templates — answer the same question the same way, and
+    /// so the sidebar row can show the note on hover without a second round-trip.
+    pub description: Option<String>,
 }
 
 /// List a workspace's command instances, each JOINED to its template's display
@@ -10028,6 +10207,7 @@ pub fn list_instances_for_workspace(
             managed_commands::package_manager,
             managed_commands::group_id,
             workspaces::root_path,
+            managed_commands::description,
         ))
         .load::<(
             String,
@@ -10051,6 +10231,7 @@ pub fn list_instances_for_workspace(
             Option<String>,
             Option<String>,
             String,
+            Option<String>,
         )>(conn)
         .map(|rows| {
             rows.into_iter()
@@ -10077,6 +10258,7 @@ pub fn list_instances_for_workspace(
                     group_id: r.19,
                     workspace_path: r.20,
                     cwd: None,
+                    description: r.21,
                 })
                 .collect()
         })
@@ -10115,12 +10297,20 @@ pub struct WorkspaceCommandLine {
     /// The template's sidebar order — the column this reader sorts on, kept on the row
     /// so a caller can assert the order it got is the project's own.
     pub order_index: i32,
+    /// The template's NOTE FOR THE AGENT ([`ManagedCommand::description`]), or `None`.
+    ///
+    /// A SEVENTH column on the lean row, and it earns its place: the note is the ONLY thing that
+    /// says WHEN and WHY to run the command, which is precisely what the block exists to tell a
+    /// session before it acts. It is prose the human wrote by hand — kilobytes at worst, against
+    /// the 256 KiB per instance of `scrollback` this reader still refuses — and the block truncates
+    /// it on render, so the budget the row was created to protect holds.
+    pub description: Option<String>,
 }
 
 /// The AMBIENT-BLOCK reader: a workspace's command instances as [`WorkspaceCommandLine`]
 /// rows — same JOIN and same ordering as [`list_instances_for_workspace`] (template
 /// `order_index`, then `id`), so the block agrees with the project's sidebar, but
-/// selecting only the six columns the block renders. It never touches `scrollback`.
+/// selecting only the seven columns the block renders. It never touches `scrollback`.
 ///
 /// Used by `mcp_tools_core::session_context_line` and by nothing else: every other
 /// caller (the UI bridge, `list_commands`, the runtime overlay) genuinely needs the
@@ -10143,8 +10333,17 @@ pub fn list_command_lines_for_workspace(
             command_instances::last_state,
             managed_commands::group_id,
             managed_commands::order_index,
+            managed_commands::description,
         ))
-        .load::<(String, String, String, String, Option<String>, i32)>(conn)
+        .load::<(
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            i32,
+            Option<String>,
+        )>(conn)
         .map(|rows| {
             rows.into_iter()
                 .map(|r| WorkspaceCommandLine {
@@ -10154,6 +10353,7 @@ pub fn list_command_lines_for_workspace(
                     last_state: r.3,
                     group_id: r.4,
                     order_index: r.5,
+                    description: r.6,
                 })
                 .collect()
         })
@@ -26829,6 +27029,102 @@ mod tests {
         assert_eq!(update_project(&mut conn, "no-such-id", "x").unwrap(), 0);
     }
 
+    /// `validate_project_key` is the SHAPE, and the shape alone — no database, no project.
+    ///
+    /// Every case here is a boundary of one clause, because the renderer keeps a MIRROR of this
+    /// predicate (`project-key-field.tsx`) to light its Save button as the user types, and the two
+    /// can only stay in step if the rule is stated in cases rather than in prose.
+    #[test]
+    fn a_project_key_is_an_uppercase_letter_then_letters_or_digits() {
+        for ok in ["NY", "NYX", "WEB2", "A1", "ABCDEFGHIJ", "N0000"] {
+            assert!(validate_project_key(ok), "'{ok}' is a well-formed key");
+        }
+        for bad in [
+            "",           // nothing
+            "N",          // one character — `N-12` is not a reference, it is a typo
+            "ABCDEFGHIJK", // eleven — past the bound
+            "nyx",        // lowercase: the unique index is case-sensitive, so this would be a
+            // SECOND key the database calls different and every human calls the same
+            "1NYX",  // a leading digit: `1-42` reads as a range
+            "NY X",  // a space
+            "NY-X",  // the separator itself — it would make `NY-X-12` ambiguous
+            "NY_X", "NYX!", "NYX\u{00c9}", // non-ASCII: the reference is typed by hand
+        ] {
+            assert!(
+                !validate_project_key(bad),
+                "'{bad}' must not pass as a project key"
+            );
+        }
+    }
+
+    /// `set_project_key` is THE write path for `projects.key`, and it answers the three refusals
+    /// both surfaces need to be able to print: a malformed key, a key another project holds, and an
+    /// unknown project. Re-saving a project's OWN key is a no-op, not a collision — which is what a
+    /// settings form does every time Save is pressed without touching the field.
+    #[test]
+    fn set_project_key_refuses_a_malformed_key_a_taken_one_and_an_unknown_project() {
+        let mut conn = open_in_memory();
+        let (alpha, _) = create_project(&mut conn, "Alpha", p("/a", "C:\\a"), None).unwrap();
+        let (beta, _) = create_project(&mut conn, "Beta", p("/b", "C:\\b"), None).unwrap();
+
+        // The happy path: the column is written and the UPDATED row comes back, so a caller
+        // repaints from what was granted rather than from what it asked for.
+        let updated = set_project_key(&mut conn, &alpha.id, "NYX").expect("a free, well-formed key");
+        assert_eq!(updated.key, "NYX");
+        assert_eq!(
+            get_project(&mut conn, &alpha.id).unwrap().unwrap().key,
+            "NYX",
+            "the key is persisted, not merely returned"
+        );
+        assert!(
+            updated.updated_at >= alpha.updated_at,
+            "a key change bumps updated_at"
+        );
+
+        // …and the Spec reference resolver follows it immediately: nothing is stored per Spec, so
+        // re-keying is one write and the whole project answers to the new prefix.
+        assert!(
+            matches!(project_by_key(&mut conn, "NYX").unwrap(), ProjectByKey::Found(p) if p.id == alpha.id),
+        );
+
+        // MALFORMED — refused before any query.
+        assert!(matches!(
+            set_project_key(&mut conn, &alpha.id, "nyx"),
+            Err(ProjectKeyError::Malformed)
+        ));
+        assert!(matches!(
+            set_project_key(&mut conn, &alpha.id, "N"),
+            Err(ProjectKeyError::Malformed)
+        ));
+
+        // TAKEN — by ANOTHER project. The message must be distinguishable from the shape refusal:
+        // they are the two things a user can do wrong, and they call for opposite corrections.
+        assert!(matches!(
+            set_project_key(&mut conn, &beta.id, "NYX"),
+            Err(ProjectKeyError::Taken)
+        ));
+        assert_ne!(
+            ProjectKeyError::Taken.to_string(),
+            ProjectKeyError::Malformed.to_string()
+        );
+
+        // …but NOT by ITSELF: re-saving the key a project already holds is a no-op success.
+        assert_eq!(
+            set_project_key(&mut conn, &alpha.id, "NYX")
+                .expect("a project may keep its own key")
+                .key,
+            "NYX"
+        );
+
+        // UNKNOWN PROJECT — named, rather than a silent zero-row update reported as success.
+        assert!(matches!(
+            set_project_key(&mut conn, "no-such-id", "ZZZ"),
+            Err(ProjectKeyError::UnknownProject)
+        ));
+        // And nothing was written on the way: `beta` still carries the key it was born with.
+        assert_ne!(get_project(&mut conn, &beta.id).unwrap().unwrap().key, "NYX");
+    }
+
     /// `delete_project` removes the project AND its workspaces (ON DELETE
     /// CASCADE), but terminals bound to those workspaces SURVIVE — they are
     /// DETACHED (workspace_id → NULL via ON DELETE SET NULL), not killed.
@@ -29255,6 +29551,85 @@ mod tests {
 
         // Unknown id → no-op (0 rows).
         assert_eq!(set_template_env(&mut conn, "no-such-id", None).unwrap(), 0);
+    }
+
+    /// `set_template_description` writes the NOTE FOR THE AGENT, `None` clears it, a BLANK value
+    /// clears it too — and the note travels down to BOTH readers of a workspace's commands.
+    ///
+    /// The blank case is the one that has to hold at THIS level rather than at a caller's: three
+    /// surfaces write this column (the UI route, the MCP tool, this function), and "an empty note
+    /// is no note" is a fact about the column, not a courtesy each of them remembers. Below it the
+    /// ambient block would render a bullet with nothing after it.
+    #[test]
+    fn set_template_description_round_trips_clears_on_blank_and_reaches_both_readers() {
+        let mut conn = open_in_memory();
+        let (project, root) = create_project(&mut conn, "p", p("/p", "C:\\p"), None).unwrap();
+        let check = create_template(
+            &mut conn,
+            &project.id,
+            "check",
+            "bun run check",
+            None,
+            CommandSource::default(),
+        )
+        .unwrap();
+        assert_eq!(check.description, None, "a fresh template carries no note");
+
+        assert_eq!(
+            set_template_description(&mut conn, &check.id, Some("The gate before any commit."))
+                .unwrap(),
+            1
+        );
+        let stored = get_template(&mut conn, &check.id).unwrap().unwrap();
+        assert_eq!(stored.description.as_deref(), Some("The gate before any commit."));
+        assert_eq!(
+            stored.command, "bun run check",
+            "setting the note never edits the command"
+        );
+
+        // BOTH readers of a workspace's commands carry it: the FULL row the UI and `list_commands`
+        // take, and the LEAN row the SessionStart block takes. A note on one and not the other
+        // would mean the sidebar and the injected context describe two different commands.
+        let full = list_instances_for_workspace(&mut conn, &root.id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(full.description.as_deref(), Some("The gate before any commit."));
+        let lean = list_command_lines_for_workspace(&mut conn, &root.id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(lean.description.as_deref(), Some("The gate before any commit."));
+
+        // A BLANK note is stored as NULL, not as whitespace.
+        assert_eq!(
+            set_template_description(&mut conn, &check.id, Some("   \n  ")).unwrap(),
+            1
+        );
+        assert_eq!(
+            get_template(&mut conn, &check.id)
+                .unwrap()
+                .unwrap()
+                .description,
+            None
+        );
+
+        // …and so is an explicit clear. Unknown id → no-op (0 rows).
+        set_template_description(&mut conn, &check.id, Some("back")).unwrap();
+        assert_eq!(set_template_description(&mut conn, &check.id, None).unwrap(), 1);
+        assert_eq!(
+            get_template(&mut conn, &check.id)
+                .unwrap()
+                .unwrap()
+                .description,
+            None
+        );
+        assert_eq!(
+            set_template_description(&mut conn, "no-such-id", None).unwrap(),
+            0
+        );
     }
 
     // --- Agent sessions (PRD-5 v7, ADR-0010) -----------------------------

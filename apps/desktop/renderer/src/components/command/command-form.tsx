@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Field } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import { pickDirectory, relativeToWorkspace } from "@/components/sidebar/folder-picker";
 import { CommandSourcePanel } from "./command-source-panel";
 import { DetailSeparator } from "./command-detail-chrome";
@@ -74,16 +75,21 @@ export interface CommandFormProps {
 
 /**
  * Zod v4 schema for the command form (review T2). `name`/`command` are required
- * (trimmed, non-empty); `subfolder` is optional; `restart_on_startup` is a bool.
+ * (trimmed, non-empty); `subfolder` and `description` are optional; `restart_on_startup` is a bool.
  * Wired into TanStack Form as the `onChange` validator (a Standard Schema), so the
  * field validity — and therefore the submit gate (`canSubmit`) — derives from this
  * one declaration instead of a hand-rolled `canSubmit` boolean.
+ *
+ * `description` is UNCONSTRAINED prose on purpose: the backend truncates it where it costs
+ * something (the SessionStart block, capped at 200 characters) and stores it whole, so a length
+ * rule here would only forbid what the reader already handles.
  */
 const commandSchema = z.object({
   name: z.string().trim().min(1, "A name is required."),
   command: z.string().trim().min(1, "A command is required."),
   subfolder: z.string(),
   restart_on_startup: z.boolean(),
+  description: z.string(),
 });
 
 type CommandFormFields = z.input<typeof commandSchema>;
@@ -95,7 +101,13 @@ type CommandFormFields = z.input<typeof commandSchema>;
  * in the same panel now, so the difference between them is a `commit` mode and not a second layout.
  *
  * Fields: `name`, `command`, an OPTIONAL `subfolder` (run path relative to the workspace) with a
- * native FOLDER PICKER, and a `restart_on_startup` toggle.
+ * native FOLDER PICKER, an OPTIONAL multiline `description` — the NOTE FOR THE AGENT — and a
+ * `restart_on_startup` toggle. The note sits between the subfolder and the toggle because it reads
+ * as the last thing said ABOUT the command, before the one setting that changes its behaviour.
+ *
+ * The SAME form serves the project scope and the Système scope (`<SystemCommandsDialog>` mounts the
+ * very same `<CommandsSection>`), so the note is offered on both without a second placement — which
+ * is exactly what the shared-shell decision of review 01M1EP31GWDR6FJEXY6E8CVDZZ bought.
  *
  * Built on **@tanstack/react-form** with a **Zod v4** schema (`commandSchema`) as the validator: the
  * form store owns the field state + the submit gate (`canSubmit`). Each field is scaffolded by our
@@ -134,6 +146,7 @@ export function CommandForm({
   const nameId = useId();
   const commandId = useId();
   const subfolderId = useId();
+  const descriptionId = useId();
   // The Switch is a Base UI `Switch.Root` (a non-native `role="switch"` span), so
   // there is no implicit label↔control link. We give it an explicit id and point
   // the wrapping `Field` (`<label htmlFor>`) at it so screen readers (and the
@@ -146,6 +159,7 @@ export function CommandForm({
     command: editing?.command ?? "",
     subfolder: editing?.subfolder ?? "",
     restart_on_startup: editing?.restart_on_startup ?? false,
+    description: editing?.description ?? "",
   };
 
   const form = useForm({
@@ -159,6 +173,7 @@ export function CommandForm({
         command: value.command.trim(),
         subfolder: value.subfolder.trim(),
         restart_on_startup: value.restart_on_startup,
+        description: value.description.trim(),
       });
     },
   });
@@ -182,12 +197,14 @@ export function CommandForm({
       command: value.command.trim(),
       subfolder: value.subfolder.trim(),
       restart_on_startup: value.restart_on_startup,
+      description: value.description.trim(),
     };
     const unchanged =
       next.name === seeded.name.trim() &&
       next.command === seeded.command.trim() &&
       next.subfolder === seeded.subfolder.trim() &&
-      next.restart_on_startup === seeded.restart_on_startup;
+      next.restart_on_startup === seeded.restart_on_startup &&
+      next.description === seeded.description.trim();
     if (unchanged) return;
     onSubmit(next);
   };
@@ -312,6 +329,33 @@ export function CommandForm({
         )}
       </form.Field>
 
+      {/* THE NOTE FOR THE AGENT — the only field on this form whose reader is not the human filling
+          it in. `command` and `subfolder` say what runs and where; this says WHEN and WHY, which is
+          what an agent has no way to infer and what makes it start a command it should not (or skip
+          one it should). The description under the field says who reads it, because a textarea
+          labelled "Note" in a settings modal reads as a private annotation, and this one is not. */}
+      <form.Field name="description">
+        {(field) => (
+          <Field
+            htmlFor={descriptionId}
+            label="Note for the agent (optional)"
+            description="When and why to run this command — the agent reads it at the start of every session."
+          >
+            <Textarea
+              id={descriptionId}
+              value={field.state.value}
+              onChange={(e) => field.handleChange(e.target.value)}
+              onBlur={() => {
+                field.handleBlur();
+                commitOnBlur();
+              }}
+              aria-label="Note for the agent"
+              placeholder="e.g. the test suite — replay it before saying the work is done."
+            />
+          </Field>
+        )}
+      </form.Field>
+
       <form.Field name="restart_on_startup">
         {(field) => (
           <Field
@@ -333,6 +377,7 @@ export function CommandForm({
                     command: value.command.trim(),
                     subfolder: value.subfolder.trim(),
                     restart_on_startup: checked,
+                    description: value.description.trim(),
                   });
                 }
               }}

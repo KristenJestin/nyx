@@ -3,10 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   loadLastProjectId,
   loadLastTerminalId,
+  loadSectionOpen,
   loadVersionedJson,
   saveLastProjectId,
   saveLastTerminalId,
+  saveSectionOpen,
   saveVersionedJson,
+  sectionOpenKey,
 } from "./ui-persistence";
 
 interface Shape {
@@ -102,5 +105,48 @@ describe("versioned JSON", () => {
       throw new Error("SecurityError");
     });
     expect(loadVersionedJson("k", 1, isShape)).toBeNull();
+  });
+});
+
+/**
+ * A RUNTIME BAND'S FOLD, remembered per WORKSPACE and per BAND.
+ *
+ * The key shape is asserted literally, once: it is the only thing that makes two workspaces (and
+ * the two bands of one workspace) independent, and a mistake in it is invisible — everything keeps
+ * working, folded together.
+ */
+describe("a runtime band's fold state", () => {
+  it("keys on the workspace AND the band", () => {
+    expect(sectionOpenKey("ws-1", "terminals")).toBe("nyx.ui.section:ws-1:terminals");
+    expect(sectionOpenKey("ws-1", "commands")).toBe("nyx.ui.section:ws-1:commands");
+  });
+
+  it("answers null until the band has been folded, then remembers", () => {
+    expect(loadSectionOpen("ws-1", "terminals")).toBeNull();
+    saveSectionOpen("ws-1", "terminals", false);
+    expect(loadSectionOpen("ws-1", "terminals")).toBe(false);
+    saveSectionOpen("ws-1", "terminals", true);
+    expect(loadSectionOpen("ws-1", "terminals")).toBe(true);
+  });
+
+  it("keeps the two bands and the two workspaces apart", () => {
+    saveSectionOpen("ws-1", "commands", false);
+    // The OTHER band of the same workspace is untouched…
+    expect(loadSectionOpen("ws-1", "terminals")).toBeNull();
+    // …and so is the same band of another workspace: folding one workspace's commands must not
+    // fold them on the workspace next to it.
+    expect(loadSectionOpen("ws-2", "commands")).toBeNull();
+  });
+
+  it("forgets the band on null, and refuses an entry of the wrong shape", () => {
+    saveSectionOpen("ws-1", "commands", false);
+    saveSectionOpen("ws-1", "commands", null);
+    expect(window.localStorage.getItem(sectionOpenKey("ws-1", "commands"))).toBeNull();
+
+    // A hand-edited or downgraded entry reads as "no preference", never as a boolean it is not.
+    window.localStorage.setItem(sectionOpenKey("ws-1", "commands"), '{"v":1,"data":"nope"}');
+    expect(loadSectionOpen("ws-1", "commands")).toBeNull();
+    window.localStorage.setItem(sectionOpenKey("ws-1", "commands"), '{"v":2,"data":false}');
+    expect(loadSectionOpen("ws-1", "commands")).toBeNull();
   });
 });

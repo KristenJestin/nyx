@@ -729,6 +729,7 @@ export function BaseLayout() {
     renameWorkspace,
     reorderProjects,
     setProjectResumeAgentSessions,
+    setProjectKey,
     setProjectAccent,
     setProjectMark,
   } = useProjects();
@@ -1443,7 +1444,11 @@ export function BaseLayout() {
             globalSection={{
               resumeAgentSessions: liveTree?.project.resume_agent_sessions ?? false,
               showRename: true,
+              // THE KEY, from the LIVE tree like the name and the identity — the field re-seeds
+              // from what the backend granted, never from a local copy of what was asked.
+              projectKey: liveTree?.project.key,
               onRename: (name) => (targetId ? updateProject(targetId, name) : Promise.resolve()),
+              onKeyChange: (key) => (targetId ? setProjectKey(targetId, key) : Promise.resolve()),
               onResumeChange: (resume) =>
                 targetId ? setProjectResumeAgentSessions(targetId, resume) : Promise.resolve(),
               // The identity block, read from the LIVE tree so a press repaints the rail tile

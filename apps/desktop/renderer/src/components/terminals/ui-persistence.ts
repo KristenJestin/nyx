@@ -49,6 +49,18 @@ const TERMINAL_KEY_PREFIX = "nyx.ui.lastTerminalId:";
 const GROUP_OPEN_KEY_PREFIX = "nyx.ui.groupOpen:";
 /** Schema version of a group's fold state — a bare boolean. */
 const GROUP_OPEN_VERSION = 1;
+/**
+ * Prefix for a RUNTIME BAND's folded/unfolded state (`<prefix><workspaceId>:<band>`).
+ *
+ * PER WORKSPACE and PER BAND, both halves deliberate. Per workspace, because a fold is a statement
+ * about ONE workspace's runtime ("I am not looking at this one's terminals right now"), and a
+ * global "Terminals are folded" would collapse the band on the workspace the user is working in.
+ * Per band, because the two answer different questions and a user routinely wants one shut and the
+ * other open.
+ */
+const SECTION_OPEN_KEY_PREFIX = "nyx.ui.section:";
+/** Schema version of a band's fold state — a bare boolean. */
+const SECTION_OPEN_VERSION = 1;
 
 /** The `localStorage` handle, or `null` when it is absent / access throws (private mode, SSR). */
 function store(): Storage | null {
@@ -161,6 +173,44 @@ export function loadGroupOpen(groupId: string): boolean | null {
 /** Remember a group block's folded/unfolded state (or, for `null`, forget it). */
 export function saveGroupOpen(groupId: string, open: boolean | null): void {
   saveVersionedJson(`${GROUP_OPEN_KEY_PREFIX}${groupId}`, GROUP_OPEN_VERSION, open);
+}
+
+/** The two typed bands of a workspace's runtime tree — the second half of a band's storage key. */
+export type RuntimeBand = "terminals" | "commands";
+
+/**
+ * The key ONE band of ONE workspace is remembered under. Exported so the fold hook, this module and
+ * its test all name it the same way rather than each rebuilding the string.
+ */
+export function sectionOpenKey(workspaceId: string, band: RuntimeBand): string {
+  return `${SECTION_OPEN_KEY_PREFIX}${workspaceId}:${band}`;
+}
+
+/**
+ * Whether a workspace's TERMINALS / COMMANDS band is unfolded — `null` when it has never been
+ * folded or unfolded, in which case the caller's default applies (both bands open: the runtime tree
+ * is what a workspace accordion opens ONTO, so arriving on a folded one would be arriving on
+ * nothing).
+ *
+ * Rides the same registry, the same guards and the same versioned envelope as
+ * {@link loadGroupOpen} — one key per (workspace, band), so a deleted workspace leaves two dead
+ * entries behind and never a growing blob to migrate.
+ */
+export function loadSectionOpen(workspaceId: string, band: RuntimeBand): boolean | null {
+  return loadVersionedJson(
+    sectionOpenKey(workspaceId, band),
+    SECTION_OPEN_VERSION,
+    (value): value is boolean => typeof value === "boolean",
+  );
+}
+
+/** Remember a band's folded/unfolded state for one workspace (or, for `null`, forget it). */
+export function saveSectionOpen(
+  workspaceId: string,
+  band: RuntimeBand,
+  open: boolean | null,
+): void {
+  saveVersionedJson(sectionOpenKey(workspaceId, band), SECTION_OPEN_VERSION, open);
 }
 
 /**

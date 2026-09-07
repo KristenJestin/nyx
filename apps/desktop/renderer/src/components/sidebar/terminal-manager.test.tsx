@@ -229,6 +229,8 @@ describe("<TerminalManager> production auto-attach loop", () => {
           collapsed: false,
           created_at: 0,
           updated_at: 0,
+          key: "P",
+
           resume_agent_sessions: false,
         },
       ],
@@ -276,6 +278,8 @@ describe("<TerminalManager> production auto-attach loop", () => {
           collapsed: false,
           created_at: 0,
           updated_at: 0,
+          key: "P",
+
           resume_agent_sessions: false,
         },
       ],
@@ -327,6 +331,8 @@ describe("<TerminalManager> production auto-attach loop", () => {
           collapsed: false,
           created_at: 0,
           updated_at: 0,
+          key: "P",
+
           resume_agent_sessions: false,
         },
       ],
@@ -376,6 +382,8 @@ describe("<TerminalManager> production auto-attach loop", () => {
           collapsed: false,
           created_at: 0,
           updated_at: 0,
+          key: "P",
+
           resume_agent_sessions: false,
         },
       ],

@@ -147,6 +147,7 @@ export function TerminalManager() {
     createWorkspace,
     updateProject,
     setProjectResumeAgentSessions,
+    setProjectKey,
     setProjectAccent,
     setProjectMark,
     deleteProject,
@@ -725,7 +726,11 @@ export function TerminalManager() {
             // Wiring the Global pane is what puts it in the rail — see `globalSection`.
             globalSection={{
               resumeAgentSessions: liveTree?.project.resume_agent_sessions ?? false,
+              // THE KEY, from the LIVE tree like the name and the identity — the field re-seeds
+              // from what the backend granted, never from a local copy of what was asked.
+              projectKey: liveTree?.project.key,
               onRename: (name) => (targetId ? updateProject(targetId, name) : Promise.resolve()),
+              onKeyChange: (key) => (targetId ? setProjectKey(targetId, key) : Promise.resolve()),
               onResumeChange: (resume) =>
                 targetId ? setProjectResumeAgentSessions(targetId, resume) : Promise.resolve(),
               // The identity block, read from the LIVE tree so the spine's mark repaints at once.

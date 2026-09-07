@@ -267,6 +267,14 @@ diesel::table! {
         // order of the migration.
         group_id -> Nullable<Text>,
         group_order -> Integer,
+        // THE NOTE FOR THE AGENT (migration `20260907154551_managed_commands_description`): free
+        // prose saying WHEN and WHY to run this command — the one thing neither `command` nor
+        // `subfolder` can say. Read back on every agent-facing surface (`list_commands`,
+        // `list_system_commands`, and one indented line under the command in the SessionStart
+        // ambient block). NULL (the default, and the value of every command predating the
+        // migration) = no note, and no line. Appended LAST, after `group_order`, to match the
+        // ALTER order of the migration.
+        description -> Nullable<Text>,
     }
 }
 

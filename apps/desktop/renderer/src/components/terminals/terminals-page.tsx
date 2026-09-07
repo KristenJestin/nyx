@@ -66,6 +66,7 @@ export function TerminalsPage() {
     createProject,
     createWorkspace,
     setProjectResumeAgentSessions,
+    setProjectKey,
     setProjectAccent,
     setProjectMark,
     updateProject,
@@ -117,6 +118,12 @@ export function TerminalsPage() {
   const [settingsTarget, setSettingsTarget] = useState<{
     section: ProjectSettingsSection;
     workspace: { id: string; path: string } | null;
+    /**
+     * WHICH command the Commands pane opens on (a TEMPLATE id), for the third entry point: a
+     * command row's `…` ▸ Details. It rides the same value as the section and the workspace, so
+     * the three entries still differ by DATA and not by a second component.
+     */
+    commandId?: string;
   } | null>(null);
 
   const activeTree = useMemo(
@@ -206,6 +213,9 @@ export function TerminalsPage() {
             onRemoveWorkspace={removeWorkspace}
             onOpenProjectSettings={() => setSettingsTarget({ section: "global", workspace: null })}
             onOpenCommands={(workspace) => setSettingsTarget({ section: "commands", workspace })}
+            onOpenCommandDetails={(workspace, commandId) =>
+              setSettingsTarget({ section: "commands", workspace, commandId })
+            }
           />
         </ConsumedNotificationsProvider>
       </RuntimeSelectionProvider>
@@ -227,14 +237,18 @@ export function TerminalsPage() {
         projectId={activeTree.project.id}
         projectName={activeTree.project.name}
         initialSection={settingsTarget?.section ?? "global"}
+        initialCommandId={settingsTarget?.commandId ?? null}
         importWorkspaceId={settingsTarget?.workspace?.id ?? null}
         workspacePath={settingsTarget?.workspace?.path ?? null}
         globalSection={{
           resumeAgentSessions: activeTree.project.resume_agent_sessions ?? false,
           showRename: false,
+          // THE KEY is offered even where the RENAME is not: renaming a project belongs to the
+          // rail's kebab CRUD, while the key has no other surface at all.
+          projectKey: activeTree.project.key,
           onRename: (name) => updateProject(activeTree.project.id, name),
-          onResumeChange: (resume) =>
-            setProjectResumeAgentSessions(activeTree.project.id, resume),
+          onKeyChange: (key) => setProjectKey(activeTree.project.id, key),
+          onResumeChange: (resume) => setProjectResumeAgentSessions(activeTree.project.id, resume),
           // The identity block — same live tree, so the header's own mark and the rail tile
           // repaint the moment a swatch or a glyph is pressed.
           identity: {
@@ -270,6 +284,7 @@ function TerminalsBody({
   onRemoveWorkspace,
   onOpenProjectSettings,
   onOpenCommands,
+  onOpenCommandDetails,
 }: {
   projectId: string;
   projectName: string;
@@ -295,6 +310,12 @@ function TerminalsBody({
    * modal is gone (finding 01M132YSBKJ5J22VG60P5GN7W0).
    */
   onOpenCommands: (workspace: { id: string; path: string }) => void;
+  /**
+   * Open THE SAME modal on ONE COMMAND of that workspace — the row-level `…` ▸ Details. The
+   * workspace still travels with it (the import entry and the subfolder picker need it), so this
+   * is `onOpenCommands` plus the command it opens on, not a second door.
+   */
+  onOpenCommandDetails: (workspace: { id: string; path: string }, commandId: string) => void;
 }) {
   const { selected, select } = useRuntimeSelection();
 
@@ -637,6 +658,12 @@ function TerminalsBody({
                             }
                             onNewCommand={() =>
                               onOpenCommands({ id: workspace.id, path: workspace.path })
+                            }
+                            onOpenCommandDetails={(commandId) =>
+                              onOpenCommandDetails(
+                                { id: workspace.id, path: workspace.path },
+                                commandId,
+                              )
                             }
                             // The workspace's OWN lifecycle, on its own line: rename any workspace,
                             // remove a non-root one (the header's kebab disables it on the root

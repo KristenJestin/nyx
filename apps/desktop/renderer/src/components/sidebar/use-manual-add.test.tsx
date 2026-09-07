@@ -37,6 +37,8 @@ function tree(id: string, name: string, workspaces: WorkspaceRecord[] = []): Pro
       collapsed: false,
       created_at: 0,
       updated_at: 0,
+      key: "P",
+
       resume_agent_sessions: false,
     },
     workspaces,

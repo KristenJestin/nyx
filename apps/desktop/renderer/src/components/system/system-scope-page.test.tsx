@@ -16,6 +16,8 @@ function systemProject(): ProjectRecord {
     collapsed: false,
     created_at: 0,
     updated_at: 0,
+    key: "P",
+
     resume_agent_sessions: false,
     kind: "system",
   };
@@ -84,6 +86,8 @@ function snapshot(extraTerminalIds: readonly string[] = []): WorkspaceRuntimeSna
         workspace_id: "sys-ws",
         name: "palbank services",
         command: "systemctl --user start palbank.target",
+        subfolder: null,
+        description: null,
         run_state: "running",
         exit_code: null,
         unread: false,

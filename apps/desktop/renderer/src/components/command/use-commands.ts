@@ -36,6 +36,16 @@ export interface ManagedCommand {
   source_script_name: string | null;
   source_script_command_snapshot: string | null;
   package_manager: string | null;
+  /**
+   * THE NOTE FOR THE AGENT — free prose saying WHEN and WHY to run this command, written by the
+   * user in the command form. `null` when there is none.
+   *
+   * It is NOT a UI caption: the backend reads it back on every agent-facing surface (both forms of
+   * the MCP `list_commands`, and one indented line under the command in the SessionStart ambient
+   * block). Which is why the form's help text says so — someone typing here is writing to the
+   * agent, not annotating a list.
+   */
+  description: string | null;
 }
 
 /** Front mirror of `db::InstanceWithTemplate` — one workspace's command instance. */
@@ -73,6 +83,12 @@ export interface InstanceWithTemplate {
   workspace_path: string;
   /** Resolved run directory (workspace + subfolder), filled by the bridge. */
   cwd: string | null;
+  /**
+   * The template's NOTE FOR THE AGENT, joined like the other template fields (`null` = none). It
+   * travels down to the INSTANCE row so the sidebar can show it on hover without a second read:
+   * the sidebar knows instances, the note lives on the template.
+   */
+  description: string | null;
 }
 
 /** Front mirror of `pkgjson::DiscoveredScript` — one importable package.json script. */
@@ -98,6 +114,12 @@ export interface CommandFormValues {
   command: string;
   subfolder: string;
   restart_on_startup: boolean;
+  /**
+   * The NOTE FOR THE AGENT, as the form holds it: a plain string, `""` for "no note". The stored
+   * column is nullable, so the mutations below send `null` for a value that trims to nothing —
+   * an empty note and an absent note are the same fact, and only one of them can be stored.
+   */
+  description: string;
 }
 
 /**
@@ -267,6 +289,9 @@ export function useCommands(projectId: string | null): UseCommands {
         command: values.command,
         subfolder: values.subfolder.trim() ? values.subfolder.trim() : null,
         restartOnStartup: values.restart_on_startup,
+        // A blank note is sent as `null`, not as `""`: the ambient block renders a line per stored
+        // note, and an empty one would be a bullet with nothing after it in every session.
+        description: values.description.trim() ? values.description.trim() : null,
       });
       await refresh();
       return created;
@@ -282,6 +307,10 @@ export function useCommands(projectId: string | null): UseCommands {
         command: values.command,
         subfolder: values.subfolder.trim() ? values.subfolder.trim() : null,
         restartOnStartup: values.restart_on_startup,
+        // The route reads this key as a TRISTATE, so `null` here is not "leave it alone" — it
+        // ERASES the note, which is exactly what emptying the field must do. The form always
+        // sends the key, so the third state (absent) is the agent's alone.
+        description: values.description.trim() ? values.description.trim() : null,
       });
       await refresh();
     },

@@ -38,6 +38,8 @@ function tree(projectId: string, name: string, workspaces: WorkspaceRecord[]): P
       collapsed: false,
       created_at: 0,
       updated_at: 0,
+      key: "P",
+
       resume_agent_sessions: false,
     },
     workspaces,

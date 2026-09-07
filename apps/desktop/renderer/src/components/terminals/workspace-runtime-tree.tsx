@@ -1,8 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { PencilIcon, PlusIcon, Settings2Icon, XIcon } from "lucide-react";
+import {
+  InfoIcon,
+  MoreVerticalIcon,
+  PencilIcon,
+  PlusIcon,
+  Settings2Icon,
+  XIcon,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Menu, MenuItem } from "@/components/ui/menu";
 import { Tooltip } from "@/components/ui/tooltip";
 import { CommandControls } from "@/components/command/command-controls";
 import { CommandGroupControls } from "@/components/command/command-group-controls";
@@ -39,7 +47,13 @@ import {
 } from "@/components/ui/sidebar-line";
 import { useGroupFolds } from "@/components/panes/use-group-folds";
 import { aggregateState } from "@/components/ui/status-dot";
-import { loadGroupOpen, saveGroupOpen } from "./ui-persistence";
+import {
+  loadGroupOpen,
+  loadSectionOpen,
+  saveGroupOpen,
+  saveSectionOpen,
+  type RuntimeBand,
+} from "./ui-persistence";
 import { useRuntimeSelection } from "./runtime-selection";
 import { useConsumedNotifications } from "./use-consumed-notifications";
 import { useMarkReadOnActive } from "./use-mark-read";
@@ -60,6 +74,13 @@ import type {
  * provider's brand logo, so an agent is legible in the tree without inventing a separate
  * cosmetic bucket.
  *
+ * ## Both bands fold, and the fold is remembered
+ *
+ * Terminals and Commands are the same object twice (`<RuntimeSection>`), which is what finding
+ * 01KV63TD5E… asked for — the two bands aligned — and they now fold rather than being pinned open.
+ * The state is per WORKSPACE and per BAND (`terminals/ui-persistence.ts`), so a workspace whose
+ * commands are a launcher can keep them shut without folding the band on the workspace next to it.
+ *
  * ## No business logic here
  * Run states are the pure projections from `runtime-state` (a total fold over the read model
  * the backend already computed); the service controls delegate to the shared
@@ -70,6 +91,7 @@ export function WorkspaceRuntimeTree({
   snapshot,
   onNewTerminal,
   onNewCommand,
+  onOpenCommandDetails,
   agentActivity,
   formatCwd,
 }: {
@@ -78,6 +100,12 @@ export function WorkspaceRuntimeTree({
   onNewTerminal?: () => void;
   /** Open the project's command manager to CREATE a command (the section gear). */
   onNewCommand?: () => void;
+  /**
+   * Open the command manager ON ONE COMMAND (by TEMPLATE id) — the row-level `…` ▸ Details. The
+   * twin of `onNewCommand`: same modal, one entry point for creating and one for inspecting what
+   * already exists. Omitted, the rows carry no `…`.
+   */
+  onOpenCommandDetails?: (commandId: string) => void;
   /**
    * Re-render a terminal's CWD for display when the row falls back to it for a name (an unnamed
    * terminal shows its cwd). The SYSTÈME page passes the home abbreviation so a terminal opened at
@@ -109,6 +137,19 @@ export function WorkspaceRuntimeTree({
     () => new Map(terminals.map((terminal, index) => [terminal.id, index])),
     [terminals],
   );
+  // WHICH BAND IS FOLDED, for THIS workspace — the SAME `useGroupFolds` the command folders use,
+  // keyed on `<workspaceId>:<band>` rather than on a group id. Reusing it is not a shortcut: it
+  // already owns the three things this needs (a live map, a read-once cache over a synchronous
+  // storage read, and persistence INJECTED rather than imported), and a second hook doing them
+  // again is a second place for "remembered" to mean something slightly different.
+  //
+  // OPEN BY DEFAULT for both bands, until the first fold: the runtime tree is what a workspace
+  // accordion opens ONTO, so arriving on a folded band would be arriving on nothing.
+  const bands = useGroupFolds({
+    defaultOpen: true,
+    load: (band) => loadSectionOpen(snapshot.workspace.id, band as RuntimeBand),
+    save: (band, open) => saveSectionOpen(snapshot.workspace.id, band as RuntimeBand, open),
+  });
   return (
     <div className="flex flex-col py-2">
       {/* (v2.5.8: the post-crash "Interrupted — Resume/Ignore" restore panel was reverted. A crash
@@ -117,6 +158,9 @@ export function WorkspaceRuntimeTree({
       <RuntimeSection
         title="Terminals"
         count={terminals.length}
+        open={bands.isOpen("terminals")}
+        onToggle={() => bands.toggle("terminals")}
+        toggleLabel="Toggle terminals"
         actions={
           onNewTerminal ? (
             <Tooltip label="New terminal">
@@ -160,6 +204,9 @@ export function WorkspaceRuntimeTree({
       <RuntimeSection
         title="Commands"
         count={services.length}
+        open={bands.isOpen("commands")}
+        onToggle={() => bands.toggle("commands")}
+        toggleLabel="Toggle commands"
         actions={
           onNewCommand ? (
             <Tooltip label="New command">
@@ -175,7 +222,11 @@ export function WorkspaceRuntimeTree({
           ) : null
         }
       >
-        <CommandRows services={services} workspaceId={snapshot.workspace.id} />
+        <CommandRows
+          services={services}
+          workspaceId={snapshot.workspace.id}
+          onOpenDetails={onOpenCommandDetails}
+        />
       </RuntimeSection>
     </div>
   );
@@ -215,10 +266,13 @@ export function WorkspaceRuntimeTree({
 function CommandRows({
   services,
   workspaceId,
+  onOpenDetails,
 }: {
   services: readonly WorkspaceRuntimeService[];
   /** The workspace these instances belong to — a group's lifecycle has no meaning without it. */
   workspaceId: string;
+  /** Open the Commands modal on one command (by template id) — see `<ServiceRow>`. */
+  onOpenDetails?: (commandId: string) => void;
 }) {
   const controller = useCommandGroupsContext();
 
@@ -252,7 +306,11 @@ function CommandRows({
         empty="No managed commands."
         rows={blocks.map((block) =>
           block.group == null ? (
-            <ServiceRow key={block.items[0].id} service={block.items[0]} />
+            <ServiceRow
+              key={block.items[0].id}
+              service={block.items[0]}
+              onOpenDetails={onOpenDetails}
+            />
           ) : (
             <CommandGroupBlock
               key={block.group.id}
@@ -260,6 +318,7 @@ function CommandRows({
               index={controller.groups.findIndex((g) => g.id === block.group!.id)}
               members={block.items}
               workspaceId={workspaceId}
+              onOpenDetails={onOpenDetails}
             />
           ),
         )}
@@ -304,12 +363,19 @@ function CommandGroupBlock({
   index,
   members,
   workspaceId,
+  onOpenDetails,
 }: {
   group: CommandGroup;
   /** The group's rank in the project's list — how an UNNAMED group is designated. */
   index: number;
   members: readonly WorkspaceRuntimeService[];
   workspaceId: string;
+  /**
+   * Passed straight down to the MEMBER rows. The BLOCK still carries no `…` of its own — composing
+   * a group stays the modal's (finding 01M11XMQA3M852JDD7R3MDG88X); what each member gains is a
+   * door onto its own definition, which is the same door the modal is.
+   */
+  onOpenDetails?: (commandId: string) => void;
 }) {
   const { isConsumed } = useConsumedNotifications();
   const { select, isSelected } = useRuntimeSelection();
@@ -354,7 +420,12 @@ function CommandGroupBlock({
         // Attention Inbox has been answered for each of them — without this a command could be
         // watched running and keep its unread dot forever, since the folder is now a way to look at
         // it that never selects it.
-        <ServiceRow key={service.id} service={service} viewedByGroup={groupViewed} />
+        <ServiceRow
+          key={service.id}
+          service={service}
+          viewedByGroup={groupViewed}
+          onOpenDetails={onOpenDetails}
+        />
       ))}
     </GroupBlock>
   );
@@ -609,6 +680,7 @@ export function TerminalRow({
 function ServiceRow({
   service,
   viewedByGroup = false,
+  onOpenDetails,
 }: {
   service: WorkspaceRuntimeService;
   /**
@@ -617,6 +689,11 @@ function ServiceRow({
    * Inbox, and nothing else: the row's own selected fill still belongs to the row's own selection.
    */
   viewedByGroup?: boolean;
+  /**
+   * Open the Commands modal ON THIS COMMAND (by TEMPLATE id — what the modal selects). Omitted, the
+   * row carries no `…` at all: a menu whose only entry leads nowhere is worse than no menu.
+   */
+  onOpenDetails?: (commandId: string) => void;
 }) {
   const { isSelected } = useRuntimeSelection();
   const { isConsumed, consume } = useConsumedNotifications();
@@ -639,15 +716,91 @@ function ServiceRow({
       icon={<SidebarLineFamilyGlyph family="command" />}
       label={service.name}
       state={dotState}
+      // WHAT THE ROW CANNOT SAY, said on hover. A command row is a name and a dot; two commands
+      // called `dev` in two workspaces look identical, and nothing on screen answers "what does
+      // this one actually run, from where, and why". `<RuntimeRow>`'s tooltip is the NON-INLINE
+      // channel that already exists for exactly this (a terminal's CPU/RAM rides it) — the reading
+      // never competes with the name for row width.
+      tooltip={<ServiceSummary service={service} />}
       actions={
-        <CommandControls
-          instanceId={service.id}
-          state={state}
-          showDot={false}
-          buttonSize="icon-xs"
-          inRow
-        />
+        <>
+          <CommandControls
+            instanceId={service.id}
+            state={state}
+            showDot={false}
+            buttonSize="icon-xs"
+            inRow
+          />
+          {onOpenDetails && (
+            // THE `…`, AND WHY IT IS NOT THE ONE THE REVIEW REFUSED (01M11XMQA3M852JDD7R3MDG88X).
+            //
+            // That finding chased COMPOSITION out of the sidebar: « pour les commandes, tout se
+            // passe dans le modal pas ici ». The kebab it refused was the GROUP block's — the one
+            // that opened a `<GroupPanel>` and let a command group be renamed, recoloured and taken
+            // apart from the tree. This one holds a single entry, it edits nothing, and what it
+            // does is OPEN THAT VERY MODAL on this command. It is the finding's rule made
+            // reachable, not an exception to it: before it, a command seen in the sidebar could
+            // only be inspected by opening the settings and finding the line again by hand.
+            //
+            // The SHARED `<Menu>`, not a second dropdown: same popup, same motion, same keyboard
+            // wiring as the project rail's and the terminal row's.
+            <Menu
+              tooltip="Command actions"
+              trigger={
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={`Actions for ${service.name}`}
+                  // `stopPropagation` on the click so opening the menu never also SELECTS the row —
+                  // selecting acknowledges the command's unread result, which looking at a menu
+                  // must not do.
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <MoreVerticalIcon />
+                </Button>
+              }
+            >
+              <MenuItem
+                icon={<InfoIcon className="size-3.5" />}
+                // The TEMPLATE id, not the instance id: the modal edits the project-level command,
+                // which is what exists in every workspace. `service.command_id` is on the wire for
+                // this class of reason already (the group join).
+                onClick={() => onOpenDetails(service.command_id)}
+              >
+                Details
+              </MenuItem>
+            </Menu>
+          )}
+        </>
       }
     />
+  );
+}
+
+/**
+ * WHAT A COMMAND IS, in the three lines a hover can hold: the command LINE, WHERE it runs, and the
+ * NOTE the user wrote for the agent.
+ *
+ * The three answer the three questions a name alone leaves open, in the order they are asked — what
+ * does it run, from where, and why. The subfolder line is omitted when the command runs at the
+ * workspace root (the overwhelming majority: a line saying "the default" is noise), and the note
+ * line when there is none.
+ *
+ * The command text is CLAMPED rather than truncated in JS: a tooltip is a reading surface, so a
+ * long pipeline wraps to two or three lines instead of ending in an ellipsis the user cannot
+ * expand. The ambient block's 160-character cut is a TOKEN budget and has no business here.
+ */
+function ServiceSummary({ service }: { service: WorkspaceRuntimeService }) {
+  const note = service.description?.trim();
+  return (
+    <span className="flex flex-col gap-1">
+      <code className="font-mono text-2xs break-all">{service.command}</code>
+      {service.subfolder && (
+        <span className="text-2xs text-muted-foreground">
+          in <code className="font-mono">{service.subfolder}</code>
+        </span>
+      )}
+      {note && <span className="line-clamp-3 text-2xs">{note}</span>}
+    </span>
   );
 }

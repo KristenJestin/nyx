@@ -3303,6 +3303,22 @@ const MAX_SYSTEM_COMMAND_LINES: usize = 8;
 /// re-type it from the block.
 const MAX_COMMAND_CHARS: usize = 160;
 
+/// The widest a rendered NOTE is, ellipsis INCLUDED — the same rule as [`MAX_COMMAND_CHARS`], one
+/// notch wider because the two are not the same object. A command line is RECOGNISED (the agent has
+/// `list_commands` for the exact text); a note is READ, and it is the sentence that decides whether
+/// the agent starts the command at all, so cutting it at 160 would routinely cut it mid-reason.
+///
+/// Bounded all the same, and the bound is the block's whole economy: the column is unconstrained, a
+/// human can paste a paragraph into it, and twelve pasted paragraphs would blow the `SessionStart`
+/// hook's 1000 ms budget — where a timeout drops the WHOLE injected context, orientation line
+/// included. Past the cut the agent still has `list_commands`, which returns the note untruncated.
+const MAX_NOTE_CHARS: usize = 200;
+
+/// The indent a note is rendered under, and the ONE thing that says a note BELONGS to the command
+/// above it rather than being a thirteenth command. Two spaces + a middle dot: the same separator
+/// the command line itself uses between its fields, so the block keeps one punctuation vocabulary.
+const NOTE_PREFIX: &str = "\n  · ";
+
 /// The header of the WORKSPACE half — the commands of the workspace this session was started in.
 const WORKSPACE_BLOCK_HEADER: &str = "Managed commands of this workspace:";
 
@@ -3392,11 +3408,34 @@ const SYSTEM_AUTHORIZATION_DIRECTIVE_LINE: &str =
 /// is never longer than the bound. Counts CHARS, not bytes, so a truncation never splits a
 /// multi-byte character.
 fn render_command_text(command: &str) -> String {
-    let flattened = command.replace(['\r', '\n'], " ");
-    if flattened.chars().count() <= MAX_COMMAND_CHARS {
+    render_flat(command, MAX_COMMAND_CHARS)
+}
+
+/// The NOTE as the block shows it, or `None` when there is nothing to show. Same flattening and
+/// same char-counted cap as the command text ([`MAX_NOTE_CHARS`] rather than
+/// [`MAX_COMMAND_CHARS`] — see the constant for why the two differ).
+///
+/// A note that is absent AND a note that is blank both answer `None`: `set_template_description`
+/// already stores a blank one as NULL, and this second guard is what keeps a row that predates it —
+/// or one written straight into SQLite — from rendering an empty bullet under its command.
+fn render_note_text(description: Option<&str>) -> Option<String> {
+    let text = description?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(render_flat(text, MAX_NOTE_CHARS))
+}
+
+/// Flatten `text` onto ONE line and cap it at `max` CHARS, ellipsis INCLUDED (so a rendered value is
+/// never longer than the bound). Counts chars, not bytes, so a truncation never splits a multi-byte
+/// character. Shared by the command text and the note so the two can never drift into two
+/// truncation rules.
+fn render_flat(text: &str, max: usize) -> String {
+    let flattened = text.replace(['\r', '\n'], " ");
+    if flattened.chars().count() <= max {
         return flattened;
     }
-    let mut out: String = flattened.chars().take(MAX_COMMAND_CHARS - 1).collect();
+    let mut out: String = flattened.chars().take(max - 1).collect();
     out.push('…');
     out
 }
@@ -3410,6 +3449,12 @@ fn render_command_text(command: &str) -> String {
 /// vocabulary an agent already meets there, not a second label invented for the text — and it is
 /// per-line on purpose: a section header can be summarized away, a marker sitting on the line an
 /// agent is about to act on cannot.
+///
+/// THE NOTE GETS ITS OWN LINE, indented under the command's ([`NOTE_PREFIX`]), and only when the
+/// command carries one. Not appended to the command line: that line is already `name · command ·
+/// state · instance_id` and, on the shared half, a `nature` and a `group_id` — a fifth free-prose
+/// field on the end would push the `instance_id` an agent must copy past where it can be found at a
+/// glance. A command with no note renders exactly what it rendered before this: ONE line.
 fn push_command_lines<F>(
     out: &mut String,
     rows: &[db::WorkspaceCommandLine],
@@ -3437,6 +3482,12 @@ where
             out.push_str(&format!(" · group_id={group_id}"));
             rendered_a_group = true;
         }
+        // The note LAST, under the whole line, so every machine-readable field of the command stays
+        // where it was and the prose never sits between two of them.
+        if let Some(note) = render_note_text(row.description.as_deref()) {
+            out.push_str(NOTE_PREFIX);
+            out.push_str(&note);
+        }
     }
     rendered_a_group
 }
@@ -3455,6 +3506,11 @@ where
 /// shared one and `· group_id=…` on a command that belongs to a multi-pane group. `command_id` is
 /// deliberately absent: no tool takes it, and it would cost an ULID per line in every session's
 /// first tokens.
+///
+/// A command carrying a NOTE FOR THE AGENT gets a SECOND, indented line under its own — the human's
+/// sentence about WHEN and WHY to run it, the one thing the four fields above cannot say. Only when
+/// there is one, and capped at [`MAX_NOTE_CHARS`]; a command with no note renders exactly the single
+/// line it rendered before the note existed.
 ///
 /// Each half is rendered in the order it arrives — [`db::list_command_lines_for_workspace`] already
 /// orders by the template's `order_index` then `id`, which is the order of the sidebar, so
@@ -8341,12 +8397,130 @@ mod tests {
                 last_state: last_state.to_string(),
                 group_id: None,
                 order_index: 0,
+                description: None,
+            }
+        }
+
+        /// The same row, carrying a NOTE FOR THE AGENT — the only field the note-rendering cases
+        /// vary, so they say so and nothing else.
+        fn row_with_note(
+            id: &str,
+            name: &str,
+            command: &str,
+            last_state: &str,
+            note: &str,
+        ) -> db::WorkspaceCommandLine {
+            db::WorkspaceCommandLine {
+                description: Some(note.to_string()),
+                ..row(id, name, command, last_state)
             }
         }
 
         /// The overlay that knows nothing: every row falls back to its persisted `last_state`.
         fn no_overlay(_: &str) -> Option<RunState> {
             None
+        }
+
+        /// THE NOTE FOR THE AGENT gets its OWN indented line, under the command it belongs to — and
+        /// only when there is one.
+        ///
+        /// The two halves are one decision. A command WITHOUT a note must render exactly what it
+        /// rendered before notes existed, or every workspace on the machine would pay a blank line
+        /// per command in every session's first tokens for a feature nobody used. And a note that
+        /// IS there must not be appended to the command line: that line ends on the `instance_id`
+        /// an agent copies, and free prose in front of it is the one way to make that id hard to
+        /// find.
+        #[test]
+        fn a_note_renders_as_its_own_indented_line_and_only_when_present() {
+            let rows = vec![
+                row_with_note(
+                    "inst-check",
+                    "check",
+                    "bun run check",
+                    db::STATE_IDLE,
+                    "The gate before any commit.",
+                ),
+                row("inst-dev", "dev", "bun run dev", db::STATE_RUNNING),
+            ];
+            let block = session_commands_block(&rows, &[], no_overlay);
+
+            assert!(
+                block.contains("- check · bun run check · idle · instance_id=inst-check\n  · The gate before any commit."),
+                "the note sits on the NEXT line, indented, under its own command:\n{block}",
+            );
+            // The command with no note is followed straight by the next command's line — nothing
+            // was inserted between them.
+            assert!(
+                block.contains("- dev · bun run dev · running · instance_id=inst-dev\n"),
+                "a command without a note renders exactly one line:\n{block}",
+            );
+            assert_eq!(
+                block.matches(NOTE_PREFIX).count(),
+                1,
+                "one note in, one note line out:\n{block}",
+            );
+        }
+
+        /// A LONG note is cut at [`MAX_NOTE_CHARS`], ellipsis included — the block is read on the
+        /// `SessionStart` hook's 1000 ms budget, and a human can paste a paragraph into a column
+        /// that constrains nothing. What is cut is not lost: `list_commands` returns it whole.
+        #[test]
+        fn a_long_note_is_truncated_within_its_own_bound() {
+            let long = "z".repeat(MAX_NOTE_CHARS * 2);
+            let rows = vec![row_with_note(
+                "inst-1",
+                "long",
+                "echo hi",
+                db::STATE_IDLE,
+                &long,
+            )];
+            let block = session_commands_block(&rows, &[], no_overlay);
+            let rendered = block
+                .split(NOTE_PREFIX)
+                .nth(1)
+                .expect("the note line is rendered")
+                .lines()
+                .next()
+                .expect("the note occupies one line");
+
+            assert_eq!(
+                rendered.chars().count(),
+                MAX_NOTE_CHARS,
+                "the ellipsis counts INSIDE the cap, so the rendered note is never longer:\n{block}",
+            );
+            assert!(rendered.ends_with('…'), "the cut is visible: {rendered}");
+        }
+
+        /// A note is FLATTENED onto one line, and a BLANK one renders nothing at all.
+        ///
+        /// The multiline case is not theoretical: the field is a textarea, so a user pressing Enter
+        /// twice would otherwise inject two unindented lines into the middle of the command list —
+        /// where a reader (and a model) would take them for commands. The blank case guards a row
+        /// written before `set_template_description` normalised blanks, or straight into SQLite: an
+        /// empty bullet says a note exists when none does.
+        #[test]
+        fn a_note_is_flattened_onto_one_line_and_a_blank_one_renders_nothing() {
+            let rows = vec![
+                row_with_note(
+                    "inst-1",
+                    "multi",
+                    "echo hi",
+                    db::STATE_IDLE,
+                    "First line.\nSecond line.",
+                ),
+                row_with_note("inst-2", "blank", "echo ho", db::STATE_IDLE, "   "),
+            ];
+            let block = session_commands_block(&rows, &[], no_overlay);
+
+            assert!(
+                block.contains("\n  · First line. Second line."),
+                "the newline becomes a space — one note, one line:\n{block}",
+            );
+            assert_eq!(
+                block.matches(NOTE_PREFIX).count(),
+                1,
+                "a blank note is not a note:\n{block}",
+            );
         }
 
         /// A workspace WITH managed commands renders the block: a header, then one line per command

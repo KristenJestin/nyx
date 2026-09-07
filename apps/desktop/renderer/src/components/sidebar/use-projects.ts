@@ -32,6 +32,16 @@ export interface ProjectRecord {
   id: string;
   name: string;
   /**
+   * The project's canonical KEY — the prefix every Spec of the project is referenced by (`NYX-42`
+   * is Spec 42 of the project keyed `NYX`). NOT NULL and UNIQUE backend-side.
+   *
+   * It is DERIVED from the name at creation and, since the settings pane's Key field, changeable
+   * afterwards through `setProjectKey`. A Spec's reference is composed at render time
+   * (`key || '-' || number`), never stored — so this field is what every reference on screen reads,
+   * and why the write path is the only non-optimistic one on this hook.
+   */
+  key: string;
+  /**
    * Persisted sidebar disclosure state (`false` = open/expanded). The band
    * initializes its `open` from `!collapsed` so the open/closed state survives
    * a restart (`setProjectCollapsed` persists a toggle).
@@ -204,6 +214,19 @@ export interface UseProjects {
    * reflected on the tree, then persisted via `set_project_resume_agent_sessions`.
    */
   setProjectResumeAgentSessions: (id: string, resume: boolean) => Promise<void>;
+  /**
+   * Persist a project's KEY — the prefix every Spec of the project is referenced by (`NYX-42`).
+   *
+   * NOT OPTIMISTIC, unlike every other write on this hook, and that is the decision: this one
+   * REFUSES. A malformed key and a key another project already holds both come back as an Err
+   * carrying the backend's own sentence, and reflecting the new key on the tree before the answer
+   * would repaint every Spec reference in the app under a key that was never granted. So the tree
+   * is updated from what the backend RETURNS, after it has agreed.
+   *
+   * The rejection PROPAGATES so the settings field can print it under the input — which is the
+   * only place the user can learn that `NYX` is taken.
+   */
+  setProjectKey: (id: string, key: string) => Promise<void>;
   /**
    * Persist a project's ACCENT — the name of a palette token (`identity-3`), or
    * `null` to clear it back to the neutral tile. Optimistically reflected on the
@@ -490,26 +513,39 @@ export function useProjects(): UseProjects {
     await nyxBridge.invoke("set_project_resume_agent_sessions", { id, resume });
   }, []);
 
-  const setProjectAccent = useCallback(async (id: string, accent: string | null) => {
-    // Optimistically reflect the colour so every mark of that project — rail tile,
-    // home header, corner mark on a cross-project row — repaints at once, then
-    // persist. The rejection PROPAGATES so the settings modal can toast the real
-    // reason.
-    setProjects((prev) =>
-      prev.map((t) => (t.project.id === id ? { ...t, project: { ...t.project, accent } } : t)),
-    );
-    try {
-      await nyxBridge.invoke("set_project_accent", { id, accent });
-    } catch (e) {
-      // RE-READ rather than remember. A refused write leaves the tree showing a colour
-      // the database does not have, and nothing else would take it back: the corrective
-      // `workspaces://changed` is emitted by the write that just FAILED. Re-listing is
-      // also the only answer that stays right when the row moved for another reason
-      // (an agent, another surface) between the optimistic paint and the refusal.
-      void syncProjectTrees();
-      throw e;
-    }
-  }, [syncProjectTrees]);
+  const setProjectKey = useCallback(async (id: string, key: string) => {
+    // AWAIT FIRST, PAINT SECOND — the inverse of every other write on this hook, because this one
+    // has refusals of its own (a shape, and a uniqueness). An optimistic paint would re-key every
+    // Spec reference on screen to a prefix the backend may be about to refuse, and the corrective
+    // `workspaces://changed` is emitted by the write that FAILED. The route hands back the updated
+    // row, so the tree is refreshed from what was actually granted rather than from what was asked.
+    const project = await nyxBridge.invoke<ProjectRecord>("set_project_key", { id, key });
+    setProjects((prev) => prev.map((t) => (t.project.id === id ? { ...t, project } : t)));
+  }, []);
+
+  const setProjectAccent = useCallback(
+    async (id: string, accent: string | null) => {
+      // Optimistically reflect the colour so every mark of that project — rail tile,
+      // home header, corner mark on a cross-project row — repaints at once, then
+      // persist. The rejection PROPAGATES so the settings modal can toast the real
+      // reason.
+      setProjects((prev) =>
+        prev.map((t) => (t.project.id === id ? { ...t, project: { ...t.project, accent } } : t)),
+      );
+      try {
+        await nyxBridge.invoke("set_project_accent", { id, accent });
+      } catch (e) {
+        // RE-READ rather than remember. A refused write leaves the tree showing a colour
+        // the database does not have, and nothing else would take it back: the corrective
+        // `workspaces://changed` is emitted by the write that just FAILED. Re-listing is
+        // also the only answer that stays right when the row moved for another reason
+        // (an agent, another surface) between the optimistic paint and the refusal.
+        void syncProjectTrees();
+        throw e;
+      }
+    },
+    [syncProjectTrees],
+  );
 
   const setProjectMark = useCallback(
     async (id: string, mark: { icon: string } | { image: string } | null) => {
@@ -589,6 +625,7 @@ export function useProjects(): UseProjects {
     renameWorkspace,
     reorderProjects,
     setProjectResumeAgentSessions,
+    setProjectKey,
     setProjectAccent,
     setProjectMark,
     setProjectCollapsed,

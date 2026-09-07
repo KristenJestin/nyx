@@ -68,6 +68,7 @@ export function WorkspaceAccordion({
   defaultOpen = false,
   onNewTerminal,
   onNewCommand,
+  onOpenCommandDetails,
   onRename,
   onRemove,
 }: {
@@ -79,6 +80,11 @@ export function WorkspaceAccordion({
   onNewTerminal?: () => void;
   /** Open the project's command manager to CREATE a command (the tree's Commands gear). */
   onNewCommand?: () => void;
+  /**
+   * Open the command manager ON ONE COMMAND (by template id) — the row-level `…` ▸ Details.
+   * Passed straight through to the runtime tree, which owns the row.
+   */
+  onOpenCommandDetails?: (commandId: string) => void;
   /**
    * Open the RENAME dialog for this workspace (`rename_workspace`). Never reached on a ROOT
    * workspace: the kebab that would offer it is not rendered there at all.
@@ -234,6 +240,7 @@ export function WorkspaceAccordion({
             snapshot={snapshot}
             onNewTerminal={onNewTerminal}
             onNewCommand={onNewCommand}
+            onOpenCommandDetails={onOpenCommandDetails}
             // The live agent-activity lookup (review T2) — the SAME `byActivity` map that feeds
             // this accordion's rollup dot, threaded to each terminal LINE so a hosted agent shows
             // its working/waiting/ready dot on the line, not just at the rollup.

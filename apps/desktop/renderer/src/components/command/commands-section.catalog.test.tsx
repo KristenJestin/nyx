@@ -128,6 +128,7 @@ function template(over: Partial<ManagedCommand>): ManagedCommand {
     source_script_name: null,
     source_script_command_snapshot: null,
     package_manager: null,
+    description: null,
     ...over,
   };
 }
@@ -629,9 +630,9 @@ describe("the catalogue tells WAITING apart from EMPTY", () => {
     // The read lands EMPTY: NOW the absence is a fact, and the screen may say so.
     release([]);
     await waitFor(() => {
-      expect(
-        container.querySelector("[data-command-list-status]")?.textContent,
-      ).toContain("No commands yet");
+      expect(container.querySelector("[data-command-list-status]")?.textContent).toContain(
+        "No commands yet",
+      );
     });
     expect(container.querySelector("[data-command-count]")?.textContent).toBe("0");
   });

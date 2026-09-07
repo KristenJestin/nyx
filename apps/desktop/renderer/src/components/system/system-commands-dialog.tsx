@@ -9,6 +9,12 @@ export interface SystemCommandsDialogProps {
   projectId: string | null;
   /** The ABSOLUTE home — the workspace path the command form's folder picker relativizes against. */
   home: string | null;
+  /**
+   * WHICH command the modal opens on (a command TEMPLATE id), or `null`/omitted for the catalogue
+   * summary. The Système page's per-command "Details" passes it: this scope's rows get the same
+   * door onto their own definition as a project's, and it is literally the same one.
+   */
+  initialCommandId?: string | null;
   /** Dismiss (Close / backdrop / Escape). */
   onClose: () => void;
 }
@@ -68,6 +74,7 @@ export function SystemCommandsDialog({
   open,
   projectId,
   home,
+  initialCommandId,
   onClose,
 }: SystemCommandsDialogProps) {
   return (
@@ -75,6 +82,7 @@ export function SystemCommandsDialog({
       open={open}
       projectId={projectId}
       projectName="System"
+      initialCommandId={initialCommandId}
       // The scope's own name for the modal — the header says it once, so no muted subject repeats
       // it an inch to the right. It is also the stem of `Close system commands`.
       title="System commands"

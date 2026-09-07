@@ -81,6 +81,19 @@ export interface WorkspaceRuntimeService {
   readonly workspace_id: string;
   readonly name: string;
   readonly command: string;
+  /**
+   * The template's optional run subfolder, relative to the workspace (`null` = the workspace root).
+   * Already on the wire (`InstanceWithTemplate`, flattened into `WorkspaceService`); named here
+   * because the sidebar row shows it on hover — WHERE a command runs is half of what "is this the
+   * one I mean" asks, and the row itself has only a name.
+   */
+  readonly subfolder: string | null;
+  /**
+   * The template's NOTE FOR THE AGENT (`null` = none) — when and why to run this command. On the
+   * wire for the same reason as `subfolder`, and shown in the same hover: the sentence the user
+   * wrote for the agent is also the best answer a human gets to "what is this command for".
+   */
+  readonly description: string | null;
   /** The FACTUAL current run state (live-runner overlay, else persisted). */
   readonly run_state: ExecState;
   readonly exit_code: number | null;

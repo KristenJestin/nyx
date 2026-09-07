@@ -1043,6 +1043,18 @@ export type BackendCommand =
   | "projects_reorder"
   | "set_project_collapsed"
   | "set_project_resume_agent_sessions"
+  // `set_project_key` — `{ id, key }` → the UPDATED project row. The KEY is the prefix every Spec
+  // of the project is referenced by (`NYX-42` is Spec 42 of the project keyed `NYX`). It was
+  // derived from the name at creation and unwritable afterwards; this route opens it, and it is
+  // the SAME `db::set_project_key` verb the MCP `set_project_settings` enters through — so the
+  // shape rule (2–10 characters, an uppercase letter then uppercase letters or digits) and the
+  // uniqueness rule are stated once, in the domain, for both surfaces.
+  //
+  // IT REJECTS, and the rejection is the point: a malformed or already-taken key comes back as an
+  // Err carrying the domain's own sentence, which the settings field prints under the input. A
+  // caller that swallowed it would leave a project whose Specs keep answering to the old prefix
+  // while the form says it saved.
+  | "set_project_key"
   // THE PROJECT'S VISUAL IDENTITY, written by a HUMAN. Both call the very writes the MCP tool
   // `set_project_settings` calls, so the agent surface and the settings modal converge on one
   // code path — nyx does not gain a second way to dress a project.

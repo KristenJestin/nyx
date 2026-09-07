@@ -48,6 +48,7 @@ function instance(overrides: Partial<InstanceWithTemplate>): InstanceWithTemplat
     group_id: null,
     workspace_path: "/p",
     cwd: "/p",
+    description: null,
     ...overrides,
   };
 }
@@ -60,6 +61,7 @@ const tree: ProjectTree[] = [
       collapsed: false,
       created_at: 0,
       updated_at: 0,
+      key: "P",
       resume_agent_sessions: false,
     },
     workspaces: [

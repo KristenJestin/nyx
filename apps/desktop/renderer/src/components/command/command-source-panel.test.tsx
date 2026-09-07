@@ -20,6 +20,7 @@ function cmd(over: Partial<ManagedCommand>): ManagedCommand {
     source_script_name: "dev",
     source_script_command_snapshot: "vite --host",
     package_manager: "pnpm",
+    description: null,
     ...over,
   };
 }

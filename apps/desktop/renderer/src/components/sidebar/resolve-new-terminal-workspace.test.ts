@@ -48,6 +48,8 @@ function tree(workspaces: WorkspaceRecord[]): ProjectTree {
     collapsed: false,
     created_at: 0,
     updated_at: 0,
+    key: "P",
+
     resume_agent_sessions: false,
   };
   return { project, workspaces };

@@ -1412,13 +1412,28 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                             echoed.",
         })
     };
+    // The NOTE FOR THE AGENT on a command TEMPLATE — the human's sentence about WHEN and WHY to run
+    // it. Shared by add_command and update_command so the two say the same thing about the same
+    // column, and so the "null erases it" rule is written once.
+    let command_description_prop = || {
+        json!({
+            "type": "string",
+            "description": "optional NOTE FOR YOU, written by the user: when and why to run this \
+                            command — what `command` and `subfolder` cannot say (that `check` is \
+                            the suite to replay before concluding, that `db` is shared and must not \
+                            be restarted, …). You are shown it in two places: an abridged line \
+                            under the command in the session's opening context, and in FULL as the \
+                            `description` field of list_commands / list_system_commands. Pass null \
+                            (or an empty string) to ERASE it; omit it to leave it untouched.",
+        })
+    };
     // Agent-facing one-liner per v1 tool: WHEN/WHY to use it, in plain terms. These
     // mirror the order of [`V1_TOOLS`].
     let description = |name: &str| -> &'static str {
         match name {
             "list_projects" => "List the user's projects in nyx. Start here to discover what the user is working on; each project groups one or more workspaces (folders on disk).",
             "list_workspaces" => "List the workspaces (on-disk folders) inside a project. Use after list_projects to find the workspace you want to inspect or run commands in.",
-            "list_commands" => "List the development commands for a workspace (or the command templates for a project). Use the workspace form to get each command's `instance_id` — the id you pass to start/stop/relaunch/get_command_output. The project form returns reusable templates that are NOT launchable on their own, PLUS the project's command `groups` (id, name, color, `layout_shape`, and `command_ids` in disposition order); every command carries its `group_id` (null = solo). A `group_id` + a `workspace_id` is also what start/stop/relaunch_command take to drive a WHOLE group at once. This is the read-only way to inspect the grouping manage_command_group edits — no write needed.",
+            "list_commands" => "List the development commands for a workspace (or the command templates for a project). Use the workspace form to get each command's `instance_id` — the id you pass to start/stop/relaunch/get_command_output. The project form returns reusable templates that are NOT launchable on their own, PLUS the project's command `groups` (id, name, color, `layout_shape`, and `command_ids` in disposition order); every command carries its `group_id` (null = solo). Both forms also carry `description` — the user's NOTE saying when and why to run that command, in full (the session's opening context shows an abridged version); null when there is none. A `group_id` + a `workspace_id` is also what start/stop/relaunch_command take to drive a WHOLE group at once. This is the read-only way to inspect the grouping manage_command_group edits — no write needed.",
             "start_command" => "Start a managed command (e.g. a dev server, build watcher, or test run) so nyx supervises it and captures its output. Identify it by `instance_id` from list_commands, or by `name` within a `workspace_id`. Starting an already-running command is a no-op (it does NOT launch a second process): the result reports `was_running:true, restarted:false` so you can tell — use relaunch_command to actually restart. Pass an optional `env` map (KEY→VALUE strings, e.g. {\"VAULT_ENV\":\"dev\"}) to add environment variables for this run, merged onto the inherited environment. After starting, read its output with get_command_output to see logs, errors, or a server URL. WHOLE GROUP: pass `group_id` (from list_commands(project_id=…) `groups`) together with `workspace_id` INSTEAD of an instance, and every member of that multi-pane group is started in that workspace — but ONLY the members that are not already running; a member already up is left strictly alone, neither restarted nor interrupted. The result is then `{ group_id, workspace_id, action, members[], running, total }`, one entry per member with its own status plus `was_running`/`acted`/`error`, and `running`/`total` as the group's aggregate. This is the exact same operation the user performs with the group's play button.",
             "stop_command" => "Stop a running managed command. Identify it by its `instance_id` from list_commands. The result reports `changed` (whether a live process was actually stopped) and `was_running`, so a stop on an already-idle command is a clear no-op rather than a false success. WHOLE GROUP: pass `group_id` together with `workspace_id` INSTEAD of `instance_id` to stop EVERY member of a multi-pane command group in that workspace (idempotent on the members already idle); the result is then the group shape `{ group_id, workspace_id, action, members[], running, total }`.",
             "relaunch_command" => "Restart a managed command in place (stop then start the same instance) — useful after a config or code change. This ALWAYS restarts (unlike start_command, which no-ops on a running command); the result reports `restarted:true`. Identify it by its `instance_id` from list_commands. Pass an optional `env` map (KEY→VALUE strings) to set environment variables for the fresh run, merged onto the inherited environment. WHOLE GROUP: pass `group_id` together with `workspace_id` INSTEAD of `instance_id` to restart a whole multi-pane command group in that workspace — the ACTIVE members are re-spawned and the INACTIVE ones are started, so the group ends fully active. All members are decided from one snapshot taken before anything runs (simultaneous, not one-after-another); the result is the group shape `{ group_id, workspace_id, action, members[], running, total }`.",
@@ -1602,7 +1617,8 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
     descriptors.push(json!({
         "name": ADD_COMMAND_TOOL,
         "description": "Create a per-project command TEMPLATE (name + command line, \
-                        optional run subfolder, optional persistent environment), via the \
+                        optional run subfolder, optional persistent environment, optional \
+                        note), via the \
                         SAME path as the UI's command_create — one instance is materialized \
                         per existing workspace of the project. A command line that is itself \
                         a package manager invocation (`pnpm dev`, …) has its provenance \
@@ -1623,6 +1639,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                 "command": str_prop("the command line to run"),
                 "subfolder": str_prop("optional run path relative to EACH workspace (default: workspace root). A run-path, NOT a scope: the template is materialized into every workspace and this subfolder is appended even if it does not exist there"),
                 "env": command_env_prop(),
+                "description": command_description_prop(),
             },
             "required": ["project_id", "name", "command"],
         },
@@ -1630,10 +1647,11 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
     descriptors.push(json!({
         "name": UPDATE_COMMAND_TOOL,
         "description": "Modify an existing command TEMPLATE's editable fields (name, \
-                        command, subfolder, env), via the SAME path as the UI's \
+                        command, subfolder, env, description), via the SAME path as the UI's \
                         command_update. Only the fields supplied are changed; omitted fields \
                         keep their current value (pass subfolder:\"\" to clear it, env:{} or \
-                        env:null to clear the stored environment). Editing the command \
+                        env:null to clear the stored environment, description:null to erase \
+                        the note). Editing the command \
                         of a package.json-linked template away from its canonical call \
                         DETACHES the source (same rule as the UI). Refused while any of the \
                         template's instances is running (invalid_state).",
@@ -1645,6 +1663,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                 "command": str_prop("new command line (optional; unchanged if omitted)"),
                 "subfolder": str_prop("new run subfolder (optional; unchanged if omitted; empty string clears it to the workspace root)"),
                 "env": command_env_prop(),
+                "description": command_description_prop(),
             },
             "required": ["command_id"],
         },
@@ -1736,7 +1755,8 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
     descriptors.push(json!({
         "name": SET_PROJECT_SETTINGS_TOOL,
         "description": "Change an EXISTING project's settings, via the SAME path as the \
-                        UI's project-settings modal. You can rename it (`name`), give it a \
+                        UI's project-settings modal. You can rename it (`name`), change the \
+                        KEY its Specs are referenced by (`key`), give it a \
                         visual identity (`accent` plus `icon` OR `image`) and/or \
                         turn its agent-session resume on/off (`resume_agent_sessions`): \
                         when on, nyx re-attaches that project's terminals' active agent \
@@ -1751,6 +1771,16 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             "properties": {
                 "project_id": str_prop("project to modify (the project id from list_projects)"),
                 "name": str_prop("new display name (optional; unchanged if omitted; must be non-blank)"),
+                "key": str_prop(
+                    "optional; the project's KEY — the prefix every Spec of this project is \
+                     referenced by (NYX-42 is Spec 42 of the project keyed NYX). 2 to 10 \
+                     characters: an uppercase letter, then uppercase letters or digits. It must \
+                     be free: another project already using it is invalid_argument. CHANGING IT \
+                     RE-KEYS EVERY EXISTING SPEC AT ONCE — the reference is derived, not stored, \
+                     so NYX-12 becomes <new>-12 and any NYX-12 written down elsewhere stops \
+                     resolving. Ask the user before changing it on a project that has Specs. \
+                     Unchanged if omitted.",
+                ),
                 "resume_agent_sessions": json!({
                     "type": "boolean",
                     "description": "optional; when true, resume this project's active agent \

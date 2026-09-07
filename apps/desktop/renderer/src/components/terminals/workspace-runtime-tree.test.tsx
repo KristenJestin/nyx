@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { emit, mockIPC } from "@/bridge/test-harness";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 
 import type { AgentActivity } from "@/components/sidebar/use-agent-sessions";
 import { TerminalStatsProvider } from "@/components/sidebar/use-terminal-stats";
@@ -10,6 +10,7 @@ import { ConsumedNotificationsProvider } from "./use-consumed-notifications";
 import { TerminalCloseProvider } from "./use-terminal-close";
 import { WorkspaceRuntimeTree } from "./workspace-runtime-tree";
 import type {
+  WorkspaceRuntimeService,
   WorkspaceRuntimeSession,
   WorkspaceRuntimeSnapshot,
   WorkspaceRuntimeTerminal,
@@ -132,6 +133,8 @@ describe("WorkspaceRuntimeTree", () => {
             workspace_id: "ws1",
             name: "dev-server",
             command: "npm run dev",
+            subfolder: null,
+            description: null,
             run_state: "running",
             exit_code: null,
             unread: false,
@@ -226,6 +229,8 @@ describe("WorkspaceRuntimeTree — notification dots (finding 53)", () => {
             workspace_id: "ws1",
             name: "build",
             command: "npm run build",
+            subfolder: null,
+            description: null,
             run_state: "error",
             exit_code: 1,
             unread: true,
@@ -581,5 +586,195 @@ describe("WorkspaceRuntimeTree — per-terminal CPU%/RAM is NON-inline (tooltip,
     fireEvent.mouseEnter(trigger);
     expect(screen.queryByText(/CPU/)).toBeNull();
     expect(screen.getByText("quiet")).toBeTruthy();
+  });
+});
+
+/**
+ * A managed-command service row fixture — the shape the runtime snapshot hands the sidebar.
+ * `subfolder` and `description` are the two joined template fields the row reads on hover.
+ */
+function service(overrides: Partial<WorkspaceRuntimeService> = {}): WorkspaceRuntimeService {
+  return {
+    id: "s1",
+    command_id: "c1",
+    workspace_id: "ws1",
+    name: "check",
+    command: "bun run check",
+    subfolder: null,
+    description: null,
+    run_state: "idle",
+    exit_code: null,
+    unread: false,
+    ...overrides,
+  };
+}
+
+/**
+ * THE ROW'S DOOR ONTO ITS OWN DEFINITION — the `…` ▸ Details, and the hover that says what the
+ * command IS before the user opens anything.
+ *
+ * Both exist because a command row is a NAME and a DOT: two commands called `dev` in two
+ * workspaces look identical, and until now the only way to see what one ran was to open Project
+ * settings and find the line again by hand. The menu ROUTES to that screen (it edits nothing —
+ * see `<ServiceRow>` on why this is not the kebab review 01M11XMQA3M852JDD7R3MDG88X refused), and
+ * it hands over the TEMPLATE id, which is what the modal selects.
+ */
+/** Hover a row by its label — the three events Base UI's rest-based hover needs to open. */
+function hover(label: string) {
+  const trigger = screen.getByText(label).closest("button") as HTMLElement;
+  fireEvent.pointerEnter(trigger);
+  fireEvent.mouseEnter(trigger);
+  fireEvent.mouseMove(trigger);
+}
+
+describe("WorkspaceRuntimeTree — a command's details", () => {
+  it("opens the command manager on THIS command, by template id", async () => {
+    const opened: string[] = [];
+    render(
+      <RuntimeSelectionProvider initialSelection={null}>
+        <ConsumedNotificationsProvider>
+          <WorkspaceRuntimeTree
+            snapshot={snapshot({
+              services: [service({ name: "dev-server", command_id: "tpl-7" })],
+            })}
+            onOpenCommandDetails={(id) => opened.push(id)}
+          />
+        </ConsumedNotificationsProvider>
+      </RuntimeSelectionProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Actions for dev-server" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /details/i }));
+
+    // The TEMPLATE id, not the instance id (`s1`): the modal edits the project-level command.
+    expect(opened).toEqual(["tpl-7"]);
+  });
+
+  it("carries no menu at all where no caller wired the door", () => {
+    renderTree(snapshot({ services: [service({ name: "dev-server" })] }));
+    expect(screen.queryByRole("button", { name: "Actions for dev-server" })).toBeNull();
+  });
+
+  it("shows the command line, the subfolder and the note on hover", async () => {
+    renderTree(
+      snapshot({
+        services: [
+          service({
+            name: "api",
+            command: "bun run api",
+            subfolder: "packages/api",
+            description: "Needed by the web app — start it first.",
+          }),
+        ],
+      }),
+    );
+
+    hover("api");
+
+    // Base UI opens on the pointer coming to REST, so the wait is generous — the same shape the
+    // CPU/RAM tooltip specs above use.
+    await waitFor(() => expect(screen.getByText("bun run api")).toBeTruthy(), { timeout: 2000 });
+    expect(screen.getByText("packages/api")).toBeTruthy();
+    expect(screen.getByText("Needed by the web app — start it first.")).toBeTruthy();
+  });
+
+  it("says nothing about a subfolder or a note that do not exist", async () => {
+    renderTree(snapshot({ services: [service({ name: "api", command: "bun run api" })] }));
+
+    hover("api");
+
+    // The command line is there — the hover exists — and the two optional lines are absent rather
+    // than rendered empty: a line saying "the default" is noise, and an empty bullet says a note
+    // exists when none does.
+    const tip = await waitFor(() => screen.getByText("bun run api"), { timeout: 2000 });
+    expect(tip.parentElement?.textContent).toBe("bun run api");
+  });
+});
+
+/**
+ * THE TWO BANDS FOLD, AND THE FOLD SURVIVES A RELOAD.
+ *
+ * Finding 01KV63TD5E… was about ALIGNMENT — one band behaving unlike its neighbour — and the first
+ * answer aligned them by removing the fold. This is the other answer to the same requirement: both
+ * bands fold, through the one `<RuntimeSection>`, so there is no per-band behaviour left to
+ * diverge. What is asserted here is therefore SYMMETRY (each has a toggle) plus INDEPENDENCE
+ * (folding one leaves the other alone) plus the memory.
+ */
+describe("WorkspaceRuntimeTree — the bands fold", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  const snap = () =>
+    snapshot({
+      terminals: [terminal({ id: "t1", label: "shell" })],
+      services: [service({ name: "check" })],
+    });
+
+  it("both bands carry a toggle, and each one folds ONLY its own rows", async () => {
+    renderTree(snap());
+    expect(screen.getByText("shell")).toBeTruthy();
+    expect(screen.getByText("check")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Toggle terminals" }));
+
+    // The terminal row leaves (the reveal is presence-animated, so it goes on the exit)…
+    await waitFor(() => expect(screen.queryByText("shell")).toBeNull());
+    // …and the Commands band is untouched: two bands, two independent folds.
+    expect(screen.getByText("check")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Toggle terminals" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.getByRole("button", { name: "Toggle commands" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+  });
+
+  it("a closed band still says how much it is hiding", async () => {
+    renderTree(snap());
+    fireEvent.click(screen.getByRole("button", { name: "Toggle commands" }));
+    await waitFor(() => expect(screen.queryByText("check")).toBeNull());
+    // The count pill stays: a band that hid what it holds AND how much it holds would be a band
+    // nobody reopens.
+    const header = screen.getByRole("button", { name: "Toggle commands" }).parentElement;
+    expect(header?.textContent).toContain("1");
+  });
+
+  it("remembers the fold per workspace and per band, across a remount", async () => {
+    const first = renderTree(snap());
+    fireEvent.click(screen.getByRole("button", { name: "Toggle commands" }));
+    await waitFor(() => expect(screen.queryByText("check")).toBeNull());
+    first.unmount();
+
+    // A REMOUNT is what a reload is to this component — it re-reads the stored preference.
+    renderTree(snap());
+    expect(screen.getByRole("button", { name: "Toggle commands" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.queryByText("check")).toBeNull();
+    // The band nobody folded stays open — the memory is per band, not per tree.
+    expect(screen.getByText("shell")).toBeTruthy();
+
+    // …and it is per WORKSPACE: another workspace's identical bands start open.
+    first.unmount();
+    render(
+      <RuntimeSelectionProvider initialSelection={null}>
+        <ConsumedNotificationsProvider>
+          <WorkspaceRuntimeTree
+            snapshot={{
+              ...snap(),
+              workspace: { id: "ws2", name: "other", path: "/other" },
+            }}
+          />
+        </ConsumedNotificationsProvider>
+      </RuntimeSelectionProvider>,
+    );
+    expect(screen.getAllByRole("button", { name: "Toggle commands" }).at(-1)).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
   });
 });

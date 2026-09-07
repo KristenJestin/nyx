@@ -1048,6 +1048,29 @@ impl Ctx<'_> {
                     .map_err(Self::db_err)?;
                 Ok("null".to_string())
             }
+            // THE PROJECT'S KEY — the prefix its Specs are referenced by (`NYX-42`). A route of its
+            // own rather than a second argument on `update_project`, because it is the only project
+            // field with REFUSALS of its own (a shape and a uniqueness), and those refusals have to
+            // reach the form as sentences it can print next to the field. `db::set_project_key` is
+            // the shared verb; the MCP `set_project_settings` enters through the very same one, so
+            // the hand and the agent cannot disagree on what a valid key is.
+            //
+            // The reply is the UPDATED project, not `null`: the caller repaints a tile that shows
+            // the key, and re-reading it would be a second round-trip for a value just written.
+            "set_project_key" => {
+                let id = self.arg_str("id")?;
+                let key = self.arg_str("key")?;
+                self.db()
+                    .with_conn(|c| db::set_project_key(c, &id, key.trim()))
+                    // The domain's OWN sentence, VERBATIM and unprefixed — the same shape
+                    // `scope_err` uses, and for a stronger reason: this text is PRINTED UNDER THE
+                    // INPUT, so a `set_project_key: ` in front of it would be route plumbing shown
+                    // to a human who asked for a key. Observed on the real app before it was
+                    // removed. (`Self::db_err`'s "db error: " prefix is right for its own case: an
+                    // internal failure nobody can act on says where it came from.)
+                    .map_err(|e| e.to_string())
+                    .and_then(|project| Self::json(&project))
+            }
             "delete_project" => {
                 let id = self.arg_str("id")?;
                 // RUNTIME kill owned by the bridge — the SAME pattern as `workspace_delete`
@@ -2136,6 +2159,11 @@ impl Ctx<'_> {
                 let source_script_command_snapshot =
                     self.arg_opt_str("sourceScriptCommandSnapshot");
                 let package_manager = self.arg_opt_str("packageManager");
+                // THE NOTE FOR THE AGENT — the human's sentence about when and why to run this
+                // command. A creation has nothing to leave alone, so absent and null both mean
+                // "no note", which is what the fresh row already holds; the setter turns a blank
+                // one into NULL as well.
+                let description = self.arg_opt_str("description");
                 let (source_kind, package_manager) =
                     nyx_core::pkgjson::infer_command_source(&command, source_kind, package_manager);
                 let source = db::CommandSource {
@@ -2158,6 +2186,13 @@ impl Ctx<'_> {
                         if restart_on_startup == Some(true) {
                             db::set_restart_on_startup(c, &created.id, true)?;
                         }
+                        if description.is_some() {
+                            db::set_template_description(
+                                c,
+                                &created.id,
+                                description.as_deref(),
+                            )?;
+                        }
                         db::get_template(c, &created.id).map(|t| t.unwrap_or(created))
                     })
                     .map_err(Self::db_err)
@@ -2169,6 +2204,13 @@ impl Ctx<'_> {
                 let command = self.arg_str("command")?;
                 let subfolder = self.arg_opt_str("subfolder");
                 let restart_on_startup = self.arg_opt_bool("restartOnStartup");
+                // TRISTATE, like `set_project_accent`'s accent and unlike `subfolder` above: an
+                // EMPTY note is a value, not a silence. `null` ERASES the note, a string sets it,
+                // and an ABSENT key leaves whatever is stored alone — the same three answers the
+                // MCP `update_command` gives, so the hand and the agent cannot mean two different
+                // things by the same request.
+                let description =
+                    self.arg_tristate("description", |v| v.as_str().map(|s| s.to_string()))?;
                 self.guard_template_not_running(&id)?;
                 self.db()
                     .with_conn(|c| {
@@ -2184,6 +2226,9 @@ impl Ctx<'_> {
                         }
                         if let Some(flag) = restart_on_startup {
                             db::set_restart_on_startup(c, &id, flag)?;
+                        }
+                        if let Some(note) = description.as_ref() {
+                            db::set_template_description(c, &id, note.as_deref())?;
                         }
                         Ok::<_, diesel::result::Error>(())
                     })
@@ -4429,6 +4474,10 @@ fn mutates_workspace_tree(command: &str) -> bool {
 /// likewise has NO use case emitting a domain event (it calls `db::delete_project` directly),
 /// so its push stays on this legacy broadcast until it is migrated to a use case.
 ///
+/// `set_project_key` joins them on that same reasoning taken one step further: the key is not only
+/// worn by the project tile, it is the PREFIX every Spec reference is rendered from, so a surface
+/// holding a stale tree would keep printing `NYX-12` for a project that has just become `WEB`.
+///
 /// `set_project_accent` / `set_project_mark` are here for the SAME reason the MCP twin
 /// (`set_project_settings`) emits `ChangedTopic::Workspaces`: the identity a project wears is
 /// read from the project tree, and `useProjects` holds ONE tree PER HOOK INSTANCE (the rail's
@@ -4442,7 +4491,11 @@ fn mutates_workspace_tree(command: &str) -> bool {
 fn pushes_workspace_tree_legacy(command: &str) -> bool {
     matches!(
         command,
-        "delete_project" | "projects_reorder" | "set_project_accent" | "set_project_mark"
+        "delete_project"
+            | "projects_reorder"
+            | "set_project_accent"
+            | "set_project_mark"
+            | "set_project_key"
     )
 }
 
@@ -4639,6 +4692,55 @@ mod tests {
             .expect("the project exists")
     }
 
+    /// THE HUMAN CAN NOW RE-KEY A PROJECT. `set_project_key` is the UI's half of what the MCP
+    /// `set_project_settings { key }` does, over the same `db::set_project_key` verb — and the
+    /// route hands back the UPDATED row rather than `null`, because the caller repaints every Spec
+    /// reference from it and a second read would be a round-trip for a value just written.
+    ///
+    /// The refusals are asserted through the DISPATCH, not through the domain function they come
+    /// from, because what has to hold here is that they reach the transport as an `Err` carrying a
+    /// readable sentence. A route that swallowed them and answered `null` would type-check, pass
+    /// the domain's own tests, and leave the settings form saying it saved.
+    #[test]
+    fn set_project_key_writes_the_key_and_surfaces_its_refusals() {
+        let h = Harness::new();
+        let alpha = a_project(&h, "key-alpha");
+        let beta = a_project(&h, "key-beta");
+
+        let out = h
+            .run("set_project_key", serde_json::json!({ "id": alpha, "key": "NYX" }))
+            .expect("a free, well-formed key");
+        let row: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(row["key"], serde_json::json!("NYX"), "the route answers the updated project");
+        assert_eq!(stored(&h, &alpha).key, "NYX");
+
+        // MALFORMED — the sentence states the shape.
+        let err = h
+            .run("set_project_key", serde_json::json!({ "id": alpha, "key": "nyx" }))
+            .expect_err("lowercase is not a key");
+        assert!(
+            err.contains("uppercase"),
+            "the refusal must state the shape, got: {err}"
+        );
+        assert_eq!(stored(&h, &alpha).key, "NYX", "a refused key writes nothing");
+
+        // TAKEN — a different sentence, because it calls for a different correction.
+        let err = h
+            .run("set_project_key", serde_json::json!({ "id": beta, "key": "NYX" }))
+            .expect_err("another project holds it");
+        assert!(
+            err.contains("already uses"),
+            "the refusal must say the key is taken, got: {err}"
+        );
+        // …and it says ONLY that. The settings field prints this text under the input, so a
+        // `set_project_key: ` prefix would be route plumbing shown to a human — it was, once.
+        assert!(
+            !err.contains("set_project_key"),
+            "the refusal is the domain's sentence, not the route's, got: {err}"
+        );
+        assert_ne!(stored(&h, &beta).key, "NYX");
+    }
+
     /// THE HUMAN CAN NOW DRESS A PROJECT. `set_project_accent` is the UI's half of what the MCP
     /// tool `set_project_settings` already did, over the same `db::set_project_accent` write.
     ///
@@ -4827,6 +4929,9 @@ mod tests {
         let forbidden: Vec<(&str, serde_json::Value)> = vec![
             // project lifecycle + settings
             ("update_project", serde_json::json!({ "id": pid, "name": "hack" })),
+            // The KEY is a project SETTING like the name, and the singleton holds no Spec to key —
+            // it is refused by the same allow-list, not by a rule of its own.
+            ("set_project_key", serde_json::json!({ "id": pid, "key": "SYS" })),
             ("delete_project", serde_json::json!({ "id": pid })),
             ("set_project_collapsed", serde_json::json!({ "id": pid, "collapsed": true })),
             (

@@ -134,6 +134,56 @@ describe("<ProjectSettingsDialog> — section rail", () => {
     expect(screen.queryByLabelText("Project name")).toBeNull();
   });
 
+  /**
+   * THE THIRD ENTRY POINT — a sidebar command row's `…` ▸ Details opens this modal ON that command,
+   * not on the catalogue summary. Without the seed the user, who was pointing AT the line, would
+   * land on the summary and have to find it again in the list beside it.
+   */
+  it("opens the Commands section ON a command when one is named", async () => {
+    mockIPC(
+      (cmd) => {
+        switch (cmd) {
+          case "command_list":
+            return [
+              {
+                id: "c1",
+                project_id: "p1",
+                name: "check",
+                command: "bun run check",
+                subfolder: null,
+                restart_on_startup: false,
+                order_index: 0,
+                created_at: 0,
+                updated_at: 0,
+                source_kind: null,
+                source_package_json_path: null,
+                source_script_name: null,
+                source_script_command_snapshot: null,
+                package_manager: null,
+                description: "The gate before any commit.",
+              },
+            ];
+          default:
+            return [];
+        }
+      },
+      { shouldMockEvents: true },
+    );
+    render(
+      <ProjectSettingsDialog {...baseProps()} initialSection="commands" initialCommandId="c1" />,
+    );
+
+    // The detail panel is on a COMMAND (not the summary), and it is the one that was named: its
+    // form is seeded from that command's stored fields.
+    await waitFor(() =>
+      expect(document.querySelector('[data-command-detail="command"]')).not.toBeNull(),
+    );
+    expect((screen.getByLabelText("Command line") as HTMLInputElement).value).toBe("bun run check");
+    expect((screen.getByLabelText("Note for the agent") as HTMLTextAreaElement).value).toBe(
+      "The gate before any commit.",
+    );
+  });
+
   it("navigates between Global and Commands via the rail", async () => {
     render(<ProjectSettingsDialog {...baseProps()} initialSection="global" />);
     const rail = screen.getByRole("navigation", { name: "Project settings sections" });

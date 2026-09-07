@@ -23,20 +23,26 @@ export interface SidebarSectionProps {
 }
 
 /**
- * `<SidebarSection>` — the SHARED, NON-collapsible typed band used by both the
- * TERMINALS and COMMANDS subsections (finding 01KV63TD5E…). Both bands are now the
- * SAME shape: a quiet uppercase title (PLAIN text — there is NO chevron and NO
- * collapse: the title is not a toggle button) plus ONE hover-revealed action icon at
- * the right edge, over the section body.
+ * `<SidebarSection>` — the SHARED, non-collapsible typed band of the LEGACY sidebar spine
+ * (`sidebar/workspace-subsections.tsx`): a quiet uppercase title plus ONE hover-revealed action
+ * icon at the right edge, over the section body.
  *
- * Before this, TERMINALS was non-collapsible but COMMANDS carried a chevron +
- * `<CollapsibleSection>` — the inconsistency the finding called out. Folding both
- * onto this component removes the COMMANDS chevron and gives it a hover action (the
- * gear that opens the manage-commands modal), mirroring TERMINALS' `+`.
+ * ## WHAT FINDING 01KV63TD5E… ASKED FOR, AND WHERE IT NOW LIVES
  *
- * The action reveals on `group-hover/sub` (matching the `group/sub` on the header
- * row), exactly as the old per-band `+` did, so both bands surface their action the
- * same way.
+ * The finding was about ALIGNMENT: TERMINALS was non-collapsible while COMMANDS carried a chevron
+ * and a `<CollapsibleSection>`, and one band behaving unlike its neighbour is what it called out.
+ * This component was the first answer — align them by taking the fold AWAY, so neither band has
+ * one.
+ *
+ * The bands of the CURRENT tree took the other answer: `terminals/runtime-section.tsx` gives BOTH
+ * of them the fold, through one component, with the state remembered per workspace and per band.
+ * The requirement is the same and it is met the same way — one shape for both — so nothing here
+ * needs changing; what changed is which of the two alignments the product wanted. Read this
+ * paragraph before "fixing" either file to match the other: they are not in disagreement, they are
+ * two different surfaces, and only one of them is the tree the app renders today.
+ *
+ * The action reveals on `group-hover/sub` (matching the `group/sub` on the header row), exactly as
+ * the old per-band `+` did, so both bands surface their action the same way.
  */
 export function SidebarSection({ title, action, children }: SidebarSectionProps) {
   return (

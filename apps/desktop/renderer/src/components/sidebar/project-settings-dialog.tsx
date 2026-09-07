@@ -4,6 +4,7 @@ import { SettingsIcon, SlidersHorizontalIcon, TagIcon, TerminalSquareIcon } from
 import { cn } from "@/lib/utils";
 import { Dialog, DialogBackdrop, DialogCloseX, DialogPopup } from "@/components/ui/dialog";
 import { CommandsSection } from "@/components/command/commands-section";
+import { NO_SELECTION } from "@/components/command/commands-selection";
 import { CategoriesSection } from "./categories-section";
 import { GlobalSection, type GlobalSectionIdentity } from "./global-section";
 
@@ -54,8 +55,19 @@ export interface ProjectSettingsGlobalPane {
    * a human can dress a project.
    */
   identity: GlobalSectionIdentity;
+  /**
+   * The project's KEY — the prefix every Spec of the project is referenced by (`NYX-42`).
+   * OPTIONAL, and its absence (or `onKeyChange`'s) DROPS the field: the same "no wiring, no
+   * control" rule the rail applies to a whole section, applied to one row of a pane.
+   */
+  projectKey?: string;
   /** Persist a project rename. */
   onRename: (name: string) => Promise<void>;
+  /**
+   * Persist a KEY change. REJECTS with the backend's own sentence (a malformed key, or one another
+   * project already holds) — the field prints it under the input, so it must not be swallowed.
+   */
+  onKeyChange?: (key: string) => Promise<void>;
   /** Persist the resume-opt-in toggle. May return a promise so the section can toast the real
    *  reason on failure. */
   onResumeChange: (resume: boolean) => void | Promise<void>;
@@ -92,6 +104,16 @@ export interface ProjectSettingsDialogProps {
   workspacePath?: string | null;
   /** Which section to open on. Defaults to the FIRST section the caller wired. */
   initialSection?: ProjectSettingsSection;
+  /**
+   * WHICH COMMAND the Commands pane opens on — the command TEMPLATE id, or omitted for the
+   * catalogue summary.
+   *
+   * The sidebar's per-command "Details" is the entry point that needs it: it opens this modal from
+   * a line the user is already pointing at, and landing on the summary would ask them to find that
+   * line again in the list beside it. It is a SEED — once the screen is open, the selection is the
+   * user's.
+   */
+  initialCommandId?: string | null;
   /**
    * The modal's title — and the stem of its two accessible names (`Close <title>` on the header's
    * cross, `<title> sections` on the rail). Defaults to `"Project settings"`.
@@ -143,6 +165,7 @@ export function ProjectSettingsDialog({
   importWorkspaceId,
   workspacePath,
   initialSection,
+  initialCommandId,
   title = "Project settings",
   subject,
   icon: HeaderIcon = SettingsIcon,
@@ -253,8 +276,10 @@ export function ProjectSettingsDialog({
                 <GlobalSection
                   projectId={projectId}
                   projectName={projectName}
+                  projectKey={globalSection.projectKey}
                   resumeAgentSessions={globalSection.resumeAgentSessions}
                   onRename={globalSection.onRename}
+                  onKeyChange={globalSection.onKeyChange}
                   onResumeChange={globalSection.onResumeChange}
                   showRename={globalSection.showRename}
                   identity={globalSection.identity}
@@ -274,6 +299,9 @@ export function ProjectSettingsDialog({
                 projectName={projectName}
                 importWorkspaceId={importWorkspaceId}
                 workspacePath={workspacePath}
+                initialSelection={
+                  initialCommandId ? { kind: "command", id: initialCommandId } : NO_SELECTION
+                }
               />
             )}
           </div>

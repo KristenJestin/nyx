@@ -174,7 +174,10 @@ function SystemScopeLoaded({
   // The command MANAGER (create / import / edit / delete / group). Opened by the Commands section's
   // gear — the only composition surface of the scope, and the reason no project-settings modal is
   // mounted here at all.
-  const [commandsOpen, setCommandsOpen] = useState(false);
+  // `null` = closed. A STRING is the command the modal opens on (a template id), and the empty
+  // string is "open, on nothing" — the gear's own entry. One value for one modal with two doors,
+  // the same shape the project page's `settingsTarget` takes for the same reason.
+  const [commandsOpen, setCommandsOpen] = useState<string | null>(null);
 
   return (
     // ONE `terminal://stats` subscription for the page, outside the selection provider (same shape
@@ -187,15 +190,17 @@ function SystemScopeLoaded({
             snapshot={snapshot}
             deepLinkTerminalId={deepLinkTerminalId}
             deepLinkCommandId={deepLinkCommandId}
-            onOpenCommands={() => setCommandsOpen(true)}
+            onOpenCommands={() => setCommandsOpen("")}
+            onOpenCommandDetails={(commandId) => setCommandsOpen(commandId)}
           />
         </ConsumedNotificationsProvider>
       </RuntimeSelectionProvider>
       <SystemCommandsDialog
-        open={commandsOpen}
+        open={commandsOpen != null}
         projectId={scope.project.id}
         home={scope.home}
-        onClose={() => setCommandsOpen(false)}
+        initialCommandId={commandsOpen || null}
+        onClose={() => setCommandsOpen(null)}
       />
     </TerminalStatsProvider>
   );
@@ -213,6 +218,7 @@ function SystemScopeBody({
   deepLinkTerminalId,
   deepLinkCommandId,
   onOpenCommands,
+  onOpenCommandDetails,
 }: {
   scope: SystemScopeDetail;
   /** The Système workspace's live aggregate, or `null` until the first snapshot lands. */
@@ -223,6 +229,11 @@ function SystemScopeBody({
   deepLinkCommandId: string | null;
   /** Open the command manager (the Commands section's gear). */
   onOpenCommands: () => void;
+  /**
+   * Open the command manager ON ONE COMMAND (by template id) — a row's `…` ▸ Details. The scope's
+   * rows get the same door onto their own definition as a project's, through the same modal.
+   */
+  onOpenCommandDetails: (commandId: string) => void;
 }) {
   const { selected, select } = useRuntimeSelection();
   const { byActivity } = useAgentSessions();
@@ -463,6 +474,7 @@ function SystemScopeBody({
                         snapshot={snapshot}
                         onNewTerminal={() => void newTerminalInWorkspace(workspaceId, scope.home)}
                         onNewCommand={onOpenCommands}
+                        onOpenCommandDetails={onOpenCommandDetails}
                         agentActivity={(terminalId) => byActivity.get(terminalId)}
                         formatCwd={formatCwd}
                       />

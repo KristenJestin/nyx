@@ -20,6 +20,7 @@ function sourced(over: Partial<ManagedCommand> = {}): ManagedCommand {
     source_script_name: "build",
     source_script_command_snapshot: "tsc -b",
     package_manager: "bun",
+    description: null,
     ...over,
   };
 }
@@ -42,6 +43,7 @@ function template(over: Partial<ManagedCommand>): ManagedCommand {
     source_script_name: null,
     source_script_command_snapshot: null,
     package_manager: null,
+    description: null,
     ...over,
   };
 }
@@ -289,5 +291,79 @@ describe("<CommandForm> commit modes", () => {
     await waitFor(() =>
       expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ restart_on_startup: true })),
     );
+  });
+});
+
+/**
+ * THE NOTE FOR THE AGENT — the one field on this form whose reader is not the person filling it in.
+ *
+ * What is pinned here is the round trip a user actually performs: a note is typed and it is
+ * SUBMITTED (not silently dropped), a stored note SEEDS the field when the command is reopened
+ * (else editing anything else would look like the note was never saved), and emptying the field
+ * COMMITS the emptiness (`""` — which the mutation layer sends as `null`, erasing it). That last
+ * case is the one a naive "only submit non-empty values" guard would break, leaving a note the user
+ * deleted in every future session's context.
+ */
+describe("<CommandForm> note for the agent", () => {
+  it("submits the note typed on a creation", async () => {
+    const onSubmit = vi.fn<(v: CommandFormValues) => void>();
+    render(<CommandForm onSubmit={onSubmit} onCancel={vi.fn()} />);
+
+    fireEvent.change(screen.getByLabelText("Command name"), { target: { value: "check" } });
+    fireEvent.change(screen.getByLabelText("Command line"), { target: { value: "bun run check" } });
+    fireEvent.change(screen.getByLabelText("Note for the agent"), {
+      target: { value: "  The gate before any commit.  " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^create$/i }));
+
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith(
+        expect.objectContaining({ description: "The gate before any commit." }),
+      ),
+    );
+  });
+
+  it("seeds the field from the stored note when editing", () => {
+    render(
+      <CommandForm
+        editing={template({ description: "Slow — ask before starting it." })}
+        commit="blur"
+        onSubmit={vi.fn()}
+      />,
+    );
+    expect((screen.getByLabelText("Note for the agent") as HTMLTextAreaElement).value).toBe(
+      "Slow — ask before starting it.",
+    );
+  });
+
+  it("blur mode: emptying the note COMMITS the emptiness, so it can be erased", async () => {
+    const onSubmit = vi.fn<(v: CommandFormValues) => void>();
+    render(
+      <CommandForm
+        editing={template({ description: "Obsolete note." })}
+        commit="blur"
+        onSubmit={onSubmit}
+      />,
+    );
+    const field = screen.getByLabelText("Note for the agent");
+    fireEvent.change(field, { target: { value: "" } });
+    fireEvent.blur(field);
+
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ description: "" })),
+    );
+  });
+
+  it("blur mode: leaving the note untouched writes nothing", () => {
+    const onSubmit = vi.fn<(v: CommandFormValues) => void>();
+    render(
+      <CommandForm
+        editing={template({ description: "Unchanged." })}
+        commit="blur"
+        onSubmit={onSubmit}
+      />,
+    );
+    fireEvent.blur(screen.getByLabelText("Note for the agent"));
+    expect(onSubmit).not.toHaveBeenCalled();
   });
 });

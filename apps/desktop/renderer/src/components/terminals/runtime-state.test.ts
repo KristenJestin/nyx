@@ -49,6 +49,8 @@ function service(overrides: Partial<WorkspaceRuntimeService> = {}): WorkspaceRun
     workspace_id: "ws1",
     name: "dev",
     command: "npm run dev",
+    subfolder: null,
+    description: null,
     run_state: "idle",
     exit_code: null,
     unread: false,
