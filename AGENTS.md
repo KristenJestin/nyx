@@ -32,6 +32,7 @@ bun : `apps/desktop` et `apps/desktop/renderer`.
 ```sh
 bun run dev            # renderer en dev
 bun run dev:desktop    # app desktop en dev
+bun run start          # app desktop en prod locale — BUILD puis lance (start:no-build pour sauter le build)
 bun run build          # build renderer ; build:desktop pour l'app complète
 bun run install:linux  # Linux : build release + paquet unpacked + lanceur .desktop (voir apps/desktop/PACKAGING.md)
 ```

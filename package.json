@@ -13,6 +13,8 @@
     "dev:desktop": "bun run --filter nyx-v2 dev",
     "build": "bun run --filter nyx-v2-renderer build",
     "build:desktop": "bun run --filter nyx-v2 build",
+    "start": "bun run --filter nyx-v2 start",
+    "start:no-build": "bun run --filter nyx-v2 start:no-build",
     "test": "bun run --filter nyx-v2-renderer test && bun run test:core && bun run test:core:e2e && bun run test:contract",
     "test:frontend": "bun run --filter nyx-v2-renderer test",
     "test:core": "cargo test --workspace --lib && cargo test -p nyx-sidecar --test contract",

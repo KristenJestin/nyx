@@ -57,6 +57,18 @@ helpers (in `src/main/sidecar.ts`) make this resolution testable; `scripts/smoke
 asserts both the POSIX and the Windows (`.exe` + `\` separator) branches redirect into
 `app.asar.unpacked` and that the resolved POSIX path exists + the binary boots from it.
 
+## Lancer l'app construite, sans paquet
+
+```sh
+bun run start           # depuis la racine ou apps/desktop : BUILD puis `electron .`
+bun run start:no-build  # relance ce qui est déjà dans dist/ (rare, et à ses risques)
+```
+
+`start` construit d'abord — bundles main/preload, renderer, sidecar, ressources — parce qu'un
+`electron .` sur un `dist/` périmé lance l'app d'avant sans rien dire, et que le plugin Claude
+bundlé fait partie de ce que le build met en place. `install:linux` et `package` construisent
+déjà, chacun par sa propre chaîne : rien à ajouter devant eux.
+
 ## Linux — AppImage (produced + verified on the host here)
 
 ```sh
