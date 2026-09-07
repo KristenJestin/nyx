@@ -23,7 +23,6 @@ import { SpecDetailPage } from "@/components/specs/spec-detail-page";
 import { PrototypePage } from "@/components/specs/prototype-page";
 import { ReviewPage } from "@/components/review/review-page";
 import { KnowledgePage } from "@/components/knowledge/knowledge-page";
-import { EnginePage } from "@/components/engine/engine-page";
 import { CataloguePage } from "@/components/design/catalogue-page";
 import { ComponentDetailPage } from "@/components/design/component-detail-page";
 import { Spinner } from "@/components/ui/spinner";
@@ -293,18 +292,6 @@ const knowledgeRoute = createRoute({
 });
 
 /**
- * Engine (`/engine`) — the READ-ONLY React Flow view of the orchestration behavior tree (v2.8 Phase
- * 6): the static graph (custom nodes / group nodes / custom edges / ELK compound layout), the runtime overlay
- * (current node + blackboard) and the node inspector (spawn → rendered effector context). Authoring
- * stays MCP-first; this route never mutates the graph.
- */
-const engineRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/engine",
-  component: EnginePage,
-});
-
-/**
  * Design-system CATALOGUE (`/design`, v2.7 Phase 3, task #10) — browse the project's
  * `design_components` vocabulary (DS + NEW) with a rendered preview per component and DS/NEW/
  * liés-page filters. Portée PROJET. The composant detail (task #11) opens from a card.
@@ -341,7 +328,6 @@ const routeTree = rootRoute.addChildren([
   specReviewRoute,
   specPrototypeRoute,
   knowledgeRoute,
-  engineRoute,
   catalogueRoute,
   componentDetailRoute,
 ]);

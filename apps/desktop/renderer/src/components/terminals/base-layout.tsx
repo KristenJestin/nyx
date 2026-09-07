@@ -14,7 +14,6 @@ import {
   SlidersHorizontalIcon,
   SquareTerminalIcon,
   Trash2Icon,
-  WorkflowIcon,
 } from "lucide-react";
 import { Menu as BaseMenu } from "@base-ui/react/menu";
 import { motion, useReducedMotion } from "motion/react";
@@ -80,15 +79,14 @@ const NAV = [
   { to: "/", icon: SquareTerminalIcon, label: "Terminals", crossProject: false },
   { to: "/work", icon: BriefcaseIcon, label: "Work", crossProject: true },
   { to: "/knowledge", icon: BookOpenIcon, label: "Ideas", crossProject: true },
-  { to: "/engine", icon: WorkflowIcon, label: "Engine", crossProject: false },
   { to: "/design", icon: ComponentIcon, label: "Design", crossProject: false },
 ] as const;
 
 /**
- * The entries the rail DRAWS for a scope — six in a project, three across every project
+ * The entries the rail DRAWS for a scope — five in a project, three across every project
  * (`Home`, `Work`, `Ideas`), NONE in Système.
  *
- * In the cross-project scope the three others are ABSENT, not disabled: `Terminals`, `Engine` and
+ * In the cross-project scope the two others are ABSENT, not disabled: `Terminals` and
  * `Design` have no cross-project reading that means anything (which is the conclusion that closed
  * the three findings asking for one), and an entry that is present but inert is a promise not kept
  * — the user was explicit.
@@ -96,8 +94,8 @@ const NAV = [
  * IN SYSTÈME THE LIST IS EMPTY, and that is the same rule applied to the third scope rather than a
  * new one. Every entry of {@link NAV} reads a PROJECT: five of them read the entered one, and the
  * three flagged `crossProject` read the projects as a set. The Système singleton is in neither —
- * it is not returned by `list_projects` and has no Spec, no idea, no design system, no engine run
- * — so all six would lead OUT of the scope the user just entered, which is exactly what an entry
+ * it is not returned by `list_projects` and has no Spec, no idea, no design system
+ * — so all five would lead OUT of the scope the user just entered, which is exactly what an entry
  * present in a scope must not do. The scope's one screen is `/system` itself, reached by the tile
  * that entered it.
  *
@@ -139,7 +137,7 @@ const FOOT_NAV = [] as const;
  * Terminals, which no boolean could fix. The path fixed that and is KEPT. What U1 also removed —
  * the scope itself — is back by human decision, because the other half of the model was wrong the
  * other way: with Système a mere page, the rail showed a project entered AND selected while the
- * screen was the host's, and offered six project entries over a page that has none of them.
+ * screen was the host's, and offered five project entries over a page that has none of them.
  *
  * So this route MIRRORS the scope, exactly as `/home` mirrors its `?scope=`: entering the scope
  * navigates here, and arriving here (a deep link, a restored route) enters the scope. The rail
@@ -581,7 +579,7 @@ function ProjectRailDot({
  * value, so two of them cannot be lit at once.
  *
  * Entering it therefore takes the scope region's mark AND empties the section-nav ({@link
- * sectionNav}), because the six entries are a project's. The ENTERED PROJECT is untouched — it is
+ * sectionNav}), because the five entries are a project's. The ENTERED PROJECT is untouched — it is
  * remembered, not deselected — so one click on its tile puts the user back where they were.
  *
  * ## OUTSIDE the drag-reorder
@@ -697,7 +695,7 @@ function SystemRailTile({
  *    when idle) when not entered, replaced by an animated active indicator when it is
  *    the entered project;
  *  - a SECTION-NAV under the rail, DERIVED FROM THE SCOPE ({@link sectionNav}): Home ·
- *    Terminals · Work · Ideas · Engine · Design inside a project, Home · Work · Ideas
+ *    Terminals · Work · Ideas · Design inside a project, Home · Work · Ideas
  *    across every project, nothing at all in Système — each a router `<Link>` with an
  *    animated active indicator;
  *  - a FOOT GROUP under it: the SYSTÈME scope's tile (`/system`), then the Settings button
@@ -1290,17 +1288,17 @@ export function BaseLayout() {
 
           <div className="my-4 h-px w-7 bg-border/60" />
 
-          {/* THE SECTION-NAV, derived from the SCOPE ({@link sectionNav}) — six entries inside a
+          {/* THE SECTION-NAV, derived from the SCOPE ({@link sectionNav}) — five entries inside a
             project, three across every project, NONE in Système. An entry without a reading in the
             current scope is not rendered at all, so the list simply changes length when the scope
             flips; nothing reloads and no entry is left present-but-inert.
 
             IN SYSTÈME IT IS EMPTY, and that reverses finding U1 on the human's decision. U1 had
-            made Système a mere page, which left the six project entries standing over a screen
+            made Système a mere page, which left the five project entries standing over a screen
             that is not a project's — the way back to one's Spec board, at the cost of a nav that
             lies about what the current scope holds. Système being a SCOPE again, the rule that
             governs the other two governs it: the entries of a scope are the entries that read IN
-            it, and the singleton has no Spec, no idea, no design system and no engine run. The way
+            it, and the singleton has no Spec, no idea, no design system. The way
             back is the project tile above, one click, with the project still remembered. */}
           <ul className="flex flex-1 flex-col items-center gap-1">
             {sectionNav(scope.kind).map((item) => renderNavItem(item))}
@@ -1327,7 +1325,7 @@ export function BaseLayout() {
           {/* THE RULE SEPARATES WHAT NAVIGATES FROM WHAT OPENS (finding X2). It used to sit ABOVE
             the list, fencing the Système tile off from the section-nav — which made sense while
             Système was a SCOPE one entered instead of a project. It is a routed PAGE since U1,
-            peer of Terminals / Work / Ideas / Engine / Design, so fencing it off from them
+            peer of Terminals / Work / Ideas / Design, so fencing it off from them
             drew the one boundary the model says does not exist. The boundary that DOES exist is
             the next one down: everything above the rule is a route, Settings below it is a dialog.
 

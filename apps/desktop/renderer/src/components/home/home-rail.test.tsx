@@ -277,7 +277,7 @@ describe("The home's rail entries", () => {
   });
 
   it("leaves the entered project's ring exactly as it is on every project-scope route, `/home` included", async () => {
-    for (const path of ["/", "/home", "/work", "/knowledge", "/engine", "/design"]) {
+    for (const path of ["/", "/home", "/work", "/knowledge", "/design"]) {
       const { container, unmount } = mount(path);
       const alpha = await enteredTile();
       expect(alpha.className).toContain("ring-2");

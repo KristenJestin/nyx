@@ -91,12 +91,6 @@ pub enum ChangedTopic {
     /// is `ideas`; the front's re-pull on it is wired in Phase 4 (the Knowledge UI), but the
     /// mutation authority NAMES the topic here so the seam is single-authority end to end.
     Ideas,
-    /// The ORCHESTRATION graph changed (v2.8 — carried by the `workflow_*` / `node_*` authoring
-    /// MCP tools so any open Engine visualiser re-pulls the re-built tree after an agent authoring
-    /// mutation). The wire string is `workflows`; the front's re-pull on it is wired in Phase 6
-    /// (the React Flow graph UI), but the mutation authority NAMES the topic here so the seam is
-    /// single-authority end to end (the same forward-declared pattern as `Specs` / `Ideas`).
-    Workflows,
     /// The PROTOTYPE annexe changed (v2.7 — carried by the `proto_*` MCP tools so any open
     /// proto view re-pulls after an agent action: present a round, elect a variant, raise or
     /// resolve a comment). The wire string is `prototypes`; the front's re-pull on it (and the
@@ -129,7 +123,6 @@ impl ChangedTopic {
             ChangedTopic::Specs => "specs",
             ChangedTopic::Repos => "repos",
             ChangedTopic::Ideas => "ideas",
-            ChangedTopic::Workflows => "workflows",
             ChangedTopic::Prototypes => "prototypes",
         }
     }
@@ -2587,6 +2580,21 @@ fn is_activity_hook(name: &str) -> bool {
     )
 }
 
+/// The sub-agent CHARTER for the terminal a `SubagentStart` arrived on, or `None`.
+///
+/// A THIN, NEVER-FAILING wrapper over [`crate::mcp_context::render_subagent_charter`], and the
+/// whole of the "Task A" wiring: `SubagentStart` → here → `structuredContent.context` → the
+/// `.cjs` hook's bare `{ "additionalContext": … }`.
+///
+/// THE RENDERER ALREADY DEGRADES rather than refuses: a terminal bound to no workspace, or a
+/// workspace anchoring no Spec (or several), still gets the charter with the unknown parts NAMED.
+/// So the only thing left to swallow here is a DB failure — and swallowing it is the contract:
+/// a hook is best-effort and must never see a 500. A `None` renders as a JSON `null`, which the
+/// hook's `typeof charter === "string"` guard reads as "no charter", exactly like an absent field.
+fn subagent_charter_or_none(db: &Db, terminal_id: &str) -> Option<String> {
+    crate::mcp_context::render_subagent_charter(db, terminal_id).ok()
+}
+
 /// The SHARED half of the ambient block's data: the Système scope's command lines, or an EMPTY vec.
 ///
 /// A FUNCTION, and one that returns no error, because "best-effort" is a property this path has to
@@ -2815,24 +2823,6 @@ pub fn agent_session_event<S: RunnerSink>(
         // reject them). `is_activity_hook` covers the recognized-but-no-op case (e.g. a
         // `Notification` whose type we ignore) so it is still acknowledged, not errored.
         if is_activity_hook(hook_name) {
-            // The HUMAN spoke. Recorded off the SAME hook that moves the dot, but for a different
-            // reader and into a different store: the orchestration engine has to know that a PERSON
-            // — not the session — took a turn on this terminal, and this hook is the only signal on
-            // the whole dispatch path an agent cannot produce (H6, see [`db::HumanTurn`]). It goes
-            // to the DB, not to the runtime activity map, because the answer it authorises can
-            // arrive in a LATER session than the question (`claude -p` opens and closes a whole
-            // session per prompt). The raw text rides along so a consent answer is journaled with
-            // the words that authorised it.
-            //
-            // The turn's IDENTITY is Claude Code's own `prompt_id` when the hook carries one; when
-            // it does not, `record_human_turn` mints one. BEST-EFFORT: this hook must never fail a
-            // prompt, so a DB hiccup records nothing rather than erroring (nyx then simply proves
-            // no turn, which is the safe answer).
-            if hook_name == "UserPromptSubmit" {
-                let prompt = optional_str(args, "prompt")?.unwrap_or_default();
-                let turn_id = optional_str(args, "prompt_id")?;
-                let _ = db.with_conn(|c| db::record_human_turn(c, terminal_id, turn_id, prompt));
-            }
             // The FACTS off the raw payload. `tool_input` and `message` are the SECONDARY
             // INFORMATION half (the question Claude is asking, the permission it is blocked on):
             // the `.cjs` hook already forwards Claude's whole stdin, so both are simply read here
@@ -2844,6 +2834,20 @@ pub fn agent_session_event<S: RunnerSink>(
                 notification_type: args.get("notification_type").and_then(|v| v.as_str()),
                 message: args.get("message").and_then(|v| v.as_str()),
             };
+            // THE SUB-AGENT CHARTER (PDR-0031, `docs/product/agent-manuals.md` §4 / §5 row 5b).
+            // `SubagentStart` is an activity hook like any other — it moves the in-flight counter
+            // — but it is ALSO the only moment nyx can talk to a sub-agent, which inherits its
+            // mission from the orchestrator and nothing else: not the workspace, not the Spec, not
+            // the managed commands. So the charter rides back on the SAME response, in the SAME
+            // field `SessionStart` already uses (`structuredContent.context`) — one mechanism, not
+            // two, because the shapes are identical (a rendered string the `.cjs` hook relays as
+            // `additionalContext`). Only the WRAPPER differs, and that difference lives in the
+            // hook, not here.
+            let charter = if hook_name == "SubagentStart" {
+                subagent_charter_or_none(db, terminal_id)
+            } else {
+                None
+            };
             if let Some(activity_event) = ActivityEvent::from_hook(hook_name, facts) {
                 activity.apply(terminal_id, activity_event);
                 return Ok(ToolOutcome::changed(
@@ -2851,6 +2855,7 @@ pub fn agent_session_event<S: RunnerSink>(
                         "event": hook_name,
                         "terminal_id": terminal_id,
                         "activity": true,
+                        "context": charter,
                     }),
                     ChangedTopic::AgentSessions,
                 ));
@@ -2863,6 +2868,7 @@ pub fn agent_session_event<S: RunnerSink>(
                 "event": hook_name,
                 "terminal_id": terminal_id,
                 "activity": false,
+                "context": charter,
                 "reason": "activity hook with no dot transition",
             })));
         }
@@ -3750,9 +3756,9 @@ const SCROLLBACK_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_
 /// happens; keeping one worker permanently free for short requests removes the circularity.
 ///
 /// THE BUDGET COVERS EVERY LONG BLOCK ON THIS POOL, not just terminal waits. `wait_for_command`
-/// blocks the same way for the same minute, and a `nyx_next` gate runs INLINE for up to 90 s; a cap
-/// that counted only `wait_for_terminal` left the free worker to be taken by either of them, and
-/// the deadlock came back through the side door. One budget, shared.
+/// blocks the same way for the same minute; a cap that counted only `wait_for_terminal` left the
+/// free worker to be taken by it, and the deadlock came back through the side door. One budget,
+/// shared.
 pub(crate) const MAX_CONCURRENT_TERMINAL_WAITS: usize = crate::mcp::REQUEST_WORKERS - 1;
 
 /// How many LONG BLOCKING CALLS are in flight RIGHT NOW, process-wide. Paired with
@@ -3803,7 +3809,7 @@ pub(crate) fn too_many_terminal_waits_error() -> RpcError {
         format!(
             "too many blocking calls at once (limit {MAX_CONCURRENT_TERMINAL_WAITS}): one \
              nyx worker must stay free to receive the agent hooks that END these waits, so a \
-             {n}th concurrent block (wait_for_terminal, wait_for_command or a nyx_next gate) \
+             {n}th concurrent block (wait_for_terminal or wait_for_command) \
              would only starve the others. Let one of them return first, or poll with \
              read_terminal / get_command_output — and while a terminal's submission_pending \
              is true, its agent_activity still describes the PREVIOUS turn: keep polling.",
@@ -4273,39 +4279,6 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
         crate::mcp::AGENT_SESSION_EVENT_TOOL => {
             Some(agent_session_event(db, runner, activity, args))
         }
-        // The v2.8 ENGINE run-lifecycle entry: OPEN a run and get its run_id (the dispatcher calls
-        // this once, then loops on nyx_next). Resolves the workflow + optional Spec binding. It
-        // reaches the SAME process-global engine registry the tick below does, because opening a run
-        // can REPLACE a dead one and deleting that row takes the very tick guard a live tick holds.
-        crate::mcp_engine::RUN_START_TOOL => Some(crate::mcp_engine::run_start(
-            db,
-            crate::mcp_engine::shared_runtime(),
-            args,
-        )),
-        // The RECOVERY twin of the entry above: a run already open, and no Spec on it. It reaches
-        // the SAME process-global registry because "is this run yours?" is a question only that
-        // registry answers — `run_list` enumerates the whole installation's runs.
-        crate::mcp_engine::RUN_BIND_SPEC_TOOL => Some(crate::mcp_engine::run_bind_spec(
-            db,
-            crate::mcp_engine::shared_runtime(),
-            args,
-        )),
-        // The v2.8 ENGINE runtime tick: the thin dispatcher calls this in a loop. It advances the
-        // run's behavior tree, runs the gate_check managed commands ITSELF over the PTY (refusing
-        // to advance while a blocking gate is red), imposes state transitions through the guarded
-        // Spec authority, and returns the next atomic action. Uses the session-global engine
-        // registry so the signature stays stable across shells. The CALLER SESSION rides along —
-        // the terminal this MCP connection is bound to — because the consent check (H6) is a
-        // question about who is on the other end (it reads that terminal's persisted human-turn
-        // ledger itself, from the same `db`).
-        crate::mcp_engine::NYX_NEXT_TOOL => Some(crate::mcp_engine::nyx_next(
-            db,
-            crate::mcp_engine::shared_runtime(),
-            crate::mcp_engine::CallerSession {
-                terminal_id: caller_terminal_id,
-            },
-            args,
-        )),
         // Interactive-terminal tools (DB-record half + the shell's TerminalHost).
         crate::mcp::CREATE_TERMINAL_TOOL => Some(create_terminal(db, host, args)),
         crate::mcp::SEND_TO_TERMINAL_TOOL => Some(send_to_terminal(db, host, activity, args)),
@@ -4329,10 +4302,6 @@ pub fn dispatch_extension_tool<S: RunnerSink>(
             // content_hash) — same one-place sub-dispatcher, delegating to the SHARED
             // `nyx_core::db` annexe authority.
             .or_else(|| crate::mcp_tools_annexe::dispatch_annexe_tool(db, name, args))
-            // The v2.8 GRAPH-AUTHORING tools (workflow_create/fork/assign + node CRUD) — the MCP
-            // layer over the Phase-2 workflow/node CRUD, adding the tree-coherence guard that
-            // refuses an incoherent graph. Same one-place sub-dispatcher.
-            .or_else(|| crate::mcp_authoring::dispatch_authoring_tool(db, name, args))
             // The v2.7 PROTOTYPE tools (the agent's constrained proto contract: read the explicit
             // state, present a round, elect a variant, raise/resolve a pre-dev comment) — same
             // one-place sub-dispatcher, delegating to the SHARED `nyx_core::db` prototype
@@ -6212,7 +6181,6 @@ pub(crate) mod tests {
             // product aggregates
             "spec_create",
             "idea_capture",
-            "workflow_create",
         ] {
             let err = dispatch_extension_tool(
                 &db, &runner, &host, &activity, tool, &args, None,
@@ -7566,97 +7534,6 @@ pub(crate) mod tests {
         assert!(activity.snapshot(&tid).unwrap().activity == Activity::Working);
     }
 
-    /// H6 — the same hook ALSO records that a HUMAN took a turn on this terminal: the raw text they
-    /// typed and the turn's IDENTITY (Claude Code's `prompt_id`). This is the signal the
-    /// orchestration engine checks before it lets an answer commit a Spec, and it is the only one on
-    /// the whole dispatch path an agent cannot produce: no tool call writes this row, only a person
-    /// pressing enter. A hook that is not a prompt must not write it either — otherwise the agent's
-    /// own tool traffic would forge the very proof.
-    ///
-    /// And the row OUTLIVES THE SESSION, which is the fix: `SessionEnd` drops the live dot (no turn
-    /// can still be running once the session is gone) and leaves the ledger standing. A `claude -p`
-    /// invocation IS a whole session — start, one prompt, end — so a ledger that died with it was
-    /// gone before the answer it authorises ever came back, and the consent check refused authentic
-    /// answers for exactly that reason.
-    #[test]
-    fn a_user_prompt_hook_records_the_human_turn_and_it_outlives_the_session() {
-        let _g = db_guard();
-        let db = Db::in_memory();
-        let host = NoTerminalHost;
-        let activity = AgentActivityStore::new();
-        let created = create_terminal(&db, &host, &json!({})).unwrap();
-        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
-        let ledger = || db.with_conn(|c| db::last_human_turn(c, &tid)).unwrap();
-        assert_eq!(ledger(), None, "no prompt, no turn");
-
-        session_event(
-            &db,
-            &activity,
-            &json!({
-                "hook_event_name": "UserPromptSubmit",
-                "NYX_TERMINAL_ID": tid,
-                "prompt": "oui, passe-la en ready",
-                "prompt_id": "prompt-1",
-            }),
-        )
-        .unwrap();
-        let turn = ledger().expect("the human's turn is recorded");
-        assert_eq!(turn.turn_id, "prompt-1", "the turn is NAMED by the prompt id");
-        assert_eq!(turn.prompt, "oui, passe-la en ready");
-
-        // A tool the AGENT runs is a beat of its turn, not a turn of the human's.
-        session_event(
-            &db,
-            &activity,
-            &json!({ "hook_event_name": "PreToolUse", "NYX_TERMINAL_ID": tid, "tool_name": "Bash" }),
-        )
-        .unwrap();
-        assert_eq!(
-            ledger().unwrap().turn_id,
-            "prompt-1",
-            "an agent's own tool traffic must never count as the human speaking"
-        );
-
-        // THE SESSION ENDS — the whole of a `claude -p` invocation. The dot goes (nothing is
-        // running), the human's turn STAYS: they typed it, and it is still the last thing they said.
-        session_event(
-            &db,
-            &activity,
-            &json!({
-                "hook_event_name": "SessionEnd",
-                "NYX_TERMINAL_ID": tid,
-                "session_id": "sess-1",
-                "reason": "prompt_input_exit",
-            }),
-        )
-        .unwrap();
-        assert!(
-            activity.snapshot(&tid).is_none(),
-            "the session ending clears the live dot"
-        );
-        assert_eq!(
-            ledger().expect("the ledger survives the session").turn_id,
-            "prompt-1",
-            "the human turn outlives the session it was typed in"
-        );
-
-        // A provider that sends NO prompt id still produces a DISTINCT turn — nyx mints the identity
-        // itself, because all the consent check asks is "is this another turn than the one I saw?".
-        session_event(
-            &db,
-            &activity,
-            &json!({
-                "hook_event_name": "UserPromptSubmit",
-                "NYX_TERMINAL_ID": tid,
-                "prompt": "yes",
-            }),
-        )
-        .unwrap();
-        let next = ledger().expect("the next turn is recorded");
-        assert_ne!(next.turn_id, "prompt-1", "a new prompt is a new turn");
-        assert_eq!(next.prompt, "yes");
-    }
-
     /// R1 — while the host is SHUTTING DOWN, a real `SessionEnd` (e.g. `prompt_input_exit` from a
     /// dying PTY) must NOT end the session: it stays `active` so lazy-resume reclaims it next boot.
     /// Without the suppression, that late SessionEnd (which outlives `mcp.stop()`) ended the session
@@ -7786,6 +7663,142 @@ pub(crate) mod tests {
         let snap = activity.snapshot(&tid).unwrap();
         assert_eq!(snap.activity, Activity::Working);
         assert!(!snap.ready_unread, "a sub-agent stop never raises ready");
+    }
+
+    /// THE CHARTER CHANNEL (PDR-0031, `agent-manuals.md` §4 / §5 row 5b). `SubagentStart` on a
+    /// WORKSPACE-BOUND terminal answers with the rendered sub-agent charter in the SAME field
+    /// `SessionStart` uses — `structuredContent.context` — because that is the field the `.cjs`
+    /// hook reads before writing its bare `{ "additionalContext": … }`.
+    #[test]
+    fn agent_session_event_subagent_start_returns_the_charter_as_context() {
+        use crate::schema::terminals;
+        use diesel::prelude::*;
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let (_project, workspace) = db
+            .with_conn(|c| db::create_project(c, "charter-proj", "/tmp/charter", None))
+            .unwrap();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+        db.with_conn(|c| {
+            diesel::update(terminals::table.find(&tid))
+                .set(terminals::workspace_id.eq(Some(workspace.id.clone())))
+                .execute(c)
+        })
+        .unwrap();
+
+        let out = session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "SubagentStart", "NYX_TERMINAL_ID": tid }),
+        )
+        .unwrap();
+        let charter = out.result["context"]
+            .as_str()
+            .expect("SubagentStart carries the charter in `context`");
+        assert!(
+            charter.starts_with("# nyx — you are a sub-agent in workspace"),
+            "the charter is the §4 text, verbatim at its head: {charter}"
+        );
+        assert!(
+            charter.contains(&workspace.name),
+            "the charter names the workspace resolved from the parent terminal: {charter}"
+        );
+        assert!(
+            charter.contains("Managed commands of this workspace:"),
+            "the charter carries the managed-commands block: {charter}"
+        );
+        assert!(
+            !charter.contains("{{"),
+            "every placeholder is substituted: {charter}"
+        );
+        // The activity half is untouched: the charter rides ALONG the dot transition, it does
+        // not replace it.
+        assert_eq!(out.result["activity"], json!(true));
+        assert_eq!(
+            activity.snapshot(&tid).unwrap().activity,
+            Activity::Working
+        );
+    }
+
+    /// A terminal that resolves to NOTHING (no workspace, therefore no Spec and no commands)
+    /// must NOT fail the tool — the hook is best-effort and a 500 loses the whole event. It
+    /// gets a charter that NAMES what is unknown instead.
+    #[test]
+    fn agent_session_event_subagent_start_degrades_instead_of_failing() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+
+        let out = session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "SubagentStart", "NYX_TERMINAL_ID": tid }),
+        )
+        .expect("a loose terminal never fails the hook");
+        let charter = out.result["context"]
+            .as_str()
+            .expect("a loose terminal still gets a charter");
+        assert!(
+            charter.contains("attached to no nyx workspace"),
+            "the degraded charter names the missing anchor: {charter}"
+        );
+        assert!(
+            !charter.contains("{{"),
+            "the degraded charter is not a broken template: {charter}"
+        );
+
+        // An UNKNOWN terminal id is the same story: no panic, no error, a usable charter.
+        let out = session_event(
+            &db,
+            &activity,
+            &json!({ "hook_event_name": "SubagentStart", "NYX_TERMINAL_ID": "term-does-not-exist" }),
+        )
+        .expect("an unknown terminal never fails the hook either");
+        assert!(
+            out.result["context"]
+                .as_str()
+                .is_some_and(|c| c.contains("attached to no nyx workspace")),
+            "an unresolvable terminal degrades rather than 500s: {:?}",
+            out.result["context"]
+        );
+    }
+
+    /// The charter is fetched for `SubagentStart` and for NOTHING else: the other activity
+    /// hooks fire many times a turn and must not pay a workspace + Spec + commands resolution.
+    #[test]
+    fn agent_session_event_only_subagent_start_carries_a_charter() {
+        let _g = db_guard();
+        let db = Db::in_memory();
+        let host = NoTerminalHost;
+        let activity = AgentActivityStore::new();
+        let created = create_terminal(&db, &host, &json!({})).unwrap();
+        let tid = created.result["terminal_id"].as_str().unwrap().to_string();
+
+        for hook in [
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "SubagentStop",
+            "Stop",
+        ] {
+            let out = session_event(
+                &db,
+                &activity,
+                &json!({ "hook_event_name": hook, "NYX_TERMINAL_ID": tid }),
+            )
+            .unwrap();
+            assert!(
+                out.result["context"].is_null(),
+                "{hook} carries no charter: {:?}",
+                out.result["context"]
+            );
+        }
     }
 
     /// THE #21 FIX over the MCP boundary: a BACKGROUND sub-agent whose hook order is

@@ -2,9 +2,9 @@
 
 ## État
 
-**Status: mécanisme validé (PDR-0011, PDR-0019, PDR-0020) ; contenu par défaut des playbooks proposé, raffinable. Reste à écrire : le contenu par projet (rules, agents custom, DESIGN.md).**
+**Status: mécanisme validé (PDR-0011, PDR-0019, PDR-0020, PDR-0031). Le texte livré des manuels vit dans [`agent-manuals.md`](agent-manuals.md). Reste à écrire : le contenu par projet (rules, agents custom, DESIGN.md).**
 
-Ce document rassemble tout ce qui touche au comportement des agents dans nyx : le principe fondateur, le harness, le playbook par défaut livré avec nyx, et où chaque contexte se branche. Il sépare ce qui est **posé** (le mécanisme) de ce qui reste **à écrire** (le contenu réel des contextes).
+Ce document rassemble tout ce qui touche au comportement des agents dans nyx : le principe fondateur, le harness, et où chaque contexte se branche. Il sépare ce qui est **posé** (le mécanisme) de ce qui reste **à écrire** (le contenu réel des contextes). Le texte des manuels lui-même — `/nspec`, `/ndev`, `/ndoc` et la charte des sous-agents — n'est pas recopié ici : il vit dans [`agent-manuals.md`](agent-manuals.md).
 
 ## Principe fondateur : l'humain lâche brut, l'agent grille, l'humain valide
 
@@ -20,51 +20,60 @@ Bénéfice : friction minimale pour l'humain (il ne classifie jamais à la main)
 
 ## Le harness : playbook + verbes (rappel PDR-0011)
 
-nyx ne construit **pas** de moteur de workflow. Le workflow est un **playbook éditable** (du texte/directive injecté comme instructions à l'agent). L'agent l'**exécute** en appelant les **verbes observables** de nyx. nyx fournit un playbook **par défaut**, forkable par projet.
+nyx ne construit **pas** de moteur de workflow. Le playbook est du **texte injecté comme instructions à l'agent** ; l'agent le lit, raisonne, et **exécute** en appelant les **verbes observables** de nyx. nyx tient l'état et les verbes ; l'agent décide de la marche à suivre. Le moteur d'orchestration behavior-tree qui contredisait ce principe a été construit en v2.8 puis **retiré** (PDR-0031) : il n'y a plus de graphe, plus de run, plus de tick.
 
-- **Verbes (primitives v1)** : lancer/observer une session avec un rôle, injecter du contexte, hooks de cycle de vie (start/close).
-- **Playbook (donnée, v2.7)** : le workflow lui-même, éditable.
-- Frontière : *nyx possède les verbes, le projet possède le playbook.*
+- **Verbes (primitives v1)** : lancer/observer une session avec un rôle, injecter du contexte, hooks de cycle de vie (start/close), transitions de Spec et de tâche.
+- **Playbook (donnée)** : le manuel lui-même, rendu live par nyx-core et injecté par les hooks.
+- Frontière : *nyx possède les verbes, le manuel dit quoi en faire.*
 
-## Le playbook par défaut (dev) — proposé
+## Les manuels livrés
 
-Le harness de base livré avec nyx. L'agent **orchestrateur** ne code pas, il orchestre :
+Un **manuel par commande** (`/nspec`, `/ndev`, `/ndoc`), injecté au `UserPromptSubmit`, plus une **charte unique** injectée dans **chaque** sous-agent au `SubagentStart` — quelle que soit la mission que l'orchestrateur lui a écrite. Le texte livré, mot pour mot, est dans [`agent-manuals.md`](agent-manuals.md) ; il n'est pas dupliqué ici.
 
-1. lance un **coder** avec le contexte (Spec / phase ou round) ;
-2. quand le coder a fini, lance des **auditeurs** ;
-3. si les auditeurs remontent des findings -> relance le coder avec ces findings (un finding = une task d'un round) ;
-4. reboucle coder -> auditeurs jusqu'à ce que les auditeurs passent ;
-5. découpe par **phases** ;
-6. au **close**, déclenche le **doc-sync**.
+Rôles rendus : **spec**, **dev** (orchestrateur), **doc** — trois, un par commande. Coder, auditeur et prototypeur ne sont plus des rôles nyx : ce sont des **sous-agents** que l'orchestrateur brieffe lui-même via le Task du provider, encadrés par la charte et **observés** par nyx (hooks `SubagentStart` / `SubagentStop`) — pas d'angle mort, même quand ils tournent dans le Task du provider.
 
-Rôles par défaut (PDR-0020) : **dev** (orchestrateur) + **spec** + **doc** = principaux ; **coder** et **auditeur(s)** = **subagents** lancés par `dev` via le Task du provider. Chaque rôle est **observé** par nyx (hooks `SubagentStart`/`SubagentStop` pour les subagents) — pas d'angle mort, même quand ils tournent dans le Task du provider.
-
-Ce playbook par défaut est une conception **séparée et révisable** : sa forme est posée ici, son contenu exact (prompts) s'écrit et se valide à l'implémentation.
+La seule machine à états qui subsiste est celle du **Spec** (`draft → ready → in_progress → in_review → completed`, plus `blocked`, `cancelled`, `archived`), avancée par `spec_transition` ; les transitions sensibles (`ready`, `completed`, `cancelled`) exigent `user_confirmed=true`, donc une phrase claire de l'humain dans le chat.
 
 ## Contexte injecté, par agent
 
 - **Design-system** (table `design`, format DESIGN.md) : vocabulaire visuel imposé, pour le proto **et** le dev (PDR-0010). L'agent compose depuis ce vocabulaire, il ne réinvente pas.
 - **Directives** (table `directives`) : fragments de contexte projet -> constituent le playbook (« directives v2 »).
 - **`agent_context_snapshots`** (table) : où les contextes générés sont tracés.
-- Le contenu réel est à **définir et valider par agent et sous-agent** (authoring v2.7), pas figé ici.
+- **Manuel du rôle et charte de sous-agent** : le texte fixe vit dans [`agent-manuals.md`](agent-manuals.md) ; les blocs `{{…}}` (Spec, tâches, workspace, commandes, catégorie) sont rendus live par nyx.
 
-## Le modèle d'exécution : agents, workflows, déclenchement (PDR-0019 + PDR-0020)
+## Le modèle d'exécution : agents, déclenchement, livraison (PDR-0019 + PDR-0020 + PDR-0031)
 
 **Partage en 3 couches (PDR-0019).** (1) **Verbe nyx** = exécution + autorité de l'état (worktree, status, diff, lancement terminaux/commandes/sessions). (2) Les **inputs** d'un verbe = humain (UI) ou agent (MCP) — même use case (PDR-0005). (3) Le **travail** (juger, coder, auditer, documenter) = **session agent observable**. nyx n'est pas un moteur.
 
-**Agents — bibliothèque réutilisable, 4 types (PDR-0020).** **spec**, **dev** (orchestrateur), **doc** = les **principaux** (un de chaque par workflow, **déclenchables**) ; **subagent** = coder, auditeur, ui-tester… (autant que voulu). Les subagents sont **lancés par les principaux via le Task natif du provider** (pas de système nyx, PDR-0019) et **observés** par nyx via les hooks `SubagentStart`/`SubagentStop`. nyx livre des **défauts** (spec/dev/doc + coder/auditeur), **forkables** ; les **customs** (ui-tester, coder2) sont **réutilisables entre projets**. Contenu d'un agent = **template** (statique + marqueurs `rules`/`checks`/données live) + **outils/skills** + modèle.
+**Agents — bibliothèque réutilisable (PDR-0020).** **spec**, **dev** (orchestrateur), **doc** = les **principaux**, un par commande, **déclenchables**. Les **sous-agents** sont **lancés par les principaux via le Task natif du provider** (pas de système nyx, PDR-0019) et **observés** par nyx via les hooks `SubagentStart`/`SubagentStop` ; ils reçoivent la **charte** de nyx et leur **mission de l'orchestrateur**, pas un rôle nyx. nyx livre les défauts, **forkables** ; les customs sont **réutilisables entre projets**. Contenu d'un agent = **template** (statique + marqueurs `rules`/`checks`/données live) + **outils/skills** + modèle.
 
-**Workflow (PDR-0020).** Composition réutilisable (défaut nyx forkable) : 1 spec + 1 dev + 1 doc + N subagents + **wiring** (quel subagent/check à quel scope). `projects.workflow_id` assigne un workflow à un projet.
+**Pas de composition de workflow (PDR-0031).** La composition réutilisable (1 spec + 1 dev + 1 doc + N subagents), son wiring et `projects.workflow_id` sont **retirés** : il n'y a rien à câbler entre trois manuels et une charte.
 
-**rules / checks / agents** (ce que Depot entassait dans « directives »). **rules** = consignes advisory projet (table `directives`), injectées dans un agent. **checks** = commandes déterministes à un gate, blocking (`managed_commands.gate` : lint/test/secrets). **agents** = les rôles. La *visual pass* du projet devient un **subagent `ui-tester`** branché à `pre-handoff` — observable, fini le sous-agent caché.
+**rules / checks / agents** (ce que Depot entassait dans « directives »). **rules** = consignes advisory projet (table `directives`), injectées dans un agent. **checks** = commandes managées déterministes ; leur **note** dit quand l'humain veut qu'elles tournent, et c'est cette note — rendue dans `list_commands` et dans le contexte injecté — que l'agent lit, à la place des slots de gate retirés avec le moteur. **agents** = les rôles. La *visual pass* du projet devient un **sous-agent** briefé par l'orchestrateur — observable, fini le sous-agent caché.
 
 **« Démarrer le dev » = squelette générique.** Verbe worktree (repos non-`optional` par défaut) → ligne workspace + `specs.workspace_id` + status → managed commands → session `dev` (+ playbook) → checks/hooks. **Points d'extension** projet (rejouent la préparation de feature) : **repo-set** (auto-inclusion des libs partagées), **setup hook** post-worktree (`.envrc` + `setup-feature.sh`), **dev playbook**, **managed commands/services**. Ce qui était câblé à la main (tabs de terminal, enregistrement du workspace, fichier de config maison) **disparaît** : natif + observé.
 
-**Livraison du contexte — zéro CLI, zéro fichier généré (PDR-0020).** Le contenu (rôle + rules + workflow + spec) est **rendu live par nyx-core** et **injecté via les hooks du plugin** en `additionalContext` (instruction, pas `tool_result`) : **SessionStart** (lancement UI) et **UserPromptSubmit** (`/ndev` `/nspec` `/ndoc` tapé). Les **déclencheurs** = 3 **stubs de commande fixes** portant un marqueur ; `$ARGUMENTS` → l'id sélectionne la spec, le **texte libre reste l'instruction** (injection additive) ; sans id → résolu via `cwd`. **MCP** = uniquement les **actions**.
+**Livraison du contexte — zéro CLI, zéro fichier généré (PDR-0020).** Le contenu (manuel du rôle + rules + Spec + tâches + workspace + commandes managées et leurs notes) est **rendu live par nyx-core** et **injecté via les hooks du plugin** en `additionalContext` (instruction, pas `tool_result`) : **SessionStart** (lancement UI), **UserPromptSubmit** (`/ndev` `/nspec` `/ndoc` tapé) et **SubagentStart** (la charte, dans chaque sous-agent). Les **déclencheurs** = 3 **stubs de commande fixes** portant un marqueur ; `$ARGUMENTS` → l'id sélectionne la spec, le **texte libre reste l'instruction** (injection additive) ; sans id → résolu via `cwd`. **MCP** = uniquement les **actions**.
+
+**Les trois branches du hook, en détail** (`claude-plugin/hooks/nyx-session-hook.cjs`, un seul script node cross-plateforme) :
+
+| hook | ce que nyx rend | forme de la réponse |
+| --- | --- | --- |
+| `SessionStart` | le contexte résolu du terminal (projet / workspace / Spec) | `{ hookSpecificOutput: { hookEventName, additionalContext } }` |
+| `UserPromptSubmit` | le **manuel de la commande**, via `agent_context { role, cwd, spec_id? }` | `{ hookSpecificOutput: { hookEventName, additionalContext } }` |
+| `SubagentStart` | la **charte**, portée par le `context` de l'`agent_session_event` que le hook poste déjà | `{ hookSpecificOutput: { hookEventName, additionalContext } }` |
+
+Trois choses s'y jouent, et chacune est une décision, pas un détail d'implémentation :
+
+- **Le déclencheur est le NOM de la commande**, parce que c'est tout ce qu'un `UserPromptSubmit` voit : le client ne passe que le prompt brut et ne développe le corps du stub — donc le marqueur `<!-- NYX-AGENT-CONTEXT role=… -->` — qu'après. La table `nspec → spec`, `ndev → dev`, `ndoc → doc` vit donc dans le hook, et le rôle est à lui seul ce qui sélectionne un manuel : le moteur parti, le `scope` ne nomme plus rien.
+- **L'ancre est le `cwd`** que le client donne au hook, plus le `spec_id` quand l'humain a nommé une Spec — la référence est passée **verbatim**, jamais résolue côté hook. Et c'est `agent_context`, seul point d'entrée, qui **refuse** une référence ambiguë : ce refus appartenait au `run_start` du moteur, il a déménagé avec lui (PDR-0031). Un refus n'est pas avalé — la phrase de nyx est injectée à la place du manuel, parce que stderr n'est pas lu par le modèle.
+- **`SubagentStart` prend la même enveloppe `hookSpecificOutput` que les deux autres** — et ce point a longtemps été écrit à l'envers ici, dans le hook et dans son test : on tenait la forme **nue** pour obligatoire, et l'enveloppe pour ce qui faisait *silencieusement* jeter la charte. **Mesuré le 2026-09-07**, Claude Code v2.1.246 sous Windows, en pilotant l'app réelle — un vrai sous-agent lancé depuis un vrai terminal nyx, plugin installé depuis ce build. L'observable est la pièce jointe **`hook_additional_context`** du transcript du sous-agent (`~/.claude/projects/<proj>/<session>/subagents/agent-*.jsonl`) : elle n'est écrite **que** si le texte a atteint le modèle. La forme nue n'a laissé qu'un `hook_success` portant le stdout du hook — il a donc bien tiré, et réussi — et **aucun** `hook_additional_context` ; le sous-agent interrogé a confirmé n'avoir reçu aucun contexte nyx. Dans le **même** transcript parent, les `SessionStart` et `UserPromptSubmit` **enveloppés** laissent chacun les deux pièces jointes, et les manuels qu'ils portaient ont été cités mot pour mot par le modèle. Conclusion : c'est l'enveloppe qui passe, la clé nue qui est jetée sans un mot. La forme écrite ici est celle du hook et de son gate ; ne pas la « restaurer » sur la foi d'un commentaire.
+
+Le tout est **best-effort et borné** : le hook ne jette jamais et sort toujours en 0. Sidecar éteint, réponse mal formée, `agent_context` en refus — la session s'ouvre sans manuel plutôt que de casser, et les stubs disent à l'agent de **tirer** le manuel lui-même (`agent_context`) quand il ne l'a pas reçu. Les stubs ne portent plus que ça : le marqueur de rôle, la grammaire de référence 0/1/N, et le renvoi au manuel injecté — plus une ligne de `run_start` ni de `nyx_next`.
 
 **Install.** Via **Settings → Integrations** (comme nyx v1) : installe le **plugin bundlé** `nyx-claude-integration` (MCP + hooks + stubs `/n…`), par provider. **Pas de CLI.**
 
-**Modes.** `specs.mode` = **stepped** (validation par phase) | **autopilot** (déroule jusqu'à la review finale). Gate humain final conservé.
+**Pas de modes.** `specs.mode` (`stepped` / `autopilot`) n'est plus ni lu ni exposé : rien ne s'arrête à une fin de phase, puisque les phases ne sont que des étiquettes de regroupement. Le rythme vient du manuel, et le **gate humain final** est conservé — c'est l'humain qui prononce `completed`. La colonne reste en base jusqu'à un prochain nettoyage de schéma (PDR-0031).
 
 ## Aucun angle mort (le fil rouge)
 
@@ -77,82 +86,16 @@ La lisibilité ne vient **pas** de la restriction de l'agent, mais de l'**observ
 
 ## Doc-sync (phase doc post-dev)
 
-Déclenchée par le **close** (un hook du playbook). C'est un **agent-job configuré**, pas un nouveau sous-système : un `profile` (recette : quoi lire, où écrire, style, guardrails) joue le rôle d'un managed-command ; le run est un agent-session dans le primary workspace, sur la plage Git du Spec ; la sortie est **reviewable** (l'agent propose la doc, l'humain valide — pas d'angle mort sur la doc).
+Déclenchée par l'humain (`/ndoc`) une fois le Spec `in_review` ou `completed` — l'orchestrateur la **suggère** en fin de dev, il ne l'enclenche pas. C'est un **agent-job**, pas un nouveau sous-système : une session agent dans le workspace du Spec, sur sa plage Git, qui lit les règles de doc du projet (CLAUDE.md / AGENTS.md, index docs, conventions ADR) — nyx n'en impose aucune — et écrit dans le working tree. La sortie est **reviewable** (l'agent propose la doc, l'humain valide — pas d'angle mort sur la doc), sans commit sauf demande explicite.
 
-## Playbooks par défaut — contenu proposé
+## Où vit le texte livré
 
-Le contenu réel livré avec nyx. Proposé et raffinable, mais écrit pour ne rien perdre de ce qu'on a établi. Ce sont des **instructions**, pas du code ; éditables par projet.
-
-### Orchestrateur (dev)
-
-```text
-Tu es l'orchestrateur. Tu n'écris pas de code toi-même ; tu pilotes les autres rôles via les outils nyx.
-
-Pour réaliser un Spec :
-1. Découpe le travail en phases si nécessaire.
-2. Pour chaque phase / round :
-   a. lance une session `coder` avec le contexte : le Spec, le round courant et ses tasks ouvertes ;
-   b. quand le coder a fini, lance une ou plusieurs sessions `auditeur` sur le diff produit ;
-   c. récupère les findings des auditeurs (déjà structurés) et les commentaires humains ; grille **uniquement les commentaires humains**, puis promeus le tout en tasks du round ;
-   d. s'il reste des tasks ouvertes, relance le `coder` avec elles ;
-   e. reboucle (c-d) jusqu'à ce que les auditeurs passent et qu'il ne reste plus de task ouverte.
-3. À la clôture, déclenche le `doc-sync`.
-
-Règles :
-- lance chaque rôle via les outils nyx ; jamais de sous-agent caché ;
-- tu ne résous jamais un commentaire humain : seul l'utilisateur le fait ;
-- un commentaire ne devient un finding qu'après avoir été grillé en task cohérente.
-```
-
-### Coder
-
-```text
-Tu es le coder. Tu travailles UNIQUEMENT sur les tasks ouvertes de ton round / phase courant. Tu ne décides pas du périmètre.
-
-Règles :
-- pour toute UI, compose depuis le design-system du projet (composants + tokens) ; ne réinvente jamais un rendu ;
-- tu n'adresses que des tasks ; tu ne résous pas les commentaires humains ;
-- quand une task est faite, marque-la `done` ;
-- toute commande ou service passe par les outils nyx, jamais un lancement sauvage.
-```
-
-### Auditeur
-
-```text
-Tu es un auditeur. Tu relis le diff produit par le coder. Tu signales, tu ne corriges pas.
-
-Pour chaque problème :
-- pose un finding (commentaire ancré sur le diff) avec une severité (`critical` / `high` / `medium` / `low` / `info`, l'enum `severity` du schéma) ;
-- sois précis et actionnable : le coder doit pouvoir corriger sans deviner.
-
-Tu ne modifies pas le code. Tu ne résous pas les commentaires humains.
-```
-
-### Grill (idée / commentaire -> structuré)
-
-```text
-On te donne un input humain brut (une idée vague, un commentaire de review). Ta tâche : le transformer en artefact structuré et cohérent (une task de Spec, un finding) ; pas le recopier.
-
-- clarifie les ambiguïtés ; au besoin, pose la question à l'humain ;
-- déduplique, ordonne, ajoute des critères de done ;
-- conserve l'ancre d'origine (file:line) si elle existe ;
-- ne perds aucune intention de l'input ;
-- pour un Spec, assigne une **catégorie** du set du projet ; si rien ne colle, crée-la — elle est valide telle quelle, aucune confirmation humaine ne suit (PDR-0017 amendé le 2026-09-02), donc préfère réutiliser une entrée existante ; ne bloque jamais.
-
-L'humain valide ensuite. Tu ne valides jamais à sa place.
-```
-
-### Doc-sync
-
-```text
-Déclenché à la clôture d'un Spec. Lis la plage Git du Spec (since..until) et les sources définies par le profile. Mets à jour la doc dans le repo cible selon le profile (style, audience, guardrails, topics).
-
-- écris dans le working tree ; pas de commit auto sauf si le profile le demande ;
-- ta sortie est une review : l'utilisateur valide avant que ça parte.
-```
+Les manuels `/nspec`, `/ndev`, `/ndoc` et la charte des sous-agents sont écrits **en toutes lettres** dans [`agent-manuals.md`](agent-manuals.md) : c'est la source de ce que le rendu de contexte injecte, et elle n'est pas recopiée ici pour ne pas se dédoubler. Ce document dit **où** le contexte se branche et **quel** partage il respecte ; `agent-manuals.md` dit **ce que l'agent lit**.
 
 ## Posé vs à écrire
 
-**Posé (mécanisme + contenu par défaut) :** le harness (playbook + verbes), les rôles, les principes (grill, aucun angle mort), où chaque contexte se branche (`design`, `directives`, `agent_context_snapshots`), et le **contenu par défaut des playbooks ci-dessus**.
+**Posé (mécanisme + texte livré) :** le harness (manuel + verbes), les trois rôles et la charte des sous-agents, les principes (grill, aucun angle mort), où chaque contexte se branche (`design`, `directives`, `agent_context_snapshots`), et le **texte des manuels** dans [`agent-manuals.md`](agent-manuals.md).
 
-**À faire (authoring / raffinage) :** affiner ces playbooks à l'usage, et écrire le contenu **par projet** : les `directives` spécifiques et le `DESIGN.md` de chaque projet. Ça, c'est de la donnée éditable, pas une décision figée.
+**À faire (authoring / raffinage) :** affiner les manuels à l'usage, et écrire le contenu **par projet** : les `directives` spécifiques, les notes des commandes managées et le `DESIGN.md` de chaque projet. Ça, c'est de la donnée éditable, pas une décision figée.
+
+**Reporté à la v3 (PDR-0031) :** sessions par étape, outils visibles par étape, validateurs configurables, empreinte des tours humains.

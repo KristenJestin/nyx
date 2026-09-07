@@ -109,9 +109,11 @@ Questions à trancher :
 
 ## Q-014 - Mécanisme des hooks projet
 
-**Status: resolved (PDR-0020)**
+**Status: resolved (PDR-0020), amendée par PDR-0031**
 
-Tranchée : le fourre-tout « directives » de Depot est **décomposé en trois concepts** (PDR-0020) — **rules** (contexte advisory, table `directives`), **checks** (commandes déterministes à un gate, `managed_commands.gate` + `blocking`), **agents** (les rôles, table `agents` ; les ex-hooks « sous-agent » comme la *visual pass* deviennent un subagent `ui-tester` observable). Le **workflow** (`workflows` + `workflow_agents`) les câble ; la **livraison** passe par les hooks du plugin (SessionStart / UserPromptSubmit), **pas** par une table de hooks générique. Plus de table `hooks` séparée, ni de `kind` command/guard/check sur `directives`.
+Tranchée : le fourre-tout « directives » de Depot est **décomposé en trois concepts** (PDR-0020) — **rules** (contexte advisory, table `directives`), **checks** (commandes déterministes, `managed_commands`), **agents** (les rôles, table `agents` ; les ex-hooks « sous-agent » comme la *visual pass* deviennent un sous-agent observable). La **livraison** passe par les hooks du plugin (SessionStart / UserPromptSubmit / SubagentStart), **pas** par une table de hooks générique. Plus de table `hooks` séparée, ni de `kind` command/guard/check sur `directives`.
+
+**Le retrait du moteur (PDR-0031) ne rouvre pas la question, il en retire une pièce** : il n'y a plus de **workflow** (`workflows` + `workflow_agents`, `projects.workflow_id`) pour câbler les trois concepts entre eux. Ce qui les relie est désormais le **manuel de la commande** — du texte injecté, pas une composition — et, pour un check, la **note** de la commande managée, qui dit à l'agent quand la lancer. Le reste de la réponse tient tel quel.
 
 ## Q-015 - Rafraîchissement temps réel des vues dérivées de Git
 

@@ -902,8 +902,7 @@ pub(crate) fn system_approval_status(
     Ok(system_approvals::status_result(&row))
 }
 
-/// This module's `mod tests`, in its own file — the shape `engine`, `design`, `seed`,
-/// `mcp_engine` and `mcp_authoring` already use, because the matrix is a TABLE and a table's
-/// coverage is most of what there is to read about it.
+/// This module's `mod tests`, in its own file — the shape `design` already uses, because the
+/// matrix is a TABLE and a table's coverage is most of what there is to read about it.
 #[cfg(test)]
 mod tests;

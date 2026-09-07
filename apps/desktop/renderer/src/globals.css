@@ -55,9 +55,9 @@
   --color-input: var(--input);
   --color-info-foreground: var(--info-foreground);
   --color-info: var(--info);
-  /* The BRANCH hue — the engine graph paints a `selector` with it. It needed a tone of its own: it
-     used to share `primary` with the sub-workflow node, so a fork and a whole child run read alike.
-     Cyan is the one free region left between emerald (success) and blue (info). */
+  /* The BRANCH hue — a SEMANTIC tone of its own, reserved for the categorical identity palette
+     (`group-palette.test.ts`) alongside primary/destructive/success/warning/info. Cyan is the one
+     free region left between emerald (success) and blue (info). */
   --color-branch: var(--branch);
   --color-foreground: var(--foreground);
   --color-destructive-foreground: var(--destructive-foreground);

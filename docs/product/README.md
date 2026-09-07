@@ -16,10 +16,11 @@ Ce dossier est la mémoire produit durable de la prochaine génération de nyx.
 3. [Architecture de l'information](information-architecture.md)
 4. [Workflows](workflows.md)
 5. [Harness agentique et contextes](agent-harness.md)
-6. [Architecture technique](technical-architecture.md)
-7. [Roadmap](roadmap.md)
-8. [Questions ouvertes](open-questions.md)
-9. [Décisions produit](decisions/)
+6. [Manuels d'agent](agent-manuals.md) — le texte livré des commandes `/nspec`, `/ndev`, `/ndoc` et de la charte des sous-agents
+7. [Architecture technique](technical-architecture.md)
+8. [Roadmap](roadmap.md)
+9. [Questions ouvertes](open-questions.md)
+10. [Décisions produit](decisions/)
 
 Le schéma concret est dans [`data-model.dbml`](data-model.dbml). Le lexique des termes est dans [`glossary.md`](glossary.md). Le plan d'absorption de Depot est dans [`absorption.md`](absorption.md).
 
@@ -64,7 +65,7 @@ C-026 | Harness = playbook éditable + verbes observables | validated direction 
 C-027 | Review = review / comment / task ; finding = task | validated     | PDR-0012
 C-028 | Repository logique ; pas de table de checkout    | validated     | PDR-0013
 C-029 | Grill : l'humain lâche brut, l'agent structure, l'humain valide | validated | agent-harness
-C-030 | Playbook par défaut (orchestrateur/coder/auditeurs/doc) | proposed | agent-harness
+C-030 | Playbook par défaut (orchestrateur/coder/auditeurs/doc) | superseded | agent-harness, superseded par PDR-0031 (voir C-056)
 C-031 | Spec = unité humaine ; tâches = décomposition agent | validated | PDR-0014
 C-032 | Clé Linear sur le Spec (préfixe projet + numéro) ; tâches sans clé | validated | PDR-0014
 C-033 | Priorité = enum string, stockée sur Spec et tâche | validated | PDR-0014
@@ -80,16 +81,17 @@ C-042 | Partage app/agent/humain : verbe nyx / inputs humain-ou-agent / travail 
 C-043 | Start dev = squelette générique + points d'extension projet (repo-set, setup hook, playbook, commands) | validated | PDR-0019
 C-044 | Mécanisme de hooks projet (directives enrichies) | superseded | PDR-0020
 C-045 | Agents = bibliothèque réutilisable, 4 types (spec/dev/doc/subagent) | validated | PDR-0020
-C-046 | Workflow = composition réutilisable (défaut nyx) ; projet → workflow | validated | PDR-0020
+C-046 | Workflow = composition réutilisable (défaut nyx) ; projet → workflow | superseded | PDR-0020, superseded par PDR-0031 (voir C-056)
 C-047 | rules / checks / agents (décompose les « directives » Depot) | validated | PDR-0020
-C-048 | Contexte livré par hooks (SessionStart/UserPromptSubmit), zéro CLI ; install via Settings | validated | PDR-0020
-C-049 | Mode par spec (stepped / autopilot) | validated | PDR-0020
+C-048 | Contexte livré par hooks (SessionStart/UserPromptSubmit/SubagentStart), zéro CLI ; install via Settings | validated | PDR-0020, PDR-0031
+C-049 | Mode par spec (stepped / autopilot) | superseded | PDR-0020, superseded par PDR-0031 (voir C-056)
 C-050 | Human task surfacée dans l'onglet Tasks (badge, actionnable) ; Attention Inbox différée | validated | PDR-0021
 C-051 | Phases nommées (liste ordonnée sur la spec) ; pas de table, statut dérivé | validated | PDR-0022
 C-052 | Stockage = SQLite (statiquement liée au sidecar) ; couche requêtes = impl ; Turso différé | validated | PDR-0023
 C-053 | Stockage = un seul fichier SQLite ; séparation des bounded contexts logique, pas physique | validated | PDR-0024
 C-054 | Shell de navigation multi-pages (routeur TanStack, memory history) + terminal no-host (wterm/ghostty, store module-level) | validated | PDR-0025, PDR-0026
 C-055 | Moteur de diff Git : gix primaire + fallback git CLI cohérent + `notify` (temps réel sans polling) | validated | PDR-0027
+C-056 | Manuels par commande (`/nspec`, `/ndev`, `/ndoc`) + charte unique de sous-agent ; pas de moteur d'orchestration | validated | PDR-0031, agent-manuals
 
 ## Décisions validées à ce jour
 
@@ -118,13 +120,15 @@ C-055 | Moteur de diff Git : gix primaire + fallback git CLI cohérent + `notify
 23. **Catégorie unique par Spec** : `specs.category_id` (FK unique) remplace les **tags** (`tags`/`spec_tags`/`task_tags` supprimées) ; libellés transverses (`breaking`/`security`) droppés. Seed par défaut de quatre catégories système par projet ; l'agent **assigne** depuis l'existant et, si rien ne colle, **minte** à la volée (non bloquant). *Amendement du 2026-09-02 (PDR-0017, section « Amendement (2026-09-02) — l'axe proposé/confirmé est retiré ») : ce que l'agent minte est **valide tel quel** — plus d'état « proposée », plus de geste `confirm`, plus de badge. Ce que l'humain cure, c'est le **vocabulaire**, depuis la section « Categories » des settings du projet : **créer / renommer / supprimer**, la suppression étant refusée sur les quatre slugs système et sur une catégorie encore portée par une Spec. L'anti-prolifération repose sur la directive « préfère réutiliser » et sur cette curation, jamais sur un verrou.* Pas de classification sur les tâches. Supersède le « vocabulaire tags » de PDR-0014 (PDR-0017).
 24. **Renommage PRD → Spec** : l'unité humaine s'appelle désormais **Spec** partout (UI, docs, schéma : tables `specs`/`spec_revisions`/`spec_annexes`, colonnes `spec_id`/`spec_status`…). Clé, slug, priorité, catégorie, `executor` inchangés. Les PDR ont été **réécrits en « Spec »** (seul PDR-0018 garde « PRD » pour documenter le renommage). Supersède le choix terminologique de PDR-0014 (PDR-0018).
 25. **Partage app / agent / humain** (PDR-0019) : **verbe nyx** (exécution + autorité de l'état : worktree, workspace, status, diff, lancement) / **inputs** d'un verbe = humain (UI) ou agent (MCP, même use case PDR-0005) / **travail** = session agent observable. « Démarrer le dev » = squelette générique (verbe worktree → workspace/status → managed commands → session agent + playbook → setup hooks) + **points d'extension projet** (repo-set rule, setup hook, dev playbook, managed commands) qui rejouent `feature-start`. Le câblage manuel (tabs Warp, enregistrement workspace, `.feature.json`) devient natif = la plus-value. Le **mécanisme de hooks** est tranché par PDR-0020 (décision 26).
-26. **Fonctionnement agentique** (PDR-0020) : **agents** = bibliothèque réutilisable à **4 types** (spec/dev/doc principaux + subagent) ; un **workflow** (composition réutilisable, défaut nyx) câble 1 spec + 1 dev + 1 doc + N subagents, assigné via `projects.workflow_id`. Les « directives » Depot se décomposent en **rules** (`directives`), **checks** (`managed_commands.gate`), **agents**. Les **sous-agents = Task du provider**, observés via hooks. Le contexte est **rendu live par nyx-core et injecté via les hooks du plugin** (SessionStart / UserPromptSubmit) — **zéro CLI, zéro fichier généré** ; déclencheurs = 3 stubs fixes `/nspec` `/ndev` `/ndoc`. Install via **Settings → Integrations** (plugin bundlé, comme v1). `specs.mode` = stepped|autopilot. Résout Q-014.
+26. **Fonctionnement agentique** (PDR-0020, *amendé par PDR-0031*) : **agents** = bibliothèque réutilisable à **4 types** (spec/dev/doc principaux + subagent). Les « directives » Depot se décomposent en **rules** (`directives`), **checks** (commandes managées), **agents**. Les **sous-agents = Task du provider**, observés via hooks. Le contexte est **rendu live par nyx-core et injecté via les hooks du plugin** (SessionStart / UserPromptSubmit / SubagentStart) — **zéro CLI, zéro fichier généré** ; déclencheurs = 3 stubs fixes `/nspec` `/ndev` `/ndoc`. Install via **Settings → Integrations** (plugin bundlé, comme v1). Résout Q-014. *Superseded par PDR-0031 : la **composition workflow** (`workflows` / `workflow_agents`, `projects.workflow_id`) et les **modes** `specs.mode` (stepped/autopilot) tombent.*
 27. **Surfaçage des human tasks** (PDR-0021) : une human task (`executor=human`) s'affiche dans l'**onglet Tasks** avec un badge « toi », **actionnable** par l'humain (`done`) — seule exception à la lecture seule des tasks ; l'agent l'annonce aussi en chat ; une task agent bloquée montre « bloquée par [human task] ». L'**Attention Inbox** (roll-up transverse de tous les signaux) n'est **pas un prérequis**, elle est différée (Q-007).
 28. **Phases nommées** (PDR-0022) : les phases gagnent un **nom** via une **liste ordonnée sur la spec** (`specs.phases` = `[{number,name}]`) que `tasks.phase` indexe. **Pas de table de phases** (respecte PDR-0014), **statut de phase toujours dérivé** des tasks. Le proto nommait déjà les phases ; c'est désormais backé.
 29. **Stockage** (PDR-0023) : moteur **SQLite** (SQLite-compatible), **compilé statiquement dans le sidecar** (pas de module natif per-OS — c'était un artefact Node/N-API, mort avec le sidecar Rust). La **couche requêtes/ORM** (Diesel/sqlx/…) est un **détail d'implémentation** (v2.0), pas une décision produit. **Turso (libsql/Turso DB) + Toasty = upgrade path différé** (sync = handoff différé), réversible. Ne résout pas Q-004 (fichier unique vs plusieurs).
 30. **Stockage : un seul fichier SQLite** (PDR-0024, ferme Q-004) : toute l'autorité métier dans une base unique (transactions atomiques cross-contexte, mono-writer local WAL, backup/migration triviaux). Les bounded contexts = séparation **logique** (modules/schéma), pas physique. Le seul gain de fichiers séparés (sync indépendante) = handoff multi-machine, différé (PDR-0016). Réversible. **Décisions de cadrage v2.1** liées : le lien Spec→runtime (`specs.workspace_id` + table `specs`) est **réservé en v2.1, réalisé en v2.4** ; le temps réel des **vues dérivées de Git** (diff/dirty/branche) est **différé en v2.5** (Q-015), v2.1 ne pousse que les `domain_events` métier.
 31. **Shell de navigation + stack terminal** (PDR-0025, PDR-0026) : le renderer adopte **`@tanstack/react-router`** (routing par code, `createMemoryHistory`, `BaseLayout` racine) pour un shell **multi-pages** (rail projets + section-nav + `<Outlet/>`) ; le seam hash `#/cockpit/…` est **supprimé** (on entre dans un **projet**, jamais dans un workspace). Le terminal bascule de **xterm** vers **wterm `@wterm/dom` + core ghostty** (une seule lib VT) avec un **store d'instances no-host** (Map module-level hors React/routeur) : detach/reattach du nœud DOM → **navigation lossless**, plus un **modèle d'écran VT headless** sidecar pour un **restart lossless**. `@wterm/*` épinglés en exact (0.x jeune). Livrés en v2.2.5.
 32. **Moteur de diff Git v2.4** (PDR-0027) : **`gix` primaire** (pur-Rust, `default-features = false`, features serrées, pas de toolchain C) + **fallback `git` CLI cohérent** (porcelain `-z` partagé pour index/worktree, cohérence gix↔CLI **testable**), multi-repo sans mélange d'identités, review = vue dérivée non stockée (living/pinned). Rafraîchissement temps réel **sans polling** via **`notify`** (inotify/FSEvents/RDCW + debounce + allowlist `.git`) — tranche Q-015. Développé sur `v2.4-review`, à greffer en v2.5.
+
+33. **Retrait du moteur d'orchestration** (PDR-0031) : le **behavior tree** livré en v2.8 est **retiré** — tables `workflows` / `nodes` / `workflow_runs` / `gate_attempts` / `human_turns` / `command_slots` droppées avec `projects.workflow_id`, outils MCP `nyx_next` / `run_*` / `workflow_*` / `node_*` / `slot_bind` retirés, page « Engine » et simulateur de run supprimés. À la place : **un manuel en prose par commande** (`/nspec`, `/ndev`, `/ndoc`) injecté au `UserPromptSubmit` et **une charte unique** injectée dans chaque sous-agent au `SubagentStart` — texte livré dans [`agent-manuals.md`](agent-manuals.md). L'agent raisonne, nyx tient l'état et les verbes. Le **Spec** (`draft → ready → in_progress → in_review → completed`, plus `blocked`, `cancelled`, `archived`) est la **seule machine à états** ; `spec_transition` est exposé, avec `user_confirmed=true` obligatoire pour `ready` / `completed` / `cancelled`. `specs.mode` reste en base mais n'est plus lue. Supersède la partie moteur de PDR-0020 (C-046, C-049, C-030).
 
 ## Discipline de mise à jour
 

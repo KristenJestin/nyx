@@ -49,7 +49,6 @@ pub mod db;
 pub mod design;
 mod design_axes;
 pub mod design_tokens;
-pub mod engine;
 pub mod frontier;
 pub mod git_diff;
 pub mod git_views;
@@ -58,9 +57,7 @@ pub mod home;
 pub mod idea;
 pub mod integrations;
 pub mod mcp;
-pub mod mcp_authoring;
 pub mod mcp_context;
-pub mod mcp_engine;
 pub mod mcp_runtime;
 pub mod mcp_tools_annexe;
 pub mod mcp_tools_core;
@@ -88,7 +85,6 @@ pub mod resolve;
 pub mod review_comment;
 pub mod schema;
 pub mod search;
-pub mod seed;
 pub mod shellinteg;
 pub mod shells;
 pub mod spec_activity;
@@ -113,7 +109,7 @@ mod review_loop_gate;
 
 /// The command line that does X on THIS platform — the shared vehicle for every test that arms a
 /// managed command. It lives at the crate root because the tests that need it are spread across
-/// modules ([`mcp_engine`]'s gates, [`seed`]'s coder gate), and one translation in one place beats
+/// modules ([`mcp_runtime`]'s command tests among them), and one translation in one place beats
 /// the same `#[cfg]` written out eighteen times. Test-only, so it compiles solely under `--lib`.
 #[cfg(test)]
 pub(crate) mod test_cmdline;

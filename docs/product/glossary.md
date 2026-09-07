@@ -69,8 +69,10 @@ Lexique de référence des termes du produit nyx V2. Définitions courtes ; la v
 
 - **Harness** — pas un moteur de workflow : un **playbook** (texte/directives) que l'agent **exécute** via les **verbes observables** de nyx (PDR-0011).
 - **Verbes observables** — primitives v1 : lancer/observer une session avec un rôle, injecter du contexte, hooks start/close.
-- **Playbook** — le workflow lui-même, donnée éditable par projet (payoff v2.7).
-- **Rôles par défaut** — orchestrateur (ne code pas, pilote), coder (ne fait que des tasks), auditeur (signale des findings, ne corrige pas), doc-sync (doc post-merge, reviewable).
+- **Playbook / manuel** — le texte injecté à l'agent, rendu live par nyx-core ; un **manuel par commande** (`/nspec`, `/ndev`, `/ndoc`) plus une **charte** unique pour les sous-agents. Texte livré dans `agent-manuals.md` (PDR-0031).
+- **Charte** — le bloc que nyx injecte dans **chaque** sous-agent au `SubagentStart` (workspace, Spec ancrée, commandes managées, ce qu'il ne décide pas, comment il rapporte). La **mission**, elle, vient de l'orchestrateur.
+- **Rôles** — trois côté nyx : **spec** (grille et écrit la Spec), **dev** (orchestrateur : ne code pas, pilote, vérifie), **doc** (réconcilie la doc avec ce que le Spec a livré). Coder, auditeur et prototypeur ne sont **pas** des rôles nyx : ce sont des sous-agents briefés par l'orchestrateur.
+- **Moteur d'orchestration** — behavior tree stocké en donnée, livré en v2.8 et **retiré** (PDR-0031) : plus de `nyx_next`, plus de run, plus de graphe. Le terme ne désigne plus rien de vivant dans nyx.
 - **Aucun angle mort** — tout ce que fait l'agent passe par une surface observée : nyx possède le PTY et l'arbre de processus.
 
 ## Plateforme technique

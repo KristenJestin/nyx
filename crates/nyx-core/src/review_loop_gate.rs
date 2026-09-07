@@ -110,8 +110,9 @@ fn review_loop_chat_and_viewer_grill_rounds_resolve_stay_in_review() {
             .expect("deliver slice");
     });
 
-    // draft ─ready─▶ ready ─start─▶ in_progress ─review─▶ in_review. `ready`/`start`/`done` are
-    // sensitive (need user_confirmed); `review` is routine. `start` anchors the workspace.
+    // draft ─ready─▶ ready ─start─▶ in_progress ─review─▶ in_review. `ready`/`done`/`cancel` are
+    // sensitive (need user_confirmed); `start` et `review` sont routiniers. `start` anchors the
+    // workspace.
     db.with_conn(|c| {
         db::transition_spec(c, &spec_id, SpecTransition::Ready, true).expect("ready");
         db::transition_spec_with_workspace(

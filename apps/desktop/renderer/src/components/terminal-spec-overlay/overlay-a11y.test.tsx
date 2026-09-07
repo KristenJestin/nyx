@@ -1,7 +1,10 @@
+import { useState } from "react";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { mockIPC } from "@/bridge/test-harness";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogBackdrop, DialogPopup } from "@/components/ui/dialog";
 
 // The open panel headers render `<OverlayPanelActions>`, which calls `useNavigate`. This suite mounts
 // `<SpecOverlay>` with NO router, so stub `useNavigate` to a no-op (navigation targets are asserted
@@ -63,10 +66,6 @@ function serveDrawer(count = 1): Spec[] {
     if (cmd === "spec_detail") {
       return detail(drafts.find((d) => d.id === (args?.specId as string)) ?? drafts[0], []);
     }
-    // The open panel's header carries the Run action, and the outside-click spec below opens the
-    // REAL orchestration run modal through it. No run for this Spec ⇒ the modal's empty state, which
-    // is all this suite needs: what it asserts is WHERE the modal is mounted, not what it shows.
-    if (cmd === "engine_spec_runs") return [];
     throw new Error(`unexpected ${cmd}`);
   });
   return drafts;
@@ -81,6 +80,28 @@ function panelEl(): HTMLElement | null {
 async function openPanel(): Promise<HTMLElement> {
   await waitFor(() => expect(panelEl()).not.toBeNull());
   return panelEl() as HTMLElement;
+}
+
+/**
+ * A standalone REAL dialog, unrelated to the overlay, its own trigger owning its open state — the
+ * vehicle for "some dialog is portalled to `document.body` while the panel is open" (see the test
+ * that renders it). Kept closed until clicked so it never blocks the overlay's own languette.
+ */
+function UnrelatedDialog() {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <Button onClick={() => setOpen(true)}>Open the unrelated dialog</Button>
+      <Dialog.Root open={open} onOpenChange={setOpen}>
+        <Dialog.Portal>
+          <DialogBackdrop />
+          <DialogPopup data-testid="unrelated-dialog-popup">
+            <Dialog.Title>Some other dialog</Dialog.Title>
+          </DialogPopup>
+        </Dialog.Portal>
+      </Dialog.Root>
+    </>
+  );
 }
 
 describe("overlay a11y — F1: the languette is a DISCLOSURE (aria-expanded + aria-controls)", () => {
@@ -486,9 +507,22 @@ describe("overlay a11y — F3: Escape and outside clicks dismiss (and give focus
     expect(first).toHaveAttribute("aria-expanded", "false");
   });
 
-  it("keeps the panel open for its OWN commands and for the REAL run modal portalled out of the pane", async () => {
+  it("keeps the panel open for its OWN commands and for a REAL dialog portalled out of the pane", async () => {
     serveDrawer();
-    render(<SpecOverlay terminalId="term-1" />);
+    render(
+      <>
+        {/* A REAL dialog, opened independently of the overlay (any `Dialog.Root` in the app is
+            an example — the settings dialog, the review comment editor, …). It stands in for
+            "some dialog is open while the panel is open" without inventing a fake marker: it is
+            the SAME `ui/dialog` primitive every real dialog in the app renders through, so it
+            exercises the exact `data-portal-layer` marker the overlay's outside-press rule
+            reads — a stand-in `div` appended to the body would NOT prove that. Its own trigger
+            (rather than opening it up front) keeps it a NON-modal-blocking dialog until the
+            overlay's own languette has already been clicked. */}
+        <UnrelatedDialog />
+        <SpecOverlay terminalId="term-1" />
+      </>,
+    );
 
     fireEvent.click(await screen.findByRole("button", { name: /open draft 1 live spec/i }));
     const panel = await openPanel();
@@ -500,17 +534,15 @@ describe("overlay a11y — F3: Escape and outside clicks dismiss (and give focus
     fireEvent.click(openSpec);
     expect(panelEl()).toBe(panel);
 
-    // The REAL orchestration run modal, opened from the panel's own header. `<SpecRunButton>` OWNS
-    // its open state and renders it in place, so dismissing the panel would unmount the modal under
-    // the cursor. A stand-in `div` appended to the body would NOT prove this: it would only re-test
-    // the geography ("outside the pane"), while what excludes the modal is the explicit
-    // `data-portal-layer` marker `ui/dialog`'s `<Dialog.Portal>` stamps on the container it appends
-    // to `document.body` — asserted here, since it is what the overlay's rule reads.
-    fireEvent.click(screen.getByRole("button", { name: /open the orchestration run/i }));
-    const modalBody = await screen.findByTestId("spec-run-modal-body");
-    expect(modalBody.closest("[data-overlay-surface]")).toBeNull(); // truly outside the overlay
-    expect(modalBody.closest("[data-portal-layer]")).not.toBeNull(); // and marked as a portalled layer
-    fireEvent.mouseDown(modalBody);
+    // Open the unrelated dialog now that the panel is up — it lives outside the overlay in the DOM
+    // (portalled to `document.body`) but must not read as "outside" for the overlay's purposes — the
+    // explicit `data-portal-layer` marker is what excludes it, asserted here since it is what the
+    // overlay's rule reads.
+    fireEvent.click(screen.getByRole("button", { name: /open the unrelated dialog/i }));
+    const dialogPopup = await screen.findByTestId("unrelated-dialog-popup");
+    expect(dialogPopup.closest("[data-overlay-surface]")).toBeNull(); // truly outside the overlay
+    expect(dialogPopup.closest("[data-portal-layer]")).not.toBeNull(); // marked as a portalled layer
+    fireEvent.mouseDown(dialogPopup);
     expect(panelEl()).toBe(panel);
   });
 });

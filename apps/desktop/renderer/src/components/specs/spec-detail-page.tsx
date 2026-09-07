@@ -14,11 +14,11 @@ import {
 import { Breadcrumb, BreadcrumbCurrent, breadcrumbLinkClass } from "@/components/ui/breadcrumb";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs } from "@/components/ui/tabs";
-import { SpecRunButton } from "@/components/engine/run-modal";
 import { useActiveProject } from "@/components/terminals/active-project";
 
 import { DependencyBadges } from "./dependency-badges";
 import { SpecSidebar } from "./spec-sidebar";
+import { SpecTransitions } from "./spec-transitions";
 import { specKey } from "./spec-meta";
 import { useSpecDependencies } from "./use-spec-dependencies";
 import { useSpecDetail } from "./use-spec-detail";
@@ -74,8 +74,14 @@ function tabCount(key: SpecTabKey, detail: SpecDetail): number | null {
  * (breadcrumb + title + human key) and the TABBED body (spec / tasks / review / annexes /
  * activity / runtime) filling the column to its RIGHT. Placement reproduced from the prototype's
  * `spec/spec-page` (+ sidebar): the tab ORDER and regions are the validated layout; the LOOK is
- * the real design system (the `Tabs` primitive + tokens). The tabs consume the phase-1/2/3 model
- * via `useSpecDetail`:
+ * the real design system (the `Tabs` primitive + tokens).
+ *
+ * The header also carries the LIFECYCLE controls (`<SpecTransitions>`): with the orchestration
+ * engine retired (PDR-0031), the Spec state machine is the only one left and this page is where a
+ * human moves it — one button per transition legal from the current status, and nothing on a
+ * terminal Spec.
+ *
+ * The tabs consume the phase-1/2/3 model via `useSpecDetail`:
  *  - spec → the active revision; tasks → tasks + dependencies;
  *  - activity / runtime → the DERIVED workspace context (the phase-3 Spec→workspace link);
  *  - review → the Spec-scoped review comments + an "Open review" button onto the full-screen
@@ -145,7 +151,7 @@ export function SpecDetailPage() {
                 {spec.title}
               </h1>
             </div>
-            <div className="flex shrink-0 items-center gap-2 pt-0.5">
+            <div className="flex shrink-0 items-start gap-3 pt-0.5">
               {/* Spec↔Spec dependency badges (PRD "badges dépendances sur le détail Spec"). Present
                   only when non-zero; the same `<DependencyBadges>` the board card surfaces. */}
               <DependencyBadges
@@ -153,9 +159,10 @@ export function SpecDetailPage() {
                 unblocks={deps.unblocks_count}
                 className="pt-0.5"
               />
-              {/* The Spec's ORCHESTRATION RUN — the shared engine graph + the run's blackboard, in a
-                  modal. The runtime lives with the Spec, not on `/engine` (which is structural). */}
-              <SpecRunButton specId={specId} />
+              {/* The LIFECYCLE controls (PDR-0031): the transitions legal from the Spec's current
+                  status, and the confirmation the three sensitive ones ask for. Nothing at all on a
+                  terminal Spec. */}
+              <SpecTransitions detail={detail} refresh={refresh} />
             </div>
           </div>
         </header>

@@ -44,11 +44,10 @@ export function overlayPanelId(specId: string): string {
  *    straight through to the terminal underneath, so `event.target` IS the terminal) — and dismissing
  *    is the wanted behaviour there.
  *  - `[data-portal-layer]` is the container `ui/dialog`'s `<Dialog.Portal>` stamps on the node Base UI
- *    appends to `document.body`. A layer opened FROM the panel (the orchestration run modal of
- *    `<OverlayPanelActions>`) lives there: outside the overlay in the DOM, inside it for the user.
- *    `<SpecRunButton>` OWNS the modal's open state and renders it in place, so dismissing the panel
- *    would unmount the modal under the cursor. The marker is deliberately NOT `role="dialog"` — the
- *    panel itself carries that role, so it would discriminate nothing.
+ *    appends to `document.body`. A dialog opened FROM the panel lives there: outside the overlay in
+ *    the DOM, inside it for the user. Whatever owns that dialog's open state renders it in place, so
+ *    dismissing the panel would unmount the dialog under the cursor. The marker is deliberately NOT
+ *    `role="dialog"` — the panel itself carries that role, so it would discriminate nothing.
  */
 const OVERLAY_INSIDE_SELECTOR = "[data-overlay-surface],[data-portal-layer]";
 

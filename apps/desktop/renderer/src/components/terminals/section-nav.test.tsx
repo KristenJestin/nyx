@@ -9,9 +9,9 @@ import type { ProjectRecord, WorkspaceRecord } from "@/components/sidebar/use-pr
 /**
  * THE SECTION-NAV IS DERIVED FROM THE SCOPE (H2 + H5).
  *
- * Six entries inside a project — Home · Terminals · Work · Ideas · Engine · Design — and THREE
- * across every project: Home · Work · Ideas. The three others are ABSENT FROM THE DOM, not greyed
- * and not present-and-refusing: `Terminals`, `Engine` and `Design` have no cross-project reading
+ * Five entries inside a project — Home · Terminals · Work · Ideas · Design — and THREE
+ * across every project: Home · Work · Ideas. The two others are ABSENT FROM THE DOM, not greyed
+ * and not present-and-refusing: `Terminals` and `Design` have no cross-project reading
  * that means anything, and an entry one can click into a lie is worse than no entry. So this file
  * asserts by ABSENCE, never by a disabled attribute.
  *
@@ -21,10 +21,10 @@ import type { ProjectRecord, WorkspaceRecord } from "@/components/sidebar/use-pr
  */
 
 /** The rail entries of each scope, in the order the nav lists them. */
-const PROJECT_NAV = ["Home", "Terminals", "Work", "Ideas", "Engine", "Design"] as const;
+const PROJECT_NAV = ["Home", "Terminals", "Work", "Ideas", "Design"] as const;
 const GLOBAL_NAV = ["Home", "Work", "Ideas"] as const;
-/** The three the global scope drops. */
-const PROJECT_ONLY = ["Terminals", "Engine", "Design"] as const;
+/** The two the global scope drops. */
+const PROJECT_ONLY = ["Terminals", "Design"] as const;
 
 function project(id: string, name: string): ProjectRecord {
   return { id, name, key: "P", collapsed: false, created_at: 0, updated_at: 0, resume_agent_sessions: false };
@@ -103,7 +103,7 @@ describe("The section-nav follows the scope", () => {
     expect(screen.getByRole("link", { name: "Ideas" }).getAttribute("href")).toBe("/knowledge");
   });
 
-  it("carries THREE across every project — the other three are ABSENT from the DOM", async () => {
+  it("carries THREE across every project — the other two are ABSENT from the DOM", async () => {
     const { container } = mount("/home?scope=all");
     await screen.findByRole("link", { name: "Home" });
     await waitFor(() => expect(navLabels()).toEqual([...GLOBAL_NAV]));
@@ -111,7 +111,7 @@ describe("The section-nav follows the scope", () => {
     for (const label of PROJECT_ONLY) {
       expect(screen.queryByRole("link", { name: label })).toBeNull();
     }
-    for (const href of ["/", "/engine", "/design"]) {
+    for (const href of ["/", "/design"]) {
       expect(container.querySelector(`aside a[href="${href}"]`)).toBeNull();
     }
   });

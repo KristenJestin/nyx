@@ -10,13 +10,13 @@ L'application a **trois scopes**, exclusifs, portés par une seule valeur discri
 
 | Scope | Ce qu'on lit | Où on entre | Écran |
 | --- | --- | --- | --- |
-| **projet** | le projet entré | une tuile projet du rail | ses six pages |
+| **projet** | le projet entré | une tuile projet du rail | ses cinq pages |
 | **all projects** | tous les projets à la fois | la barre « All projects », en tête du rail | `/home?scope=all` |
 | **Système** | l'hôte sur lequel l'app tourne — le singleton technique, absent de `list_projects` | la tuile Système, au pied du rail | `/system` |
 
 Le rail répond donc à **deux questions dans deux régions** : au-dessus du filet de la section-nav, *quel scope* — une seule des trois marques est allumée à la fois ; en dessous, *quelle page*. Le **projet entré est mémorisé** dans les deux autres scopes (il perd son anneau, jamais sa place) : en ressortir est un clic.
 
-La section-nav est **dérivée du scope** : six entrées dans un projet — **Home** (`/home`), **Terminals** (`/`), **Work** (`/work`), **Ideas** (`/knowledge`), **Engine** (`/engine`), **Design** (`/design`) ; **trois** en scope transverse — Home, Work, Ideas, les trois autres n'ayant pas de lecture transverse qui ait un sens ; **aucune** en Système, où les six liraient un projet que le singleton n'est pas. Ce qui est absent l'est vraiment, jamais grisé. Les libellés `Ideas` et `Design` nomment des routes internes inchangées (`/knowledge`, `/design`) : voir la correspondance au glossaire.
+La section-nav est **dérivée du scope** : cinq entrées dans un projet — **Home** (`/home`), **Terminals** (`/`), **Work** (`/work`), **Ideas** (`/knowledge`), **Design** (`/design`) ; **trois** en scope transverse — Home, Work, Ideas, les deux autres n'ayant pas de lecture transverse qui ait un sens ; **aucune** en Système, où les cinq liraient un projet que le singleton n'est pas. Ce qui est absent l'est vraiment, jamais grisé. L'entrée **Engine** (`/engine`), visualiseur du moteur d'orchestration, est **retirée** avec le moteur (PDR-0031). Les libellés `Ideas` et `Design` nomment des routes internes inchangées (`/knowledge`, `/design`) : voir la correspondance au glossaire.
 
 `/home?scope=` et `/system` **miroitent** leur scope : y arriver par un lien profond ou une route restaurée met l'application dans le scope correspondant, donc l'url d'une page ne peut jamais contredire le rail. Les **dots d'activité** du rail suivent la même logique d'écran : une tuile ne se tait que quand son propre détail est affiché, jamais parce qu'elle est « celle qu'on avait entrée ».
 

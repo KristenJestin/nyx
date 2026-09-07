@@ -36,38 +36,6 @@
 //!
 //! It never changes a verdict. `exit 2` stays `exit 2` on all three shells; a gate that was red
 //! stays red, for the reason it claims. Only the spelling moves.
-//!
-//! ## A DELIBERATE duplicate lives in `examples/sim/`
-//!
-//! The run simulator (`crates/nyx-core/examples/sim/`, PRD « Simulateur de run sans agent ») arms
-//! gate slots too, and is bound by exactly the rule above. But it is an EXAMPLE: it compiles only
-//! against `nyx_core`'s PUBLIC API, and this module is `pub(crate)` — a decision, not an oversight
-//! (no `pub(crate)` is widened for the simulator). So `examples/sim/driver.rs` (the [`Shell`] family
-//! + `shell_stem`) and `examples/sim/scenario.rs` (`Sentinel::render`) restate this module's ~30
-//! lines, knowingly. Both files say so; this note is the other half of the pair.
-//!
-//! **What is duplicated is the SET OF BEHAVIOURS, one dialect at a time — not the text.** The
-//! simulator's three sentinels are the same three vehicles, for the same interpreter, with the same
-//! verdicts:
-//!
-//!   * `green` — [`green`] renders `exit 0`, and so does the simulator's: SAME text;
-//!   * `red` — [`red`] renders `exit 1`, and so does the simulator's: SAME text;
-//!   * `green_when_file_exists` — SAME text in POSIX (`test -f 'f' || exit 1; exit 0`, a GUARD that
-//!     bails out early: [`Cmdline::requires_file`] then [`Cmdline::exits`]), DIFFERENT text on the
-//!     two Windows dialects: `if (-not (Test-Path …)) { exit 1 }; exit 0` here against
-//!     `if (Test-Path …) { exit 0 } else { exit 1 }` there, and `if not exist f exit 1&exit 0`
-//!     against `if exist f (exit 0) else (exit 1)`.
-//!
-//! POSIX agrees for a REASON, not by accident: a self-contained `test -f 'f'; exit $?` would be
-//! rejected at PARSE time by `fish`, which [`crate::pty::resolve_shell`] honours as soon as `SHELL`
-//! names it, and a line the shell refuses exits non-zero — a RED that measured nothing. The two
-//! Windows dialects diverge because the shapes differ: here a [`Cmdline`] is a BUILDER that chains
-//! guards before one closing [`Cmdline::exits`], while a `Sentinel` renders a whole line at once and
-//! has nothing to chain. Both spellings are equivalent (green exactly when the file is there) and
-//! both obey the rule above — neither needs anything on `PATH`. So a change to a dialect here must
-//! be CARRIED there, never copy-pasted: transpose the behaviour into the simulator's shape. The two
-//! are kept honest by the same anchor: both ask [`crate::pty::resolve_shell`] which interpreter will
-//! really get the line.
 
 use crate::command::shell_stem;
 use crate::pty::resolve_shell;
@@ -144,17 +112,6 @@ impl Cmdline {
         self.push(part)
     }
 
-    /// Print `count` copies of `line` — the flood a bounded output-tail is measured against.
-    pub(crate) fn prints_lines(self, count: usize, line: &str) -> Self {
-        let part = match self.shell {
-            // `yes | head` is the cheap POSIX flood; both are POSIX-standard utilities.
-            Shell::Posix => format!("yes {line} | head -n {count}"),
-            Shell::PowerShell => format!("1..{count} | ForEach-Object {{ Write-Output '{line}' }}"),
-            Shell::Cmd => format!("for /L %i in (1,1,{count}) do @echo {line}"),
-        };
-        self.push(part)
-    }
-
     /// Print `prefix`, then the VALUE of the environment variable `var` (empty when it is unset),
     /// then `suffix`.
     ///
@@ -172,35 +129,12 @@ impl Cmdline {
         self.push(part)
     }
 
-    /// Stop here with exit code 1 unless the environment variable `var` is set and non-empty.
-    pub(crate) fn requires_env(self, var: &str) -> Self {
-        let part = match self.shell {
-            Shell::Posix => format!("test -n \"${{{var}}}\" || exit 1"),
-            Shell::PowerShell => format!("if (-not $env:{var}) {{ exit 1 }}"),
-            Shell::Cmd => format!("if not defined {var} exit 1"),
-        };
-        self.push(part)
-    }
-
-    /// Stop here with exit code 1 unless `name` exists as a file in the command's cwd.
-    ///
-    /// Relative on purpose — a gate's cwd IS its subject, and each of these three spellings
-    /// resolves the name against the process's own working directory.
-    pub(crate) fn requires_file(self, name: &str) -> Self {
-        let part = match self.shell {
-            Shell::Posix => format!("test -f '{name}' || exit 1"),
-            Shell::PowerShell => format!("if (-not (Test-Path -LiteralPath '{name}')) {{ exit 1 }}"),
-            Shell::Cmd => format!("if not exist {name} exit 1"),
-        };
-        self.push(part)
-    }
-
     /// BLOCK until `name` appears as a file in the command's cwd — the rendezvous that lets a test
     /// decide WHEN a running command produces its next output, instead of racing a sleep.
     ///
     /// Bounded (~60 s) so a test that never drops the file cannot leave a process behind. Relative
-    /// on purpose, like [`Cmdline::requires_file`]: the name resolves against the command's own
-    /// working directory, which is the one the test controls.
+    /// on purpose: the name resolves against the command's own working directory, which is the one
+    /// the test controls.
     pub(crate) fn waits_for_file(self, name: &str) -> Self {
         let part = match self.shell {
             Shell::Posix => format!(
@@ -256,12 +190,6 @@ pub(crate) fn red() -> String {
 /// A command that prints `text` and then exits with `code`.
 pub(crate) fn prints_then_exits(text: &str, code: i32) -> String {
     Cmdline::new().prints(text).exits(code)
-}
-
-/// A command that is GREEN exactly when `name` exists in its cwd, and red otherwise — the sentinel
-/// gate: red until the work under test drops the file, green from then on.
-pub(crate) fn green_when_file_exists(name: &str) -> String {
-    Cmdline::new().requires_file(name).exits(0)
 }
 
 #[cfg(test)]

@@ -184,7 +184,6 @@ function mountApp(entry = "/") {
       // suite (`system/system-scope-page.test.tsx`).
       probe("/system"),
       probe("/knowledge"),
-      probe("/engine"),
       probe("/design"),
     ]),
     history: createMemoryHistory({ initialEntries: [entry] }),
@@ -226,7 +225,7 @@ function railSaysSystem(): boolean {
 
 /** The labels the section-nav is drawing right now, in DOM order. */
 function navLabels(): string[] {
-  return ["Home", "Terminals", "Work", "Ideas", "Engine", "Design"].filter(
+  return ["Home", "Terminals", "Work", "Ideas", "Design"].filter(
     (label) => screen.queryByRole("link", { name: label }) !== null,
   );
 }
@@ -469,7 +468,7 @@ describe("The SYSTÈME scope — the third one", () => {
   it("EMPTIES the section-nav — every entry of it reads a project", async () => {
     mountApp("/");
     await entered("Alpha");
-    expect(navLabels()).toEqual(["Home", "Terminals", "Work", "Ideas", "Engine", "Design"]);
+    expect(navLabels()).toEqual(["Home", "Terminals", "Work", "Ideas", "Design"]);
 
     fireEvent.click(systemTile());
     await waitFor(() => expect(railSaysSystem()).toBe(true));
@@ -496,7 +495,7 @@ describe("The SYSTÈME scope — the third one", () => {
     await waitFor(() => expect(p.getAttribute("data-kind")).toBe("project"));
     expect(p.getAttribute("data-read")).toBe("p2");
     expect(railSaysSystem()).toBe(false);
-    expect(navLabels()).toEqual(["Home", "Terminals", "Work", "Ideas", "Engine", "Design"]);
+    expect(navLabels()).toEqual(["Home", "Terminals", "Work", "Ideas", "Design"]);
   });
 
   it("is LEFT by the `All projects` bar too — the three are exclusive", async () => {

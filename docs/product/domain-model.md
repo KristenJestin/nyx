@@ -21,7 +21,7 @@ Project
  |- Specs                       (unité humaine, clé Linear ; tickets durables -> workspace de dev)
  |   `- Tasks                   (décomposition agent ; executor agent|human)
  |- Reviews                     (vue dérivée : commentaires ancrés sur (workspace, repo) + spec_id ; finding = task)
- |- Agents / Workflows          (bibliothèque réutilisable ; le projet pointe un workflow)
+ |- Agents                      (bibliothèque réutilisable de rôles ; manuels injectés par hooks)
  |- Ideas
  |- ADRs
  |- Directives (rules) + Checks (managed commands à un gate)
@@ -121,18 +121,20 @@ Le trou intention/runtime est comblé par le **workspace** lui-même, plus la co
 
 Session persistante d'un fournisseur agentique, rattachée à un workspace et liée à un terminal courant qu'elle peut survivre pour rester reprenable. Le modèle doit rester provider-agnostic ; Claude Code est un adaptateur.
 
-## Agents, Workflows, Rules & Checks
+## Agents, Manuels, Rules & Checks
 
-**Status: validated (PDR-0020)**
+**Status: validated (PDR-0020, amendé par PDR-0031)**
 
 Le fonctionnement agentique se décompose en concepts de première classe :
 
-- **Agent** — définition de rôle, **bibliothèque réutilisable** (table `agents`). Quatre types : **spec**, **dev** (orchestrateur), **doc** (les principaux, déclenchables `/nspec` `/ndev` `/ndoc`) et **subagent** (coder, auditeur, ui-tester…, lancés par les principaux via le **Task du provider**, observés par nyx). nyx livre des défauts forkables ; les customs sont réutilisables entre projets. Contenu = template de prompt (statique + marqueurs rules/checks/données) + outils/skills + modèle.
-- **Workflow** — composition réutilisable (`workflows` + `workflow_agents`) : 1 spec + 1 dev + 1 doc + N subagents + wiring (quel subagent/check à quel scope). nyx livre un workflow par défaut ; `projects.workflow_id` l'assigne.
+- **Agent** — définition de rôle, **bibliothèque réutilisable** (table `agents`). Trois principaux — **spec**, **dev** (orchestrateur), **doc** — déclenchables par `/nspec` `/ndev` `/ndoc`, plus les **sous-agents** (coder, auditeur, ui-tester…), lancés par les principaux via le **Task du provider** et observés par nyx. nyx livre des défauts forkables ; les customs sont réutilisables entre projets. Contenu = template de prompt (statique + marqueurs rules/checks/données) + outils/skills + modèle.
+- **Manuel** — le texte injecté à un agent principal quand sa commande est tapée, plus la **charte** injectée à chaque sous-agent. Le manuel dit quoi faire ; l'agent raisonne ; nyx tient l'état et les verbes. Texte livré dans [`agent-manuals.md`](agent-manuals.md). Il n'y a **pas** de composition exécutable : les `workflows` du moteur v2.8 sont retirés (PDR-0031).
 - **Rule** — consigne advisory projet injectée dans un agent (`directives`). Ex. « Angular v20 idioms ».
-- **Check** — commande déterministe à un gate, blocking (`managed_commands.gate`). Ex. lint / test / secrets.
+- **Check** — commande managée déterministe (lint / test / secrets) dont la **note** dit à l'agent quand la lancer.
 
-Le contexte d'un agent est **rendu live par nyx-core** et injecté via les **hooks du plugin** (SessionStart / UserPromptSubmit), sans CLI ni fichiers générés (PDR-0020). Une **Agent Session** (ci-dessus) est l'instance **runtime** d'un de ces agents.
+Le contexte d'un agent est **rendu live par nyx-core** et injecté via les **hooks du plugin** (SessionStart / UserPromptSubmit / SubagentStart), sans CLI ni fichiers générés (PDR-0020). Une **Agent Session** (ci-dessus) est l'instance **runtime** d'un de ces agents.
+
+La seule **machine à états** du domaine agentique est celle du **Spec** (`draft → ready → in_progress → in_review → completed`, plus `blocked`, `cancelled`, `archived`), avancée par `spec_transition` ; il n'existe aucun état d'exécution parallèle (run, nœud courant, blackboard, tour humain en attente).
 
 ## Review
 

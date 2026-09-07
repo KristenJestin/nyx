@@ -106,7 +106,6 @@ function renderLayout(initialEntry = "/") {
     mk("/work", "WORK PAGE"),
     mk("/work/$specId", "SPEC PAGE"),
     mk("/knowledge", "KNOWLEDGE PAGE"),
-    mk("/engine", "ENGINE PAGE"),
     mk("/design", "CATALOGUE PAGE"),
   ]);
   const router = createRouter({
@@ -319,13 +318,13 @@ describe("the Système tile in the rail", () => {
     await waitFor(() => expect(system.getAttribute("aria-current")).toBe("true"));
   });
 
-  it("MASKS THE SIX section entries — every one of them reads a project", async () => {
+  it("MASKS THE FIVE section entries — every one of them reads a project", async () => {
     // This test has now said both things, and the second one is the human's ruling. Finding S2 hid
-    // four of them; U1 restored all six on the reasoning that the project is still entered, so they
+    // four of them; U1 restored all of them on the reasoning that the project is still entered, so they
     // still lead to its surfaces. True — and that is precisely the objection: they lead OUT of the
     // scope one has just entered. Système being a scope again, the rule that governs the other two
     // governs it — an entry belongs to a scope when it READS in it, and the singleton has no Spec,
-    // no idea, no design system and no engine run. The way back is the project tile, one click,
+    // no idea and no design system. The way back is the project tile, one click,
     // with the project still remembered (the test above).
     installBackend();
     const { router } = renderLayout();
@@ -333,7 +332,7 @@ describe("the Système tile in the rail", () => {
 
     fireEvent.click(system);
     await waitFor(() => expect(router.state.location.pathname).toBe("/system"));
-    for (const label of ["Home", "Terminals", "Work", "Ideas", "Engine", "Design"]) {
+    for (const label of ["Home", "Terminals", "Work", "Ideas", "Design"]) {
       expect(screen.queryByRole("link", { name: label })).toBeNull();
     }
     // The SCOPE region is untouched — it is the way out, so masking it would strand the user — and

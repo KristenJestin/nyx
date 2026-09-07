@@ -46,7 +46,7 @@ CLI + web UI Node, ~39 tables. Le **domaine** est porté ; les **enveloppes** (w
 | Annexes (`spec_annexes`) | porter (concept **annexe**) | v2.4 / v2.6 | PDR-0016 |
 | Ideas | porter | v2.6 | proposed |
 | ADR | porter | v2.6 | proposed |
-| Directives | **décomposer** → rules (`directives`) + checks (`managed_commands.gate`) + agents | v2.4 / v2.7 | PDR-0011 / PDR-0020 |
+| Directives | **décomposer** → rules (`directives`) + checks (commandes managées ; leur note dit quand les lancer) + agents | v2.4 / v2.7 | PDR-0011 / PDR-0020 / PDR-0031 |
 | Documents / `doc_profiles` / `doc_sync_runs` | porter (doc-sync = agent-job) | v2.6 / v2.7 | agent-harness |
 | Milestones | porter | v2.7 | proposed |
 | Tags | **remplacés** par catégorie unique (`categories`) | v2.4 | PDR-0017 |

@@ -349,11 +349,13 @@ pub fn port_divergence(install: &PluginInstall, bound_port: u16) -> Option<PortD
 /// never namespaces them `/<plugin>:<cmd>` — dogfood finding 01KXEJVZ). Each is deployed
 /// VERBATIM into the user-scope command dir ([`PluginInstall::commands_dir`]) so the human
 /// invokes `/nspec` `/ndev` `/ndoc` BARE — that INVOCATION is what the hook's `UserPromptSubmit`
-/// branch keys on to inject the live-rendered role manual. Each stub DECLARES the run its command
-/// opens in a `<!-- NYX-AGENT-CONTEXT role=… scope=… -->` sentinel: the hook never reads that text
-/// (a hook receives the prompt as TYPED, never the expanded body), but the push-injection e2e
-/// binds the hook's command table to this declaration, so the two cannot drift. `$ARGUMENTS`
-/// carries the human's free text through.
+/// branch keys on to inject the live-rendered role manual. Each stub DECLARES the MANUAL its
+/// command reads in a `<!-- NYX-AGENT-CONTEXT role=… -->` sentinel — one of the THREE roles
+/// (`spec` / `dev` / `doc`, PDR-0031 / `docs/product/agent-manuals.md` §5 row 6), and nothing
+/// else: there is no `scope=` any more, because a scope named a node of the retired orchestration
+/// engine. The hook never reads that text (a hook receives the prompt as TYPED, never the expanded
+/// body), but the push-injection e2e binds the hook's command table to this declaration, so the
+/// two cannot drift. `$ARGUMENTS` carries the human's free text through.
 /// `(file_name, verbatim_content)` — the SAME bytes the byte-identity + push-injection tests
 /// read from the canonical source dir on disk.
 pub const USER_COMMAND_STUBS: [(&str, &str); 3] = [
@@ -1753,14 +1755,14 @@ mod tests {
         install_with(&inst, &cli).unwrap();
         for ((name, _), marker) in USER_COMMAND_STUBS
             .iter()
-            .zip(["role=dev scope=nspec", "role=dev", "role=dev scope=ndoc"])
+            .zip(["role=spec", "role=dev", "role=doc"])
         {
             let deployed = commands_dir.join(name);
             let body = std::fs::read_to_string(&deployed)
                 .unwrap_or_else(|e| panic!("stub {name} deployed: {e}"));
             assert!(
-                body.contains(&format!("NYX-AGENT-CONTEXT {marker}")),
-                "deployed {name} carries the `{marker}` dispatcher sentinel"
+                body.contains(&format!("<!-- NYX-AGENT-CONTEXT {marker} -->")),
+                "deployed {name} carries the `{marker}` manual sentinel"
             );
             assert!(
                 body.contains("$ARGUMENTS"),
@@ -2005,12 +2007,18 @@ mod tests {
     /// sentinel + `$ARGUMENTS`. The compiled-in constant and the on-disk canonical file are
     /// asserted byte-identical (the push-injection e2e reads the on-disk copy — it binds the
     /// hook's command table to the sentinel DECLARED there; the deploy writes the constant).
+    ///
+    /// THE ROLES ARE THE THREE OF PDR-0031 — `/nspec → spec`, `/ndev → dev`, `/ndoc → doc`, one
+    /// per command, no `scope=` (§5 row 6). The old table sent all three to `role=dev` and
+    /// discriminated on a `scope` naming an engine node; with the engine retired the role IS the
+    /// whole of what selects a manual, and a stub that still declared a scope would bind the
+    /// push-injection e2e to a token nothing reads.
     #[test]
     fn nyx_core_ships_the_user_scope_command_stubs() {
         let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         for ((name, content), marker) in USER_COMMAND_STUBS
             .iter()
-            .zip(["role=dev scope=nspec", "role=dev", "role=dev scope=ndoc"])
+            .zip(["role=spec", "role=dev", "role=doc"])
         {
             let on_disk = crate_root.join("resources/claude-commands").join(name);
             let bytes = std::fs::read(&on_disk)
@@ -2021,12 +2029,81 @@ mod tests {
                 "the compiled-in `{name}` must match the on-disk canonical source byte-for-byte"
             );
             assert!(
-                content.contains(&format!("NYX-AGENT-CONTEXT {marker}")),
+                content.contains(&format!("<!-- NYX-AGENT-CONTEXT {marker} -->")),
                 "`{name}` must declare the `{marker}` sentinel the hook's command table mirrors"
+            );
+            assert!(
+                !content.contains("scope="),
+                "`{name}` must NOT declare a `scope=` — the engine that gave a scope meaning is \
+                 retired (PDR-0031)"
             );
             assert!(
                 content.contains("$ARGUMENTS"),
                 "`{name}` must forward the human's free text"
+            );
+        }
+    }
+
+    /// GUARD (PDR-0031): no stub may still name a verb of the retired orchestration engine. The
+    /// stubs are what the human's session reads when the injected manual is ABSENT (sidecar down,
+    /// hook did not fire) — a stub telling it to call `nyx_next` sends it at a tool that no longer
+    /// exists, in exactly the situation where nyx cannot correct it.
+    #[test]
+    fn user_scope_command_stubs_name_no_retired_engine_tool() {
+        for (name, content) in USER_COMMAND_STUBS {
+            for dead in [
+                "nyx_next",
+                "run_start",
+                "workflow_",
+                "node_",
+                "slot_bind",
+                "run_id",
+            ] {
+                assert!(
+                    !content.contains(dead),
+                    "`{name}` still names the retired `{dead}`"
+                );
+            }
+        }
+    }
+
+    /// GUARD (PDR-0031 / `agent-manuals.md` §5 row 5b): `SubagentStart` must be REGISTERED in the
+    /// bundled `hooks.json`. The sub-agent charter is relayed by that hook and by nothing else —
+    /// an unregistered event is a capability that silently never fires, with no error anywhere to
+    /// read. Asserted on the SHIPPED file, next to the events the live dot depends on.
+    #[test]
+    fn bundled_hooks_json_registers_every_event_nyx_depends_on() {
+        let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let raw =
+            std::fs::read_to_string(crate_root.join("resources/claude-plugin/hooks/hooks.json"))
+                .expect("the bundled hooks.json must ship");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).expect("the bundled hooks.json must be valid JSON");
+        let hooks = parsed
+            .get("hooks")
+            .and_then(|h| h.as_object())
+            .expect("hooks.json carries a `hooks` object");
+        for event in [
+            "SessionStart",
+            "SessionEnd",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "SubagentStart",
+            "SubagentStop",
+            "Notification",
+            "Stop",
+            "StopFailure",
+        ] {
+            let entries = hooks
+                .get(event)
+                .and_then(|e| e.as_array())
+                .unwrap_or_else(|| panic!("`{event}` must be registered in hooks.json"));
+            let commands = serde_json::to_string(entries).unwrap();
+            assert!(
+                commands.contains("nyx-session-hook.cjs") && commands.contains(event),
+                "`{event}` must run the bundled `.cjs` with its own event name: {commands}"
             );
         }
     }

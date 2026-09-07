@@ -15,10 +15,11 @@
 //! `idea_add`). A second implementation is how the hook's recogniser and the core drifted apart in
 //! the first place, so nothing here is to be restated anywhere: the one truth to keep is this one.
 //!
-//! THE HOOK IS A RECOGNISER, NEVER A RESOLVER. `nyx-session-hook.cjs` opens the run BEFORE the
-//! agent says anything, so a form IT cannot see is a form that never reaches this module on that
-//! path — and its regex used to know the canonical id ALONE, the one shape a human never sees,
-//! which is why a `/nspec 3` arrived at `run_start` with no Spec named at all. It recognises the
+//! THE HOOK IS A RECOGNISER, NEVER A RESOLVER. `nyx-session-hook.cjs` reads the prompt BEFORE the
+//! agent says anything and forwards the token to `agent_context`, so a form IT cannot see is a form
+//! that never reaches this module on that path — and its regex used to know the canonical id ALONE,
+//! the one shape a human never sees, which is why a `/nspec 3` arrived with no Spec named at all
+//! (the call was `run_start`'s then; PDR-0031 moved it to `agent_context`). It recognises the
 //! four SHAPES now (`SPEC_REF` / `specIdFromPrompt`), pinned to this grammar by the corpus both
 //! sides replay ([`tests::the_shared_corpus_pins_the_hook_recogniser_to_this_grammar`](mod@tests)).
 //! What that pinning does NOT do is make the two one implementation — the division of labour it

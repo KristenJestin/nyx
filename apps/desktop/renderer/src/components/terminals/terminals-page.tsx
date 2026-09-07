@@ -144,7 +144,7 @@ export function TerminalsPage() {
   // race that would double every injection). The resume is driven from HERE and nowhere else: no
   // boot hook, no main-process step. It therefore requires (a) this page to be mounted — it is the `/` index route, which the
   // app does open at launch (`router.tsx`: memory history on `/`, no last-route persistence), but
-  // which UNMOUNTS as soon as one navigates to `/work`, `/knowledge`, `/engine` or `/design`; and
+  // which UNMOUNTS as soon as one navigates to `/work`, `/knowledge` or `/design`; and
   // (b) `workspaceIds` to be non-empty, i.e. a project ENTERED and carrying workspaces — it is `[]`
   // until `<BaseLayout>`'s last-project restore lands, and stays `[]` if none is entered. Neither
   // condition is a defect to fix here; both are why a boot log can legitimately show no resume at

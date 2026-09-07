@@ -483,18 +483,18 @@ Do NOT use nyx when:
 a UI gesture in the nyx app; nyx tools operate on projects that already exist (you CAN \
 rename one, or change its settings with set_project_settings).";
 
-/// How many requests the MCP surface serves AT ONCE (v2.8 L1). The accept loop hands each request
+/// How many requests the MCP surface serves AT ONCE. The accept loop hands each request
 /// to this pool instead of serving it on the accepting thread.
 ///
 /// The single-thread assumption this replaces held only while every request was short. It is FALSE
-/// for `nyx_next`: a `gate_check` runs the project's own test suite ON the dispatch path, for up to
-/// [`crate::mcp_engine::GATE_TOTAL_TIMEOUT`]. Served inline, that one call accepted nothing else —
-/// no other agent, no other session, no other tool call — for as long as the gate took, and the
-/// user hit that freeze twice in a day on a suite of a few seconds run several times per task.
+/// for a BLOCKING wait (`wait_for_terminal`, `wait_for_command`), which parks on the dispatch path
+/// for up to a minute. Served inline, that one call accepted nothing else — no other agent, no
+/// other session, no other tool call — for as long as the wait took, and the user hit that freeze
+/// twice in a day.
 ///
 /// BOUNDED rather than one thread per request: an unbounded spawn turns a burst — or a client
 /// retrying a call it wrongly believes hung — into unbounded threads, which is a worse failure than
-/// the one being fixed. Four is sized on the only long operation there is: a gate holds one worker,
+/// the one being fixed. Four is sized on the only long operation there is: a wait holds one worker,
 /// and three stay free for everyone else.
 ///
 /// # A long operation that DEPENDS on an incoming request must not be able to fill this
@@ -954,7 +954,7 @@ impl McpServer {
     /// The blocking accept loop: take each request off the listener and hand it to the WORKER POOL
     /// ([`REQUEST_WORKERS`]) rather than serving it here. A request served on THIS thread is a
     /// request that stops the loop from accepting the next one, and one `tools/call` legitimately
-    /// runs for minutes (a `nyx_next` whose `gate_check` runs the project's test suite) — so this
+    /// runs for minutes (a blocking `wait_for_terminal` / `wait_for_command`) — so this
     /// thread only ever accepts.
     ///
     /// The workers are DETACHED on purpose. [`McpServer::stop`] joins THIS thread, which is only
@@ -1235,21 +1235,22 @@ const TOOL_DESCRIPTOR_BUDGET_BYTES: usize = 4_000;
 ///
 /// A list, and not a raised ceiling, because the cost of an exception should be paid in visibility:
 /// adding a name here is a deliberate act with a reviewer on the other side. The design/prototype
-/// subsystem holds five of these and the orchestration engine two — both are out of scope for the
-/// pass that set this budget, so they were measured and admitted rather than trimmed.
+/// subsystem holds five of these — out of scope for the pass that set this budget, so they were
+/// measured and admitted rather than trimmed.
 ///
 /// The guard test also refuses a STALE entry: a tool that came back under the ceiling must LEAVE
 /// this list, so it can never quietly cover a future one.
 const OVERSIZE_DESCRIPTORS: &[&str] = &[
-    "agent_context",
+    // `agent_context` a QUITTÉ cette liste : PDR-0031 lui a retiré le `run_id`, les trois rôles de
+    // sous-agent et le troisième code de cas 0, et son descripteur est repassé sous le plafond
+    // (3 776 octets). Le garde refuse une entrée périmée — une exception qui ne couvre plus rien
+    // finirait par en couvrir une autre sans que personne l'ait décidé.
     "design_inventory",
     "design_preview",
     "design_recipe",
     "design_refresh_component",
     "manage_command_group",
-    "nyx_next",
     "proto_author_component",
-    "run_start",
 ];
 
 /// The `tools/list` descriptors for the frozen v1 surface (ADR-0003). Phase-2 fills
@@ -1257,9 +1258,8 @@ const OVERSIZE_DESCRIPTORS: &[&str] = &[
 /// valid calls; the call bodies live in [`crate::mcp_tools`]. Every descriptor's
 /// `name` stays in [`V1_TOOLS`] order; the schema mirrors each tool's `args` table.
 ///
-/// `pub(crate)` so a tool's OWN module can bind its descriptor to its behaviour: the `nyx_next`
-/// action inventory is checked against the payloads the engine really builds, in the engine's own
-/// tests ([`crate::mcp_engine`]), where a new leaf is added.
+/// `pub(crate)` so a tool's OWN module can bind its descriptor to its behaviour — a guard test
+/// reads the advertised schema back and checks it against what the handler really accepts.
 pub(crate) fn tool_descriptors() -> Vec<Value> {
     // Reusable JSON-Schema fragments for the common id/string arguments.
     let str_prop = |desc: &str| json!({ "type": "string", "description": desc });
@@ -1280,7 +1280,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
     let spec_ref_desc = |desc: &str| {
         format!(
             "{desc}. Accepts {} — a '#N' or bare 'N' resolves in the project this call's own \
-             anchors already determine (project_id / workspace_id / cwd / run_id); the canonical \
+             anchors already determine (project_id / workspace_id / cwd); the canonical \
              id and the key carry their own project",
             crate::spec_ref::ACCEPTED_FORMS
         )
@@ -1290,12 +1290,10 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
     // cannot when it is not. A form that works or not depending on something that has nothing to do
     // with it is HARDER to diagnose than one that never works, so the CONDITION is part of the
     // advertisement and the refusal names itself (findings 01M0ZGHD137MDXFGS2PBG6GS68 for
-    // `spec_update_section`, 01M0ZKWXS353TABS0WCT3XXB81 for `spec_set_workspace`, `agent_context`
-    // and `run_start`, 01M0ZWAH9EQDAZR66AFS1YJFPY for `run_bind_spec`). TWO SHAPES OF ABSENCE sit
-    // here: an anchor that may be OMITTED — `spec_set_workspace` is the sharpest, its only anchor is
-    // optional BECAUSE omitting it IS the detach — and an anchor that is REQUIRED yet resolves
-    // through a chain that can end on nothing, which is `run_bind_spec`'s `run_id`: a run's project
-    // is its workspace's, and a run can carry no workspace.
+    // `spec_update_section`, 01M0ZKWXS353TABS0WCT3XXB81 for `spec_set_workspace` and
+    // `agent_context`). The shape of absence that sits here is an anchor that may be OMITTED —
+    // `spec_set_workspace` is the sharpest, its only anchor is optional BECAUSE omitting it IS the
+    // detach.
     let conditional_spec_ref_prop = |desc: &str, condition: &str| {
         str_prop(&format!(
             "{desc}. Accepts {} — but a '#N' or bare 'N' {CONDITIONAL_ANCHOR_CLAUSE} {condition}; \
@@ -1394,19 +1392,19 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
              status.",
         ))
     };
-    // The PERSISTED `env` of a command TEMPLATE (v2.8 review N31): the environment stored WITH the
-    // command, applied on EVERY path that runs it — including a gate_check nyx runs itself, which
-    // the per-run `env` of start_command deliberately never reaches.
+    // The PERSISTED `env` of a command TEMPLATE: the environment stored WITH the command, applied
+    // on EVERY path that runs it — which the per-run `env` of start_command, a one-off override,
+    // deliberately never replaces.
     let command_env_prop = || {
         json!({
             "type": "object",
             "additionalProperties": { "type": "string" },
             "description": "optional PERSISTENT environment for this command (KEY→VALUE string map, \
                             e.g. {\"DATABASE_URL\":\"postgres://…\"}), stored with the command and \
-                            applied EVERY time it runs — started by hand, started by you, or run by \
-                            nyx as a workflow gate. Use it for what the command NEEDS to be green \
-                            (the per-run `env` of start_command is a one-off override on top, and \
-                            never applies to a gate). Each value must be a string. Sent WHOLE: it \
+                            applied EVERY time it runs — started by hand or started by you. Use it \
+                            for what the command NEEDS to be green (the per-run `env` of \
+                            start_command is a one-off override on top). Each value must be a \
+                            string. Sent WHOLE: it \
                             replaces the stored map rather than patching it, and {} (or null) clears \
                             it. Reading back, a command reports only `env_keys` — values are never \
                             echoed.",
@@ -2379,7 +2377,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                 "transcript_path": str_prop("path to the agent transcript file (SessionStart, optional)"),
                 "source": str_prop("SessionStart source: startup | resume | clear (optional)"),
                 "agent_kind": str_prop("which agent this is (default \"claude_code\")"),
-                "prompt": str_prop("UserPromptSubmit only: the raw text the HUMAN just submitted. nyx records that a human turn happened on this terminal (and its words), which is what lets the orchestration engine tell a human's answer from a session's"),
+                "prompt": str_prop("UserPromptSubmit only: the raw text the HUMAN just submitted — what tells nyx a human turn happened on this terminal"),
             },
             "required": ["hook_event_name", "session_id"],
         },
@@ -2454,16 +2452,12 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         sections (problem / solution / implementation_decisions / \
                         testing_decisions / user_stories / out_of_scope). The Spec is authored \
                         PROJECT-scoped and UNANCHORED — the dev workspace anchor is posed later, \
-                        when nyx starts the Spec (ready→in_progress), not here. \
+                        by the spec_transition onto in_progress, not here. \
                         Optionally CLASSIFY it with `category` (the genre of work: bug, feature, \
                         refactor, chore, or any category of the project) — assigned in the SAME \
                         transaction, so the Spec is never created half-classified. Returns the \
                         created spec, revision and category. Use spec_update_section to fill \
-                        sections later, and spec_set_category to reclassify. THERE IS NO LIFECYCLE \
-                        VERB ON THIS SURFACE, on purpose: nyx imposes each Spec transition (ready \
-                        / start / review / done / cancel) itself, at the workflow step built for \
-                        it — you reach that step by ticking nyx_next, and never move a Spec by \
-                        hand.",
+                        sections later, and spec_set_category to reclassify.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2487,25 +2481,16 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         implementation_decisions, testing_decisions, user_stories, out_of_scope), \
                         and the new markdown value (an empty string clears the section). Use \
                         spec_fork instead when you want to snapshot the current design into a new \
-                        revision before diverging. Sections are FROZEN once the Spec leaves draft; \
-                        the ONE exception is a correction a human authorized at a blocked-task \
-                        escalation gate — pass the run_id handed to you with that spawn, and nyx \
-                        checks the authorization itself (it is never granted by asking).",
+                        revision before diverging. Sections are FROZEN once the Spec leaves draft.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                // THE CONDITIONAL CASE, stated instead of left to be discovered. This tool's ONLY
-                // project anchor is its OPTIONAL `run_id`, so `#N` / `N` resolve with one and
-                // cannot without — on the nominal path (editing a draft, no run_id) they used to
-                // die as `unknown spec 3` although the field announced them unconditionally
+                // This call carries NO project anchor, so `#N` / `N` have nothing to be counted in
+                // and are REFUSED by name rather than dying as `unknown spec 3`
                 // (finding 01M0ZGHD137MDXFGS2PBG6GS68).
-                "spec_id": conditional_spec_ref_prop(
-                    "the Spec whose active revision to edit",
-                    "you also pass run_id, the one project anchor this call carries",
-                ),
+                "spec_id": anchorless_spec_ref_prop("the Spec whose active revision to edit"),
                 "section": str_prop("which section: problem | solution | implementation_decisions | testing_decisions | user_stories | out_of_scope"),
                 "value": str_prop("the section's new markdown content (empty string clears it)"),
-                "run_id": str_prop("the run whose human authorized this correction on a Spec that has left draft (the run_id of your spawn); ignored while the Spec is still a draft"),
             },
             "required": ["spec_id", "section", "value"],
         },
@@ -2526,8 +2511,56 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             "required": ["spec_id"],
         },
     }));
-    // N17(b) — `spec_transition` is NOT advertised to the agent: nyx imposes every Spec lifecycle
-    // transition at the graph node built for it (ndev/nspec), so the effector never transitions a Spec.
+    // THE ONLY WAY A SPEC MOVES. PDR-0031 retired the orchestration engine, so no node imposes a
+    // transition any more: the agent ASKS, and nyx's guards + validations + the confirmation
+    // guard-rail decide. The tool was declared and dispatched nowhere for a while, which is the
+    // very phantom `no_agent_facing_text_names_a_tool_that_is_not_advertised` was written for.
+    descriptors.push(json!({
+        "name": crate::mcp_tools_spec::SPEC_TRANSITION_TOOL,
+        "description": format!(
+            "Move a Spec through its lifecycle by naming the TARGET status in `to` ({targets}). \
+             The move is GUARDED (the Spec's current status must allow it — an in_progress Spec \
+             cannot go ready again) and VALIDATED (`ready` runs the pre-ready checks: the design \
+             must state a problem and a solution and carry a coherent phase plan; `completed` runs \
+             the pre-done checks and refuses while blocking work is still open). A refusal writes \
+             nothing and lists what failed in data.failures.\n\
+             \n\
+             `ready`, `completed` and `cancelled` are SENSITIVE, and they are the ONLY three: they \
+             REQUIRE user_confirmed=true, and that flag means the HUMAN said so in the chat, in \
+             their own words, just before you sent the call. Your own reading of the situation is \
+             not a confirmation, and neither is a question you asked yourself. `in_progress`, \
+             `in_review` and `draft` need nothing — starting work only records that it began.\n\
+             \n\
+             `in_progress` is the ONE target that ANCHORS: the workspace comes from workspace_id, \
+             else from cwd; on every other target both are ignored. `draft` REOPENS a Spec that is \
+             ready, in_progress or in_review so its sections become editable again — the rework \
+             move, which you make right after spec_fork when the current design is worth keeping \
+             as a revision. Returns the updated spec.",
+            targets = crate::mcp_tools_spec::SPEC_TRANSITION_TARGETS,
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                // CONDITIONAL: the two anchors this call exposes (`workspace_id` / `cwd`) are
+                // OPTIONAL and only meaningful on the `in_progress` target, so a `#N` resolves
+                // with one and cannot without.
+                "spec_id": conditional_spec_ref_prop(
+                    "the Spec to move",
+                    "you also pass workspace_id or cwd, the only project anchors this call carries \
+                     — and both are read on the in_progress target alone",
+                ),
+                "to": str_prop(&format!(
+                    "the TARGET status: {} — the conceptual verbs (start, review, done, cancel, \
+                     revise) are accepted as synonyms. Any other value is refused, naming this set",
+                    crate::mcp_tools_spec::SPEC_TRANSITION_TARGETS
+                )),
+                "user_confirmed": bool_prop("set true ONLY after the human has said so in the chat, in their own words. REQUIRED for ready, completed and cancelled, and for those three alone; ignored on in_progress, in_review and draft. Defaults to false, which refuses a sensitive move rather than guessing"),
+                "workspace_id": str_prop("the dev workspace to ANCHOR the Spec on, read on the in_progress target only (from list_workspaces). An EMPTY string is refused rather than read as 'no anchor' — omit the argument to fall through to cwd"),
+                "cwd": str_prop("optional directory the anchor is resolved from when no workspace_id is given (the workspace whose root best matches this path), on the in_progress target only. Resolving nothing starts the Spec unanchored"),
+            },
+            "required": ["spec_id", "to"],
+        },
+    }));
     descriptors.push(json!({
         "name": crate::mcp_tools_spec::SPEC_SET_WORKSPACE_TOOL,
         "description": "Anchor a Spec on a dev workspace (its repos + project are derived \
@@ -2734,9 +2767,9 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             "required": ["spec_id"],
         },
     }));
-    // The v2.8 READ half of the Spec surface. It was WRITE-ONLY: an agent could author a Spec and
+    // The READ half of the Spec surface. It was WRITE-ONLY: an agent could author a Spec and
     // its tasks and had no way to read any of it back — the only door was `agent_context`, which
-    // wraps the state in a ROLE MANUAL and refuses outright for coder/doc when no Spec resolves.
+    // wraps the state in a ROLE MANUAL and refuses outright for doc when no Spec resolves.
     // Three plain reads close it: ONE Spec whole, the Specs of a project, the tasks of a Spec.
     descriptors.push(json!({
         "name": crate::mcp_tools_spec::SPEC_GET_TOOL,
@@ -2824,69 +2857,59 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             "required": ["spec_id"],
         },
     }));
-    // Append the v2.4 Phase-5 agent-CONTEXT tool (PDR-0020): render a
-    // spec/dev/coder/auditor/doc/prototype manual live from nyx state (the native
-    // equivalent of `depot context …`).
+    // Append the v2.4 Phase-5 agent-CONTEXT tool (PDR-0020, amended by PDR-0031): render a
+    // spec/dev/doc manual live from nyx state (the native equivalent of `depot context …`).
     descriptors.push(json!({
         "name": crate::mcp_context::AGENT_CONTEXT_TOOL,
-        "description": "Render an agent context manual (spec, dev, coder, auditor, doc, or prototype) LIVE from nyx \
-                        state — the role's own contract plus the run's state. IF YOU WERE SPAWNED BY \
-                        A `nyx_next` ACTION, CALL THIS FIRST: the action hands you an `agent_id`, a \
-                        `label`, a `subject` and the `run_id` it is ticking, and nothing else — this \
-                        is where you read who you are and what the run holds. \
-                        Given a role and a run (run_id) or a Spec (spec_id, or resolved from the \
+        "description": "Render an agent context manual (spec, dev, or doc) LIVE from nyx \
+                        state — the role's own contract plus the Spec's state. \
+                        Given a role and a Spec (spec_id, or resolved from the \
                         current workspace via cwd/workspace_id), it returns: the role's preamble and \
                         its prohibitions, the Spec's structured sections, its current phase and that \
                         phase's tasks, and its PROJECT + repos (plus the dev workspace when one is \
                         anchored). The answer \
                         carries project_id beside the manual: a Spec belongs to a project from the \
                         moment it exists, so the project is there even before any code and before \
-                        any dev workspace — which is the NORMAL state for role=prototype, and that \
-                        id is what every design_* tool takes. For role=spec with NO Spec yet (ZERO \
+                        any dev workspace, and that id is what every design_* tool takes. \
+                        For role=spec with NO Spec yet (ZERO \
                         anchored on the location), it renders the PROJECT-scoped authoring manual \
                         instead (a Spec is a project artifact the author creates), resolving the \
-                        project from run_id, project_id or the cwd/workspace — never an error for \
+                        project from project_id or the cwd/workspace — never an error for \
                         want of a Spec. That exemption covers ZERO ONLY: role=spec is NOT exempt \
                         from the AMBIGUOUS case, where a location anchoring SEVERAL active Specs is \
                         refused for EVERY role alike (the location is settled before the role is \
                         read) — see RESOLUTION ORDER. \
-                        RESOLUTION ORDER: spec_id, then run_id (a run bound to no Spec resolves \
-                        NONE — the answer stops at the run), then workspace_id, then cwd. Resolving \
+                        RESOLUTION ORDER: spec_id, then workspace_id, then cwd. Resolving \
                         BY LOCATION (workspace_id / cwd) is exact: the ONE active Spec anchored \
                         there resolves; zero resolves none — and SAYS so rather than rendering a \
                         manual that looks scoped: the answer stays ok for role=dev/spec but carries \
                         a `warnings` entry, plus the SAME sentence inside the rendered text as a \
-                        'NO SPEC ANCHORED' line. THE THREE CASE-0 CODES, exhaustively — they say \
-                        WHICH of three very different situations you are in, so read the code and \
+                        'NO SPEC ANCHORED' line. THE TWO CASE-0 CODES, exhaustively — they say \
+                        WHICH of two very different situations you are in, so read the code and \
                         not just the null spec_id: 'spec_none_on_location' when the location IS a \
                         workspace and it simply anchors no active Spec (legitimate — a project's \
                         first /nspec starts exactly there); 'spec_location_unresolved' when no \
                         workspace matched at all — that one means you are calling from the wrong \
-                        folder; 'spec_run_unbound' when a run_id was passed and RESOLVED but the \
-                        RUN drives no Spec — the location is not at fault and 'pass a cwd' would \
-                        name the wrong fix, an authoring run simply has no Spec until it creates \
-                        one. SEVERAL is refused with \
+                        folder. SEVERAL is refused with \
                         invalid_argument, data.reason='spec_ambiguous_for_workspace' and the \
                         candidates listed — nyx never picks the most recent. Terminal \
                         (completed/cancelled) and archived Specs are never candidates.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "role": str_prop("spec | dev | coder | auditor | doc | prototype — which manual to render"),
-                "run_id": str_prop("the run you were spawned for — the ONE anchor a sub-agent needs: it carries the Spec the run drives and, before there is one, the workspace it opened against. Pass the run_id the spawn action was ticking; an unknown one is refused rather than rendered empty"),
+                "role": str_prop("spec | dev | doc — which manual to render"),
                 // CONDITIONAL: `role` is the only REQUIRED argument here, so every project anchor
                 // this call could read is optional. `agent_context(role=…, spec_id="#3")` alone
                 // resolves no project and used to answer the literal `unknown spec 3` this grammar
                 // exists to retire (finding 01M0ZKWXS353TABS0WCT3XXB81).
                 "spec_id": conditional_spec_ref_prop(
                     "the Spec to render the context for (preferred)",
-                    "you also pass one of run_id / workspace_id / cwd / project_id — all optional \
+                    "you also pass one of workspace_id / cwd / project_id — all optional \
                      here, since `role` is this call's only required argument",
                 ),
                 "workspace_id": str_prop("optional: resolve the Spec via its anchored dev workspace when spec_id is absent — exactly one active Spec must be anchored there (several is refused with the candidates listed, none resolves nothing)"),
                 "cwd": str_prop("optional: resolve the Spec (or, for role=spec authoring, the project) via the workspace whose path matches this cwd when spec_id/workspace_id are absent. The deepest matching workspace root wins; then the same one-active-Spec rule as workspace_id applies"),
                 "project_id": str_prop("optional: for role=spec authoring with no Spec yet, the project to author in (else resolved from cwd/workspace_id). When a Spec DOES resolve it is only checked, never applied — a Spec's project is a fact of the Spec, and naming another one is refused rather than ignored; read the project_id the answer returns instead"),
-                "subject": str_prop("optional: the spawn action's own `subject`. When it names a Spec section (problem | solution | implementation_decisions | testing_decisions | user_stories | out_of_scope), ONLY that section is reproduced — pass back the subject you were spawned with, so the pass reads the commitment it is about and not the other five"),
             },
             "required": ["role"],
         },
@@ -2996,8 +3019,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                 "repository_id": str_prop("the repository whose review comments to list (from workspace_git(workspace_id=…))"),
                 // HONOURED SINCE v2.4, NAMED ONLY NOW: the call has always narrowed the feed by
                 // `spec_id` and the schema said nothing, so no caller reading `tools/list` could
-                // use it — the same defect `run_start`'s `project_id` was just repaired for
-                // (`01M1008NHM9RRA1ZAS4V7K1PM4`). `workspace_id` is REQUIRED here and carries a
+                // use it (`01M1008NHM9RRA1ZAS4V7K1PM4`). `workspace_id` is REQUIRED here and carries a
                 // project, so the four forms always resolve.
                 "spec_id": spec_ref_prop("optional: keep only the comments bound to this Spec (omit for the repository's whole feed)"),
             },
@@ -3426,412 +3448,6 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
             "type": "object",
             "properties": { "id": str_prop("the annexe id to remove") },
             "required": ["id"],
-        },
-    }));
-    // The v2.8 GRAPH-AUTHORING surface: the agent builds an orchestration behavior tree from raw
-    // intent (the human validates it via the Phase-6 visualiser). Each mutation is guarded by a
-    // tree-coherence check that REFUSES an incoherent graph (cycle / dangling parent / a leaf with
-    // children / a second root). Advertised alongside, kept OUT of V1_TOOLS (a new v2.8 surface).
-    descriptors.push(json!({
-        "name": crate::mcp_authoring::WORKFLOW_CREATE_TOOL,
-        "description": "Create a NEW (empty) orchestration workflow draft. Add its nodes with node_add \
-                        afterwards. `project_id` binds it to a project (which flow that project uses). \
-                        You may omit project_id ONLY for a global scope='custom' template: an unowned \
-                        ndev/nspec/ndoc workflow is a SEEDED built-in and is refused (fork one instead).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "name": str_prop("human name of the workflow"),
-                "scope": str_prop("optional: ndev | nspec | ndoc | custom | coder | prototyper (default custom). coder/prototyper are SUB-WORKFLOW scopes — a sub_workflow node's child target, never a top-level run"),
-                "project_id": str_prop("the project that owns/uses this workflow (from list_projects); may be omitted ONLY for a scope='custom' global template"),
-            },
-            "required": ["name"],
-        },
-    }));
-    descriptors.push(json!({
-        "name": crate::mcp_authoring::WORKFLOW_FORK_TOOL,
-        "description": "DEEP-COPY an existing workflow's whole node tree into a new PROJECT-OWNED \
-                        workflow (forked_from = the source). The customisation path: fork a built-in \
-                        default, then edit the copy — the source is never mutated. project_id is \
-                        REQUIRED (a fork is a project's customisation); for a scoped family \
-                        (ndev/nspec/ndoc) a project holds ONE, so a second such fork is refused.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workflow_id": str_prop("the SOURCE workflow to fork"),
-                "name": str_prop("optional: name of the fork (defaults to '<source> (fork)')"),
-                "project_id": str_prop("the project that owns the fork (from list_projects)"),
-            },
-            "required": ["workflow_id", "project_id"],
-        },
-    }));
-    descriptors.push(json!({
-        "name": crate::mcp_authoring::WORKFLOW_ASSIGN_TOOL,
-        "description": "(Re)BIND a workflow to a project — the project↔workflow link (which workflow \
-                        the project uses). Sets the workflow's owning project.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workflow_id": str_prop("the workflow to bind"),
-                "project_id": str_prop("the project to bind it to (from list_projects)"),
-            },
-            "required": ["workflow_id", "project_id"],
-        },
-    }));
-    descriptors.push(json!({
-        "name": crate::mcp_authoring::SLOT_BIND_TOOL,
-        "description": "BIND a graph's command SLOT to the managed commands THIS project answers it \
-                        with. A gate_check in a SHARED graph (the seeded built-ins) declares WHAT it \
-                        needs verified — `config.slot`, e.g. 'build_check' — never which command runs \
-                        it, because a command instance id is project data. This is the other half, and \
-                        it REPLACES forking a built-in to arm its gate: the built-in is left alone, so \
-                        it keeps receiving nyx's graph fixes, while a fork would freeze it at today's \
-                        revision forever. Register the check first (add_command → list_commands for \
-                        the instance_id). The binding is re-read at every tick, so a run refused on an \
-                        unbound slot resumes on the next nyx_next. Binding again REPLACES; an empty \
-                        command_ids UNBINDS (the gate goes back to refusing). Bind a command that \
-                        EXITS: a gate's verdict IS its exit code, so a watcher or a dev server is \
-                        REFUSED here — bind `bun test`, never `bun test --watch`.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "project_id": str_prop("the project this binding is for (from list_projects)"),
-                "slot": str_prop("the slot NAME the gate_check node declares — run_start's gate warning and the tick refusal both carry it (the warning under `slot`)"),
-                "command_ids": json!({
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "the managed-command INSTANCE ids to run for that slot, in order (the instance_id from list_commands, not a template id). Empty = unbind",
-                }),
-            },
-            "required": ["project_id", "slot", "command_ids"],
-        },
-    }));
-    descriptors.push(json!({
-        "name": crate::mcp_authoring::NODE_ADD_TOOL,
-        "description": "Add a TYPED node to a workflow's tree. Types: composites sequence | loop | \
-                        selector, leaves spawn_subagent | gate_check | judge | transition | wait | \
-                        note | ask_human | produce. A parent-less node in a still-rootless workflow \
-                        becomes its root; otherwise pass parent_id (a composite). Refused if it would \
-                        make the tree incoherent (a leaf can't have children, no second root) — or if \
-                        a RUN is currently walking this workflow (let it finish, or run_delete it, \
-                        then edit the graph).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "workflow_id": str_prop("the workflow to add the node to"),
-                "type": str_prop("the node type (sequence/loop/selector/spawn_subagent/gate_check/judge/transition/wait/note/ask_human/produce)"),
-                "label": str_prop("optional: human label for the node"),
-                "config": json!({ "type": "object", "description": "the node's typed config JSON (unknown fields are REFUSED). Per type: spawn_subagent→{agent_id, inline?}; gate_check→{command_ids | slot, blocking?, expect?} (a gate names its OWN command instance ids, or declares a `slot` each project binds with slot_bind — the shape a SHARED graph uses; never both. expect declares WHICH OUTCOME satisfies the gate: \"green\" = the check must PASS, the default when the field is absent; \"red\" = the check must FAIL, which is how a REPRODUCTION is declared — a check that passes there has reproduced nothing and does not advance. A fault that left no exit status is `indeterminate` and satisfies NEITHER); transition→{target_state}; judge→{prompt, output_schema?, output_key?, append?}; ask_human→{prompt, output_key?, append?}; produce→{output_key?, append?}; loop→{until, max_iterations?}; selector→{branches:[{cond, child?}]}; note→{text}; sequence/wait→{}. output_key routes the result on the blackboard; append pushes onto an array instead of overwriting; inline runs the effector in-session (for an interactive one)" }),
-                "parent_id": str_prop("optional: the PARENT composite node (omit for the workflow's root node)"),
-                "order_index": json!({ "type": "integer", "description": "optional: sibling order under the parent (default 0)" }),
-            },
-            "required": ["workflow_id", "type"],
-        },
-    }));
-    descriptors.push(json!({
-        "name": crate::mcp_authoring::NODE_UPDATE_TOOL,
-        "description": "Edit a node's label and/or config (its type is immutable). At least one of \
-                        label / config is required. The one node edit ALLOWED while a run walks the \
-                        workflow (it moves no node id): the answer then carries a `warnings` entry \
-                        saying that run will execute the new config from its next tick.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "node_id": str_prop("the node to edit"),
-                "label": str_prop("optional: new label"),
-                "config": json!({ "type": "object", "description": "optional: the node's new typed config JSON object" }),
-            },
-            "required": ["node_id"],
-        },
-    }));
-    descriptors.push(json!({
-        "name": crate::mcp_authoring::NODE_REMOVE_TOOL,
-        "description": "Delete a node AND its whole subtree (the children cascade). Removing the root \
-                        leaves the workflow rootless (re-root it with a new parent-less node_add). \
-                        Refused while a RUN is walking this workflow.",
-        "inputSchema": {
-            "type": "object",
-            "properties": { "node_id": str_prop("the node to remove") },
-            "required": ["node_id"],
-        },
-    }));
-    descriptors.push(json!({
-        "name": crate::mcp_authoring::NODE_REORDER_TOOL,
-        "description": "Move a node: set its sibling order_index and, optionally, REPARENT it under a \
-                        new parent_id (kept otherwise). A reparent that would create a cycle (a node \
-                        under its own descendant) is refused, and so is any move while a RUN is \
-                        walking this workflow.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "node_id": str_prop("the node to move"),
-                "order_index": json!({ "type": "integer", "description": "the new sibling order under its parent" }),
-                "parent_id": str_prop("optional: reparent the node under this composite (kept unchanged if omitted)"),
-            },
-            "required": ["node_id", "order_index"],
-        },
-    }));
-    // The v2.8 authoring READ surface (review S1) + delete (review S4): discover workflows, read a
-    // graph's node ids, list a workflow's runs, and delete a project-owned workflow. Kept OUT of
-    // V1_TOOLS (part of the v2.8 authoring surface, counted via AUTHORING_TOOLS).
-    descriptors.push(json!({
-        "name": crate::mcp_authoring::WORKFLOW_LIST_TOOL,
-        "description": "List orchestration workflows. WITH project_id: that project's OWN workflows \
-                        plus the built-in defaults it falls back to; WITHOUT: the built-in defaults. \
-                        Read-only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "project_id": str_prop("optional: also include this project's own workflows"),
-            },
-        },
-    }));
-    descriptors.push(json!({
-        "name": crate::mcp_authoring::WORKFLOW_GET_TOOL,
-        "description": "Get a workflow's metadata AND its whole node tree — the read that gives you \
-                        the node ids that node_update / node_remove / node_reorder require. \
-                        Read-only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": { "workflow_id": str_prop("the workflow to read") },
-            "required": ["workflow_id"],
-        },
-    }));
-    descriptors.push(json!({
-        "name": crate::mcp_authoring::RUN_LIST_TOOL,
-        "description": "List a workflow's runs, newest first, each with its cursor, blackboard and \
-                        status. Read-only.",
-        "inputSchema": {
-            "type": "object",
-            "properties": { "workflow_id": str_prop("the workflow whose runs to list") },
-            "required": ["workflow_id"],
-        },
-    }));
-    descriptors.push(json!({
-        "name": crate::mcp_authoring::WORKFLOW_DELETE_TOOL,
-        "description": "Delete a PROJECT-OWNED workflow and its nodes + runs (cascade) — for cleaning \
-                        up drafts and failed forks. A built-in default is REFUSED: fork it instead of \
-                        editing or deleting the shared default. So is a workflow a RUN is still \
-                        walking — the cascade would take that run down with it.",
-        "inputSchema": {
-            "type": "object",
-            "properties": { "workflow_id": str_prop("the project-owned workflow to delete") },
-            "required": ["workflow_id"],
-        },
-    }));
-    descriptors.push(json!({
-        "name": crate::mcp_authoring::RUN_DELETE_TOOL,
-        "description": "Delete ONE workflow run by id — to clean up a run opened by mistake, including \
-                        a run on a built-in flow (which workflow_delete cannot reach). A run is a \
-                        leaf, so nothing else is affected.",
-        "inputSchema": {
-            "type": "object",
-            "properties": { "run_id": str_prop("the run to delete (from run_list)") },
-            "required": ["run_id"],
-        },
-    }));
-    // The v2.8 ENGINE run-lifecycle ENTRY. Since G6 the nyx COMMAND HOOK calls it, so a /nspec /ndev
-    // /ndoc session is handed its run_id with the manual and ticks nyx_next straight away; it stays
-    // advertised because that hook reaches the sidecar through THIS surface (an un-advertised tool is
-    // undispatchable — N17) and because a session that holds no run_id still needs a way to open one.
-    descriptors.push(json!({
-        "name": crate::mcp_engine::RUN_START_TOOL,
-        "description": "OPEN an orchestration RUN and get its run_id. IF YOU WERE STARTED BY A NYX \
-                        SLASH COMMAND (/nspec, /ndev, /ndoc) YOU ALREADY HAVE ONE: nyx's command hook \
-                        opened the run and injected its run_id with your dispatcher manual — go \
-                        straight to nyx_next. Call this only when you hold no run_id, then pass the \
-                        returned one to nyx_next in a loop. IDEMPOTENT: at most ONE live run per \
-                        (workflow, Spec), so a call made when a run is already live RESUMES it rather \
-                        than opening a second. nyx resolves WHICH workflow to run — an explicit \
-                        workflow_id, else the resolved project's active workflow of `scope` (default \
-                        'ndev') — and binds the run to the resolved Spec (from spec_id, workspace_id, \
-                        or cwd) when there is one. Returns { run_id, workflow_id, spec_id, scope, \
-                        outcome, warnings }. `outcome` says WHICH of three things happened — \
-                        'created' (a fresh run at the top of the flow), 'resumed' (the pair's live \
-                        run handed back, so the next nyx_next answers from where IT stopped, not \
-                        from the top) or 'replaced' (the live run could never tick again and was \
-                        dropped for a fresh one): read it rather than assuming a run_id is a new \
-                        run. \
-                        RELAY every warnings[].message to the human — each names \
-                        something they must act on (a run RESUMED mid-flow — code 'run_resumed', \
-                        which names the node it is parked on and how long it has sat there; a run \
-                        DROPPED because its graph changed, a gate \
-                        that verifies nothing, a run started bound to no Spec, or a cwd that \
-                        matched NO workspace — code 'run_location_unresolved', the run then opens \
-                        with no workspace anchor at all and its effectors resolve no repos, which \
-                        usually means the caller is running from the wrong folder). \
-                        RESOLVING BY LOCATION (workspace_id / cwd) is exact: the ONE active Spec \
-                        anchored there binds the run; zero or several bind none — nyx never picks \
-                        the most recent. What happens next depends on the flow: one that works ON a \
-                        Spec (ndev, ndoc, coder, prototyper) is REFUSED, with the candidates listed \
-                        on the ambiguous case (data.reason='spec_ambiguous_for_workspace'); a flow \
-                        that works on NO existing Spec — scope 'nspec', which creates its own, or \
-                        'custom', which declares none — STARTS UNBOUND, keeps its workspace \
-                        anchor, and reports the ambiguity as a warning \
-                        (code 'spec_ambiguous_started_unbound'). That exception reads the `scope` \
-                        ARGUMENT, so an explicit workflow_id — which leaves scope at its 'ndev' \
-                        default — keeps the refusal. Pass an explicit spec_id to work on one of \
-                        the candidates.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                // CONDITIONAL: every argument of `run_start` is optional, so a `#N` passed alone
-                // anchors nothing. The refusal it meets is the engine's own
-                // ([`crate::mcp_engine`]'s `unknown_spec_refusal`, which on that anchorless path
-                // adds the anchors to name a project with — and, once the call DOES anchor one,
-                // names what that project holds instead) rather than the entry point's — the
-                // sentence below states the condition either way, so the advertisement matches on
-                // both paths.
-                "spec_id": conditional_spec_ref_prop(
-                    "optional: the Spec to bind the run to (its lifecycle transitions then apply); \
-                     resolved from workspace_id/cwd when omitted",
-                    "you also pass project_id, workspace_id or cwd — all optional here, since this \
-                     call requires no argument at all",
-                ),
-                // ADVERTISED BECAUSE IT IS HONOURED: `mcp_context::resolve_project` reads
-                // `project_id` FIRST, and `run_start`'s own refusal for an unresolvable `#N` tells
-                // the caller to add one. A tool that accepts an argument its `tools/list` does not
-                // name cannot be discovered — and an agent sent after an argument the schema omits
-                // is exactly the half-refusal `run_bind_spec` was just repaired for (findings
-                // `01M0ZWAH9EQDAZR66AFS1YJFPY`, `01M1008NHM9RRA1ZAS4V7K1PM4`).
-                "project_id": str_prop("optional: the PROJECT this call anchors — what a '#N' or a bare number is counted in, and which project's active workflow the run uses. It resolves NO Spec by itself (workspace_id / cwd do that, or name the spec_id): it is the anchor to add when a short reference has no project to resolve against. Passed BESIDE a spec_id of another project, the disagreement is refused, never silently overridden"),
-                "workspace_id": str_prop("optional: resolve the Spec + project from this workspace — exactly one active Spec must be anchored there for the run to bind one"),
-                "cwd": str_prop("optional: resolve the Spec + project from the workspace whose path matches this cwd (deepest matching root wins), then the same one-active-Spec rule as workspace_id"),
-                "workflow_id": str_prop("optional: run THIS workflow explicitly, bypassing scope resolution"),
-                "scope": str_prop("optional: which workflow family to run (ndev | nspec | ndoc); defaults to ndev. coder/prototyper are SUB-WORKFLOW-ONLY (opened by a sub_workflow node), not started here"),
-            },
-        },
-    }));
-    // The RECOVERY twin of `run_start`: a run already open and carrying no Spec. Advertised because
-    // an un-advertised tool is undispatchable (N17) — and because the session that needs it is by
-    // definition one that already went wrong once, so it must be able to find the way out.
-    //
-    // THE `data.reason` CODES BELOW ARE A CONTRACT, NOT PROSE: they are written here as literals
-    // for readability, and `tests::run_bind_spec_advertises_its_refusal_codes_by_constant`
-    // confronts every one of them with `mcp_engine`'s `bind_refusal` module — so renaming a code,
-    // or adding one to that module (at any visibility), fails a test instead of leaving this
-    // sentence quietly wrong.
-    descriptors.push(json!({
-        "name": crate::mcp_engine::RUN_BIND_SPEC_TOOL,
-        "description": "RECOVERY, not the normal way to anchor a run: attach an ALREADY-OPEN run to \
-                        the Spec it turned out to be about. The normal way is to open the run \
-                        already anchored — run_start with the Spec named. Use this when a run is \
-                        open, work has been done in it, and it carries no Spec (its spec_id is \
-                        null): binding it arms the Spec facts the graph reads (spec_status, \
-                        spec_open_tasks) and the transitions it applies, without throwing the \
-                        session away. EVERY refusal NAMES the condition it broke, under \
-                        data.reason — what follows is what you can rule out BEFORE calling, not a \
-                        closed list of codes. ON THE RUN: it must not be finished \
-                        ('run_is_terminal' — read FIRST, because a run this session drove to its \
-                        end has already left the session registry), it must be a run THIS session \
-                        opened ('run_not_in_this_session' — run_list shows every session's and \
-                        every project's runs, so an id read there is not yours by default), it must \
-                        carry NO Spec ('run_already_bound' — a run's Spec is never re-written), and \
-                        it must be TOP-LEVEL ('run_is_a_child' — a sub-workflow child inherits its \
-                        parent's Spec). ON THE SPEC: it must belong to the project the run's \
-                        workspace anchors ('spec_project_disagrees_with_run' — a KEY-N carries its \
-                        own project, so the short grammar is exactly the form that can name a Spec \
-                        of somewhere else), and it must not already carry a live run of this \
-                        workflow ('spec_already_has_a_live_run') — nyx holds at most ONE live run \
-                        per (workflow, Spec), and a second would be destroyed by the next run_start \
-                        on that Spec. Returns { run_id, spec_id, workflow_id }.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "run_id": str_prop("the OPEN run to attach — one this session drives (its id rides in your NYX RUN block, or came back from run_start)"),
-                // REQUIRED, YET CONDITIONAL — the one member of the family whose anchor is a run.
-                // A run's project comes from its WORKSPACE, and `run_start` deliberately opens a
-                // run without one when its cwd matched nothing (`run_location_unresolved`), which
-                // is precisely the session this verb repairs. So the short forms are promised with
-                // their condition rather than unconditionally, and the anchorless way out is named.
-                "spec_id": conditional_spec_ref_prop(
-                    "the Spec the run is really about",
-                    "the run_id you pass names a run anchored on a WORKSPACE (that workspace's \
-                     project is what a number is counted in, and run_start opens a run WITHOUT one \
-                     when its cwd matched nothing — the very session this verb exists to repair)",
-                ),
-            },
-            "required": ["run_id", "spec_id"],
-        },
-    }));
-    // The v2.8 ENGINE runtime tick. The session is a THIN dispatcher: call nyx_next in a loop,
-    // perform exactly the action it returns, then call it again with the result — nothing else.
-    // nyx holds the run state, advances the behavior tree, runs the quality gates ITSELF and
-    // BLOCKS while any is red, imposes the state transitions, and hands back one atomic action.
-    //
-    // THE ACTION INVENTORY BELOW IS A CONTRACT, NOT PROSE: each type is written `type[field, …]`,
-    // and a test BINDS that list to the payloads the engine really builds — every action type it can
-    // emit must be named here, and no field may be claimed that no payload carries
-    // (`nyx_next_descriptor_states_exactly_the_actions_the_engine_emits`). This descriptor is what
-    // EVERY dispatcher reads, and the failure mode it had was drift: it kept telling agents to paste
-    // a spawn's `context` for a whole release after the manuals were dissolved and the field removed.
-    // So state fields inside the brackets, where the guard can see them.
-    descriptors.push(json!({
-        "name": crate::mcp_engine::NYX_NEXT_TOOL,
-        "description": "Advance an orchestration RUN by one step and get the next action to perform. \
-                        The calling session is a thin dispatcher: call nyx_next(run_id), do EXACTLY \
-                        the action it returns, then call nyx_next again with last_result — repeat \
-                        until it returns {\"type\":\"done\"}. nyx owns the run: it walks the workflow \
-                        graph, runs the quality-gate commands itself and REFUSES to advance while a \
-                        blocking gate is red, applies the guarded Spec state transitions, and \
-                        updates the run's blackboard. \
-                        A tick returns { run_id, action, current_node_id, blackboard_delta, \
-                        blackboard_removed, status }. \
-                        `current_node_id` is WHERE the run is — the single answer to that, so no \
-                        action carries a node id of its own; `blackboard_delta` is only the run-state \
-                        keys that CHANGED this tick, and `blackboard_removed` the keys that were \
-                        DROPPED (a Spec-write grant revoked, a red gate cleared, a child run that \
-                        ended) — a key listed there no longer holds, whatever an earlier delta said. \
-                        THE ACTION IS EXACTLY ONE OF THESE, with exactly the fields listed \
-                        (a `?` marks a field that is absent when the graph declares nothing for it): \
-                        spawn_subagent[agent_id, label, mode, mechanism, subject?] — run agent_id as \
-                        a sub-agent to do what `label` says (mode native_task = your provider's own \
-                        sub-agent, inline = do it yourself in this session; `mechanism` names which). \
-                        It ships NO prompt and NO context: the sub-agent calls \
-                        agent_context(run_id=…, role=agent_id, subject=subject when present) and \
-                        PULLS its own manual and this run's state. Report {\"diff\": …}. \
-                        judge[prompt, output_schema] — answer `prompt` yourself, honouring \
-                        output_schema when it is not null; report {\"verdict\": …}. \
-                        ask_human[prompt, options, answer_key, child_run_id?, child_node_id?, via?, \
-                        human_turn_required?, context?] — put `prompt` to the HUMAN and wait for a \
-                        real answer; offer `options` verbatim when non-empty (nyx refuses an answer \
-                        outside them) and send the answer back under the field `answer_key` names. \
-                        When the action carries child_run_id, the question comes from a sub-workflow: \
-                        send the answer to nyx_next(run_id=child_run_id), NOT to this run. When it \
-                        carries human_turn_required, the answer COMMITS the Spec (an engaging \
-                        transition: ready / done / cancel): nyx checks that the human actually SPOKE \
-                        on this session between its question and your answer, and REFUSES an answer \
-                        with no such turn behind it — including one they told you in advance. It \
-                        checks that they SPOKE, not what they said. Ask, wait, report next tick. \
-                        produce — produce the artefact the current node asks for; report its reference. \
-                        wait — pause; report {} to resume. \
-                        sub_workflow[child_run_id, context] — a CHILD run was opened for you: do what \
-                        `context` says (loop nyx_next(child_run_id) until it is done), then tick THIS \
-                        run again. \
-                        done — the run is over; stop calling. \
-                        AND NOTHING ELSE WILL EVER REACH YOU. gate_check, transition, \
-                        transition_task, query, fork_spec, create_workspace, set_category and note \
-                        are nyx's OWN effects: nyx holds \
-                        the PTY, the Spec authority and the DB, so it runs them INSIDE the tick and \
-                        you never see them. Do not wait for one — a dispatcher parked on a gate_check \
-                        it expects to be handed waits for something that never comes; the tick that \
-                        runs the gate returns the NEXT dispatcher-facing action instead. A `note` \
-                        likewise never arrives as an action: the sentences the walk went past ride the \
-                        next action as its `notes` array — relay them to the human, they are the \
-                        run's own words. \
-                        Pass last_result as the object the previous action produced (e.g. \
-                        {\"diff\":…} for a spawn, {\"verdict\":…} for a judge).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "run_id": str_prop("the workflow run to advance"),
-                "last_result": json!({
-                    "type": "object",
-                    "description": "the result of the action nyx_next last returned (e.g. {\"diff\":…} for a spawn_subagent, {\"verdict\":…} for a judge); omit on the first call",
-                }),
-                "provider": str_prop("optional: the agent provider driving the session (e.g. claude), used to pick the sub-agent spawn mechanism; defaults to claude"),
-            },
-            "required": ["run_id"],
         },
     }));
     // Append the v2.7 PROTOTYPE tools: the agent's CONSTRAINED contract for driving a Spec's
@@ -5358,7 +4974,7 @@ mod tests {
     ///
     /// THREE FAMILIES, AND THE SCHEMA ITSELF DECIDES WHICH. A `#N` / bare `N` is counted inside a
     /// project, and the project comes from the call's OWN anchors — so the family is decided by TWO
-    /// facts the schema already carries: WHICH of `project_id` / `workspace_id` / `cwd` / `run_id`
+    /// facts the schema already carries: WHICH of `project_id` / `workspace_id` / `cwd`
     /// the tool exposes, and whether one of them is REQUIRED **and carries a project by
     /// construction**.
     ///   * A CERTAIN ANCHOR → the full [`crate::spec_ref::ACCEPTED_FORMS`] sentence, unconditional,
@@ -5368,14 +4984,11 @@ mod tests {
     ///     out. The same call honours `#N` with the anchor and cannot without it, and a form that
     ///     works or not depending on an unrelated argument is harder to diagnose than one that
     ///     never works. TWO WAYS TO BE ABSENT, and they land in the same family: the anchor may be
-    ///     omitted, OR it may be required and still RESOLVE TO NOTHING. `run_bind_spec` is the
-    ///     second shape — its required `run_id` names a run whose project comes from its WORKSPACE,
-    ///     and `run_start` opens a run without one when its `cwd` matched none, which is the very
-    ///     session that verb repairs. A required `cwd` would be that shape too: it resolves by
-    ///     longest-prefix match over the workspace roots, and a valid path under none of them names
-    ///     no project. Reading "required" as "certain" is what let it promise the four forms
-    ///     unconditionally on a call that could not always keep them (finding
-    ///     `01M0ZWAH9EQDAZR66AFS1YJFPY`; `01M1005GAY94XZ7BNKY4ASFTR5` for the `cwd` half).
+    ///     omitted, OR it may be required and still RESOLVE TO NOTHING. A required `cwd` is that
+    ///     second shape: it resolves by longest-prefix match over the workspace roots, and a valid
+    ///     path under none of them names no project. Reading "required" as "certain" is what let it
+    ///     promise the four forms unconditionally on a call that could not always keep them
+    ///     (finding `01M1005GAY94XZ7BNKY4ASFTR5` for the `cwd` half).
     ///   * NO ANCHOR → `ANCHORLESS_FORMS`, and NOT the four-form sentence, because announcing a
     ///     form this tool must refuse is the original defect wearing another hat (finding
     ///     `01M0ZGCCSQ2F25HPBS6NX5JAFS`).
@@ -5402,24 +5015,18 @@ mod tests {
     fn every_spec_id_argument_advertises_the_forms_it_accepts() {
         // The anchors `mcp_context::resolve_project` reads — the ONLY way a call can name a
         // project for a bare number to be counted in.
-        const ANCHORS: [&str; 4] = ["project_id", "workspace_id", "cwd", "run_id"];
+        const ANCHORS: [&str; 3] = ["project_id", "workspace_id", "cwd"];
         // …and the subset that cannot END ON NOTHING — those that name their project
         // DIRECTLY. `project_id` IS a project; a `workspace_id` names a row that carries its
-        // project in a column. The other two are LOOKUPS that can legitimately answer nothing, and
-        // being REQUIRED does not change that:
-        //   * a `cwd` resolves through `best_workspace_for_cwd`, a longest-prefix match over the
-        //     workspace roots (`mcp_context.rs`, `resolve_project`) — a perfectly VALID path that
-        //     sits under no workspace root resolves NO project, which is the very case `run_start`
-        //     reports as `run_location_unresolved`;
-        //   * a `run_id` names a run whose project is its WORKSPACE's, and `run_start` deliberately
-        //     opens a run with no workspace when its `cwd` matched none — the session
-        //     `run_bind_spec` exists to repair.
-        // So requiring either leaves the project UNCERTAIN, and a field anchored on one alone
+        // project in a column. `cwd` is a LOOKUP that can legitimately answer nothing, and being
+        // REQUIRED does not change that: it resolves through `best_workspace_for_cwd`, a
+        // longest-prefix match over the workspace roots (`mcp_context.rs`, `resolve_project`), and
+        // a perfectly VALID path that sits under no workspace root resolves NO project.
+        // So requiring it leaves the project UNCERTAIN, and a field anchored on it alone
         // belongs to the CONDITIONAL family — the family rule read on what the anchor IS, not
-        // merely on whether it is required (findings `01M0ZWAH9EQDAZR66AFS1YJFPY` for `run_id`,
-        // `01M1005GAY94XZ7BNKY4ASFTR5` for `cwd`). This set and the `required_anchor` assertion
-        // message below name the SAME anchors; when they disagreed, the message was the one telling
-        // the truth.
+        // merely on whether it is required (finding `01M1005GAY94XZ7BNKY4ASFTR5`). This set and
+        // the `required_anchor` assertion message below name the SAME anchors; when they
+        // disagreed, the message was the one telling the truth.
         const ANCHORS_THAT_CARRY_A_PROJECT: [&str; 2] = ["project_id", "workspace_id"];
         let mut required_anchor = 0usize;
         let mut optional_anchor = 0usize;
@@ -5429,7 +5036,7 @@ mod tests {
             let Some(props) = tool["inputSchema"]["properties"].as_object() else {
                 continue;
             };
-            // A tool with no `required` array requires nothing — `run_start` is exactly that.
+            // A tool with no `required` array requires nothing.
             let required: Vec<&str> = tool["inputSchema"]["required"]
                 .as_array()
                 .map(|r| r.iter().filter_map(Value::as_str).collect())
@@ -5507,22 +5114,21 @@ mod tests {
             }
         }
         assert_eq!(
-            anchorless, 13,
+            anchorless, 14,
             "the anchorless `spec_id` FIELDS (fewer tools than fields — `spec_link` and \
              `spec_unlink` carry two each) are the ones the finding enumerates — a change in that \
-             count is a change of contract, not a detail. It went from 12 to 13 with \
-             `spec_set_category` (PDR-0017), whose only other arguments name a CATEGORY: no \
-             project_id / workspace_id / cwd / run_id, so a bare number has nothing to be counted in"
+             count is a change of contract, not a detail. It went from 13 to 14 when \
+             `spec_update_section` lost the engine's `run_id` (PDR-0031): it now carries no \
+             project anchor at all, so a bare number has nothing to be counted in"
         );
         assert_eq!(
-            optional_anchor, 7,
-            "the CONDITIONAL fields — every one whose project can be absent at call time, whether \
-             because its anchor may be omitted (`spec_update_section`, `spec_set_workspace`, \
-             `agent_context`, `run_start`, and the v2.8 reads `spec_get` / `task_list`, whose \
-             `project_id` exists only to let a '#N' resolve) or because the anchor it REQUIRES may \
-             itself resolve to nothing (`run_bind_spec`, whose `run_id` names a run that may carry \
-             no workspace). One arriving here without its condition is exactly what this family \
-             exists to catch"
+            optional_anchor, 5,
+            "the CONDITIONAL fields — every one whose project can be absent at call time because \
+             its anchor may be omitted: `spec_set_workspace`, `agent_context`, the reads \
+             `spec_get` / `task_list`, whose `project_id` exists only to let a '#N' resolve, and \
+             `spec_transition`, whose `workspace_id` / `cwd` are read on the in_progress target \
+             alone (PDR-0031 advertised it: the tool was declared and routed nowhere). One \
+             arriving here without its condition is exactly what this family exists to catch"
         );
         assert_eq!(
             required_anchor, 8,
@@ -5536,23 +5142,21 @@ mod tests {
         );
     }
 
-    /// ONE MEMBER OF THE CONDITIONAL FAMILY, pinned on its own because the BEHAVIOUR its sentence
+    /// ONE MEMBER OF THE ANCHORLESS FAMILY, pinned on its own because the BEHAVIOUR its sentence
     /// promises is pinned right next to it (`mcp_tools_spec::tests`), and the two halves are worth
     /// reading together. HOW MANY members that family has is not said here and never should be: the
     /// count lives in the assertion that fails when it drifts
     /// ([`tests::every_spec_id_argument_advertises_the_forms_it_accepts`](mod@tests)'s
-    /// `optional_anchor`), and a number repeated in prose beside it is a number nothing checks —
+    /// `anchorless`), and a number repeated in prose beside it is a number nothing checks —
     /// which is how "the four conditional fields" survived the commit that made them five (finding
     /// `01M10059A8ZKK4961GYPNERT07`).
     ///
-    /// `spec_update_section` carries exactly one project anchor and it is OPTIONAL (`run_id`, the
-    /// human-gated correction path), so the same call honours `#N` with one and refuses it without.
-    /// That is a form which works or not depending on an argument unrelated to it — harder to
-    /// diagnose than one that never works — so the CONDITION itself is part of the advertisement
-    /// (finding `01M0ZGHD137MDXFGS2PBG6GS68`). The family as a whole is held by
-    /// [`tests::every_spec_id_argument_advertises_the_forms_it_accepts`](mod@tests).
+    /// `spec_update_section` carries NO project anchor at all since the engine's `run_id` left it
+    /// (PDR-0031), so a `#N` / bare `N` has nothing to be counted in and is REFUSED BY NAME rather
+    /// than dying as `unknown spec 3` (finding `01M0ZGHD137MDXFGS2PBG6GS68`). The family as a whole
+    /// is held by [`tests::every_spec_id_argument_advertises_the_forms_it_accepts`](mod@tests).
     #[test]
-    fn spec_update_section_states_the_condition_its_short_forms_depend_on() {
+    fn spec_update_section_advertises_only_the_forms_it_can_resolve() {
         let tools = tool_descriptors();
         let desc = tools
             .iter()
@@ -5561,12 +5165,12 @@ mod tests {
             .expect("spec_update_section is advertised");
         let desc = desc.as_str().unwrap_or_default();
         assert!(
-            desc.contains("run_id"),
-            "the condition is NAMED, not left to be discovered: {desc}"
+            desc.contains(crate::spec_ref::ANCHORLESS_FORMS),
+            "the sentence names the self-anchored forms this call CAN resolve: {desc}"
         );
         assert!(
-            desc.contains(crate::spec_ref::ANCHORLESS_FORMS),
-            "and the sentence says what to send when the condition does not hold: {desc}"
+            !desc.contains(crate::spec_ref::ACCEPTED_FORMS),
+            "…and never promises a '#N' it has no project to count in: {desc}"
         );
     }
 
@@ -5576,11 +5180,9 @@ mod tests {
     ///
     /// NEITHER VISIBILITY NOR INDENTATION IS PART OF THE PATTERN: `const`, `pub const` and
     /// `pub(crate) const` all read the same. Promoting a code to `pub(crate)` so a test can pin it
-    /// by name — precisely what `mcp_engine.rs`'s `RUN_LOCATION_UNRESOLVED_WARNING_CODE` was put
-    /// through, and what `mod bind_refusal` was put through right after — must not be the move that
-    /// drops it out of a scan. `mcp_engine.rs` already mixes the two forms on one family of
-    /// constants, so a pattern keyed on `"pub const "` is not a hypothetical gap (finding
-    /// `01M10YD9QZYJJDAQQ1S8TGWSKH`).
+    /// by name must not be the move that drops it out of a scan. The crate already mixes the two
+    /// forms on one family of constants, so a pattern keyed on `"pub const "` is not a hypothetical
+    /// gap (finding `01M10YD9QZYJJDAQQ1S8TGWSKH`).
     ///
     /// Returns what FOLLOWS the keyword — the name, type and initialiser — leaving each caller to
     /// say which declarations it is after and how their literal is spelled.
@@ -5597,13 +5199,10 @@ mod tests {
     /// believed. What is asserted, on the tools concerned:
     ///   * the ANCHORING tools bound the link to `ready`/`in_progress` and promise NO status change
     ///     (and the corrective `spec_set_workspace` says a draft is refused);
-    ///   * the RESOLVING tools spell out 0/1/N — the ambiguity `reason`, the candidate list, and
+    ///   * the RESOLVING tool spells out 0/1/N — the ambiguity `reason`, the candidate list, and
     ///     the explicit denial that the most recent Spec wins;
-    ///   * `run_start` documents the AUTHORING exception: unbound + a warning, never an arbitrary
-    ///     Spec;
-    ///   * and the ZERO case speaks by CODE on both tools — `agent_context` names every case-0
-    ///     code it can emit (scanned from `mcp_context.rs`, so a new one added mute goes red) and
-    ///     `run_start` names `run_location_unresolved`.
+    ///   * and the ZERO case speaks by CODE — `agent_context` names every case-0 code it can emit
+    ///     (scanned from `mcp_context.rs`, so a new one added mute goes red).
     #[test]
     fn the_spec_anchor_and_resolution_tools_document_the_contract_they_enforce() {
         let tools = tool_descriptors();
@@ -5640,10 +5239,8 @@ mod tests {
         );
 
         // RESOLVING — the 0/1/N contract, named, with the recency pick explicitly denied.
-        for name in [
-            crate::mcp_context::AGENT_CONTEXT_TOOL,
-            crate::mcp_engine::RUN_START_TOOL,
-        ] {
+        {
+            let name = crate::mcp_context::AGENT_CONTEXT_TOOL;
             let desc = desc_of(name);
             assert!(
                 desc.contains("spec_ambiguous_for_workspace"),
@@ -5654,15 +5251,6 @@ mod tests {
                 "{name} denies the newest-wins reading outright, got: {desc}"
             );
         }
-
-        // …and the AUTHORING exception, which only run_start has.
-        let run_start = desc_of(crate::mcp_engine::RUN_START_TOOL);
-        assert!(
-            run_start.contains("spec_ambiguous_started_unbound")
-                && run_start.contains("starts unbound"),
-            "run_start documents that an authoring flow proceeds unbound with a warning, got: \
-             {run_start}"
-        );
 
         // THE CASE-0 CODES of `agent_context` — the OTHER end of the same 0/1/N contract, and the
         // one an agent meets on its nominal path (a first `/nspec` has no Spec yet).
@@ -5710,151 +5298,16 @@ mod tests {
         );
         assert_eq!(
             scanned.len(),
-            3,
-            "the scan really found mcp_context.rs's 3 case-0 codes (a pattern that silently matched \
+            2,
+            "the scan really found mcp_context.rs's 2 case-0 codes (a pattern that silently matched \
              nothing would make the loop above vacuous); got {scanned:?}"
-        );
-
-        // run_start's OWN location code — the run-side half of the same review finding: a `cwd`
-        // matching no workspace opens a run with no anchor and effectors with no repos.
-        //
-        // Pinned by NAME only, not by the same scan: `mcp_engine.rs` declares warning codes of its
-        // own, and several are covered by the descriptor as a CATEGORY rather than by their code (a
-        // stale graph fork, a query on an unbound run). Widening the rule to that module is a
-        // separate decision from this PRD's.
-        assert!(
-            run_start.contains(crate::mcp_engine::RUN_LOCATION_UNRESOLVED_WARNING_CODE),
-            "run_start's description must NAME the code '{}' — this pins the code's PRESENCE in the \
-             description, not the section of it that carries the code, got: {run_start}",
-            crate::mcp_engine::RUN_LOCATION_UNRESOLVED_WARNING_CODE
-        );
-        // …and the RESUME code, pinned the same way and for the same reason: renaming the constant
-        // without re-wording the description would leave `tools/list` naming a code no warning
-        // carries. This pins THE CODE'S PRESENCE in the description — nothing about the sentence
-        // around it, which is free to be re-written.
-        assert!(
-            run_start.contains(crate::mcp_engine::RUN_RESUMED_WARNING_CODE),
-            "run_start's description must NAME the code '{}' — same pin, same reserve: the sentence \
-             around it is free to be re-written, got: {run_start}",
-            crate::mcp_engine::RUN_RESUMED_WARNING_CODE
-        );
-    }
-
-    /// `outcome` IS A CONTRACT, and `tools/list` is where a caller reads what it may hold.
-    /// `run_start` returns one of [`crate::mcp_engine::RUN_START_OUTCOME_TAGS`] and its description
-    /// spells all three out — two spellings of the same three strings, with nothing but this test
-    /// between them. Renaming a tag on the enum alone would leave the descriptor announcing values
-    /// no run ever returns, which is the `01M1008NHM9RRA1ZAS4V7K1PM4` defect on the return side.
-    ///
-    /// THE LITERALS STAY IN THE DESCRIPTION, on the model of `run_bind_spec`'s refusal codes just
-    /// above: they read as prose there, and what keeps them honest is a lock, not a `format!` over a
-    /// paragraph. What is walked is the CONSTANT LIST against the rendered text — so a tag added to
-    /// [`crate::mcp_engine::RUN_START_OUTCOME_TAGS`], or renamed on it, fails here rather than
-    /// shipping with a descriptor that names something else.
-    ///
-    /// AND NO FURTHER, which is why the name says "listed". Nothing binds that list to the enum: a
-    /// fourth VARIANT given a tag but not a slot on the list compiles and passes HERE. What stands
-    /// in the way is a second, exhaustive match —
-    /// `mcp_engine::tests::every_run_start_outcome_carries_a_listed_tag` — which stops COMPILING on
-    /// a fourth variant and states the rule where its author lands. The array's own doc carries why
-    /// that is a visit rather than a derivation.
-    #[test]
-    fn run_start_advertises_every_listed_outcome_tag() {
-        let tools = tool_descriptors();
-        let run_start = tools
-            .iter()
-            .find(|t| t["name"] == crate::mcp_engine::RUN_START_TOOL)
-            .and_then(|t| t["description"].as_str())
-            .expect("run_start is advertised");
-        for tag in crate::mcp_engine::RUN_START_OUTCOME_TAGS {
-            assert!(
-                run_start.contains(&format!("'{tag}'")),
-                "run_start's description must name the outcome tag '{tag}' it can return, got: \
-                 {run_start}",
-            );
-        }
-    }
-
-    /// A REFUSAL MAY ONLY ADVISE AN ARGUMENT THE VERB ADVERTISES (finding
-    /// `01M1008NHM9RRA1ZAS4V7K1PM4`). When a `#N` resolves no project, `run_start` tells the caller
-    /// to ADD an anchor — and the entire value of that sentence is that the caller can act on it.
-    /// What a caller reads is `tools/list`, not `mcp_context::resolve_project`: `project_id` was
-    /// honoured at runtime and named in the trailer while ABSENT from the schema, which is the very
-    /// defect `run_bind_spec` had just been repaired for — on the verb that repair cited as the
-    /// honest one.
-    ///
-    /// THE LOCK READS THE CONSTANT, NOT A COPY OF IT
-    /// ([`crate::mcp_engine::RUN_START_ANCHOR_TRAILER`]), and it DERIVES the names the trailer
-    /// carries instead of testing it against names this test already knows: a hand-kept vocabulary
-    /// only catches a re-wording that stays inside it, so `"…a cwd / workspace_id / project_key"`
-    /// would have passed green while sending an agent after an argument `run_start` does not take
-    /// (finding `01M10YE1HTXTA76CFJMW1G4XHZ`). The domain carries both words — `project_id`, and
-    /// the KEY of a `KEY-N` — so that confusion is not hypothetical.
-    ///
-    /// THE DERIVATION HAS A SHAPE, AND THE SHAPE IS ASSERTED FIRST. The advice is a slash-separated
-    /// list of argument names, one per segment; re-write it as prose and the shape assertion goes
-    /// red rather than the derivation quietly reading nothing. That is the whole reach of this
-    /// guard, stated so it is not read as more: every name the trailer advertises IN THAT SHAPE
-    /// must be a key of `run_start`'s own `inputSchema.properties`, and any other shape has to come
-    /// back through this test.
-    /// **`node_add`'s CONFIG DESCRIPTOR ANNOUNCES EVERY FIELD `gate_check` ACCEPTS** — derived from
-    /// the authoring side's own list, not re-typed beside it.
-    ///
-    /// WHY THIS ONE TYPE GETS A GUARD. The descriptor's sentence opens with "unknown fields are
-    /// REFUSED" and then ENUMERATES the fields of each type, so for a `tools/list` reader that
-    /// enumeration IS the contract: a field missing from it reads as a field the tool will reject.
-    /// `expect` shipped validated ([`crate::mcp_authoring::known_config_fields`], and a value
-    /// outside the vocabulary is refused with the two words spelled out) and UNANNOUNCED — an agent
-    /// reading the descriptor could not discover the one field that declares a reproduction.
-    ///
-    /// WHAT IT REACHES, stated so it is not read as more: the `gate_check→{…}` enumeration, against
-    /// [`crate::mcp_authoring::known_config_fields`] for that type. Other types' enumerations are
-    /// partial by inheritance (`set_category`, `query`, `sub_workflow` and others are absent
-    /// entirely) and that pre-existing debt is not what this guard is about; extend it to them the
-    /// day their enumerations are completed.
-    #[test]
-    fn node_add_announces_every_config_field_a_gate_check_accepts() {
-        let tools = tool_descriptors();
-        let desc = tools
-            .iter()
-            .find(|t| t["name"] == crate::mcp_authoring::NODE_ADD_TOOL)
-            .and_then(|t| t["inputSchema"]["properties"]["config"]["description"].as_str())
-            .expect("node_add advertises a config description")
-            .to_string();
-        // The `type→{fields}` shape the descriptor writes its enumerations in — asserted before it
-        // is used, so a re-write into prose fails HERE instead of leaving the loop below vacuous.
-        let announced = desc
-            .split("gate_check→{")
-            .nth(1)
-            .and_then(|rest| rest.split('}').next())
-            .expect(
-                "the descriptor enumerates gate_check's fields in the `gate_check→{…}` shape this \
-                 guard derives them from",
-            )
-            .to_string();
-        for field in crate::mcp_authoring::known_config_fields(crate::db::NODE_TYPE_GATE_CHECK) {
-            assert!(
-                announced.contains(field),
-                "the authoring side accepts a 'gate_check' config field '{field}' the descriptor \
-                 does not announce — and the same sentence says unknown fields are REFUSED, so a \
-                 reader concludes it may not use it: {announced}",
-            );
-        }
-        // …and `expect`'s VOCABULARY is spelled out, since knowing the field exists without knowing
-        // which two words it takes is not a discoverable field.
-        assert!(
-            desc.contains(crate::db::GATE_EXPECT_RED)
-                && desc.contains(crate::db::GATE_EXPECT_GREEN)
-                && desc.contains("the default when the field is absent"),
-            "the descriptor states what `red` and `green` mean and that absent means green: {desc}",
         );
     }
 
     /// **`spec_set_category` ANNOUNCES THE CATEGORY OBJECT IT ACTUALLY RETURNS** — derived from
     /// [`crate::mcp_tools_spec::category_payload`], not re-typed beside it.
     ///
-    /// WHY THIS DESCRIPTOR GETS A GUARD, on the model of
-    /// [`node_add_announces_every_config_field_a_gate_check_accepts`] just above. The sentence
+    /// WHY THIS DESCRIPTOR GETS A GUARD. The sentence
     /// enumerates the response's category fields, so for a `tools/list` reader that enumeration IS
     /// the contract. It shipped announcing `state: proposed | confirmed` — a key
     /// [`crate::mcp_tools_spec::category_payload`] never emitted after the 2026-09-02 amendment of
@@ -5926,172 +5379,6 @@ mod tests {
                  2026-09-02 — this text is what an agent reads before it classifies: {rendered}",
             );
         }
-    }
-
-    #[test]
-    fn run_start_advises_only_anchors_its_own_schema_advertises() {
-        let tools = tool_descriptors();
-        let props = tools
-            .iter()
-            .find(|t| t["name"] == crate::mcp_engine::RUN_START_TOOL)
-            .and_then(|t| t["inputSchema"]["properties"].as_object().cloned())
-            .expect("run_start is advertised, with a schema");
-        let trailer = crate::mcp_engine::RUN_START_ANCHOR_TRAILER;
-        // ", or add a cwd / workspace_id / project_id" — slash-separated segments, the argument
-        // being the LAST word of each. Read that way, EVERY name the sentence carries is checked,
-        // including one no test anticipated; a list written out here would only check the ones it
-        // already contained.
-        let advised: Vec<&str> = trailer
-            .split('/')
-            .map(|segment| {
-                segment
-                    .split_whitespace()
-                    .next_back()
-                    .unwrap_or_default()
-                    .trim_end_matches(['.', ',', ';'])
-            })
-            .collect();
-        // THE SHAPE THE DERIVATION ASSUMES, ASSERTED BEFORE IT IS USED — the same discipline as the
-        // scans that audit their own reading. A trailer re-written as prose would leave the loop
-        // below matching empty strings and the guard vacuous; it fails HERE instead, so whoever
-        // changes the shape says how the new one is to be read.
-        assert!(
-            trailer.contains('/') && advised.iter().all(|name| !name.is_empty()),
-            "the advice must stay a SLASH-SEPARATED LIST of argument names — that shape is what \
-             this guard derives them from, and without it it would assert nothing while the \
-             refusal it guards says nothing actionable: {trailer}"
-        );
-        for anchor in advised {
-            assert!(
-                props.contains_key(anchor),
-                "run_start's refusal tells the caller to add '{anchor}', which its own inputSchema \
-                 does not advertise — advice a tools/list reader cannot act on is half a refusal: \
-                 {trailer}"
-            );
-        }
-    }
-
-    /// THE `data.reason` CODES `run_bind_spec` ADVERTISES ARE THE CONSTANTS IT EMITS (finding
-    /// `01M10063H5B65Q81V4HRW94W71`). Its descriptor tells a caller which condition each refusal
-    /// names, so those codes are a CONTRACT — and they were re-typed literals, exact but bound to
-    /// nothing: renaming a value in `mcp_engine`'s `bind_refusal` would have left the descriptor
-    /// mistaken in silence. The repository had already settled this the other way for
-    /// `RUN_LOCATION_UNRESOLVED_WARNING_CODE`, promoted to `pub(crate)` so its descriptor is pinned
-    /// "against the constant itself rather than against a re-typed literal"; this is the same move
-    /// on the same kind of surface.
-    ///
-    /// TWO HALVES, AND THE SECOND IS THE ONE A HAND-KEPT LIST WOULD LOSE. Each advertised code is
-    /// checked against its constant — that catches a RENAME. And the module's declarations are
-    /// SCANNED out of the source and confronted with the codes this test knows about — that catches
-    /// an ADDITION, i.e. a new refusal shipped without a word to the caller. The one code
-    /// deliberately NOT advertised is `AUTHORITY_REFUSED`: the descriptor's own sentence promises
-    /// "what you can rule out BEFORE calling, not a closed list of codes", and a race lost inside
-    /// the authority's `WHERE` is precisely what no caller can pre-check. Its ABSENCE is asserted,
-    /// so the exception stays a decision instead of becoming an oversight.
-    ///
-    /// WHAT THE ADDITION HALF REACHES, EXACTLY — because a guard that overstates its reach is worse
-    /// than none. It reads the `const` declarations of `mod bind_refusal`, at ANY visibility and
-    /// any indentation ([`const_declaration`]), and it fails on a declaration it could not parse
-    /// rather than skipping it. So: a code added there in any form is either advertised, or red.
-    /// What it does NOT reach is a `data.reason` that never becomes a constant of that module — a
-    /// bare literal handed straight to `mcp_engine::bind_refusal`. Every call site passes a
-    /// constant today, and that is the convention this guard assumes rather than enforces.
-    #[test]
-    fn run_bind_spec_advertises_its_refusal_codes_by_constant() {
-        use crate::mcp_engine::bind_refusal;
-
-        let tools = tool_descriptors();
-        let desc = tools
-            .iter()
-            .find(|t| t["name"] == crate::mcp_engine::RUN_BIND_SPEC_TOOL)
-            .and_then(|t| t["description"].as_str())
-            .expect("run_bind_spec is advertised")
-            .to_string();
-
-        // The preconditions a caller CAN rule out before calling — every one named in the
-        // descriptor, by the constant the engine answers with.
-        let advertised = [
-            bind_refusal::TERMINAL_RUN,
-            bind_refusal::FOREIGN_RUN,
-            bind_refusal::ALREADY_BOUND,
-            bind_refusal::CHILD_RUN,
-            bind_refusal::PROJECT_DISAGREEMENT,
-            bind_refusal::SPEC_HAS_A_LIVE_RUN,
-        ];
-        for code in advertised {
-            assert!(
-                desc.contains(code),
-                "run_bind_spec must name the refusal code '{code}' it can answer with — a caller \
-                 keys on data.reason, and a code taught nowhere is one it meets as a surprise: \
-                 {desc}"
-            );
-        }
-        assert!(
-            !desc.contains(bind_refusal::AUTHORITY_REFUSED),
-            "'{}' is the ONE code deliberately left out: it is a race lost inside the authority's \
-             WHERE, and the descriptor offers what can be ruled out BEFORE calling. Advertising it \
-             would invite a pre-check that cannot exist: {desc}",
-            bind_refusal::AUTHORITY_REFUSED
-        );
-
-        // …AND NOTHING MAY BE DECLARED THERE MUTE. The module's own source is the list: a new
-        // precondition added to `bind_refusal` without a word in the descriptor (and without a line
-        // above) fails here rather than reaching a caller as an unexplained `data.reason`.
-        const ENGINE_SRC: &str =
-            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_engine.rs"));
-        let block = ENGINE_SRC
-            .split_once("mod bind_refusal {")
-            .expect("the refusal codes are declared in a module of that name")
-            .1
-            .split_once("\n}")
-            .expect("…which closes at column zero, being a top-level item")
-            .0;
-        // THE READING IS [`const_declaration`]'s, and for the reason written there: a pattern keyed
-        // on `"pub const "` would make a VISIBILITY into an escape hatch. The module is `pub(crate)`
-        // — `pub const` and `pub(crate) const` reach exactly as far inside it — so a code declared
-        // either way must be seen, and `mcp_engine.rs` already mixes the two forms on one family of
-        // constants.
-        //
-        // AND THE SCAN AUDITS ITS OWN READING: every line that declares a `const` here must also
-        // yield a literal, so a declaration this pattern cannot parse — a value rustfmt wrapped
-        // onto a second line, a type spelled otherwise than `&str` — fails the COUNT rather than
-        // dropping out of the comparison below unseen. Without that audit, "unreadable" and
-        // "absent" were the same thing to this test, and a new code could ship mute by being merely
-        // unreadable (finding `01M10YD9QZYJJDAQQ1S8TGWSKH`).
-        //
-        // `line.trim()`, both ends: the block's LAST line keeps its `\r` on a CRLF checkout (it is
-        // not followed by the `\n` that would let `lines()` strip it), and a code carrying an
-        // invisible carriage return would match nothing and fail as a mystery.
-        let mut declarations = 0usize;
-        let mut declared: Vec<&str> = Vec::new();
-        for line in block.lines() {
-            let Some(rest) = const_declaration(line.trim()) else {
-                continue;
-            };
-            declarations += 1;
-            let Some((_, literal)) = rest.split_once("&str = \"") else {
-                continue;
-            };
-            declared.push(literal.trim_end_matches("\";").trim_end_matches('"'));
-        }
-        assert_eq!(
-            declared.len(),
-            declarations,
-            "every `const` DECLARED in `bind_refusal` was actually read by the scan — a declaration \
-             whose literal this pattern cannot reach must fail here rather than slip through \
-             unconfronted; {declarations} declared, read {declared:?}"
-        );
-        let mut known: Vec<&str> = advertised.to_vec();
-        known.push(bind_refusal::AUTHORITY_REFUSED);
-        declared.sort_unstable();
-        known.sort_unstable();
-        assert_eq!(
-            declared, known,
-            "every code `bind_refusal` declares is accounted for here — one this test does not \
-             know about is a refusal that would reach a caller as an unexplained `data.reason`. \
-             (A declaration the scan could NOT read has already failed the count above; what is \
-             left to this comparison is the codes it did read.)"
-        );
     }
 
     /// DONE-CRITERION (finding `01KYSCY526C9N9B2BBH68A3N2X`): A TOOL SCHEMA MAY NOT DESCRIBE A SHAPE
@@ -6459,11 +5746,9 @@ mod tests {
     /// `ASK_USER_QUESTION_TOOL`, which names CLAUDE CODE's own tool (a `PreToolUse` payload nyx
     /// reads), not a tool nyx serves — it has no business being required in `tools/list`.
     fn declared_tool_names() -> Vec<String> {
-        const SOURCES: [&str; 11] = [
+        const SOURCES: [&str; 9] = [
             include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp.rs")),
-            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_authoring.rs")),
             include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_context.rs")),
-            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_engine.rs")),
             include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_runtime.rs")),
             include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_tools_annexe.rs")),
             include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mcp_tools_core.rs")),
@@ -6536,19 +5821,30 @@ mod tests {
     ///
     /// The defect this closes was measured live: `spec_create`'s description told an agent to "use
     /// spec_transition to move its lifecycle", and the Spec role manual told it "you never call
-    /// spec_transition" — while `spec_transition` is DELIBERATELY absent from the advertised surface
-    /// (N17(b): nyx imposes every Spec transition at the graph node built for it). An agent that
-    /// followed the prose got `-32601 method_not_found` on a tool that does not exist, and a
+    /// spec_transition" — while `spec_transition` was absent from the advertised surface. An agent
+    /// that followed the prose got `-32601 method_not_found` on a tool that does not exist, and a
     /// session burned a round trip discovering it. Naming a phantom to FORBID it is the same defect
     /// as naming one to recommend it: both teach that the verb exists.
     ///
-    /// TWO NETS, because a phantom has two origins:
-    ///   * a name nyx's own code DECLARES but does not advertise ([`declared_tool_names`]) — the
-    ///     `spec_transition` shape, a tool retired from `tools/list` while the prose kept pointing
-    ///     at it. Checked wherever it appears, call shape or not, since that is how the two live
-    ///     occurrences were written.
-    ///   * a name written in CALL SHAPE ([`call_shaped_identifiers`]) that no tool answers — the
-    ///     invented verb, and the shape every "read it back with spec_get(…)" instinct takes.
+    /// THE PINNED EXAMPLE IS GONE, AND THAT IS THE POINT. `spec_transition` was the phantom this
+    /// guard was written around, and the test used to ASSERT it was one. PDR-0031 retired the
+    /// orchestration engine, so nothing imposes a Spec transition any more: the tool is now routed
+    /// and advertised like any other, and the declared-but-unadvertised set is EMPTY. An assertion
+    /// that a named tool is missing from `tools/list` would now be an assertion that the defect is
+    /// still there — so what is pinned instead is the INVARIANT the example illustrated:
+    ///
+    ///   * the phantom vocabulary is EMPTY — every `*_TOOL` name nyx's code declares is on the
+    ///     wire. This is the same rule read one step earlier: a name cannot be cited in prose
+    ///     before it exists if it cannot exist unadvertised at all. A tool constant added without
+    ///     its descriptor fails HERE, before any text has had the chance to name it.
+    ///   * and the sweep stays armed: should the set become non-empty again, every agent-facing
+    ///     text is checked against it, call shape or not — that is how the two live occurrences
+    ///     were written.
+    ///
+    /// SECOND NET, unchanged and doing the live work: a name written in CALL SHAPE
+    /// ([`call_shaped_identifiers`]) that no tool answers — the invented verb, and the shape every
+    /// "read it back with spec_get(…)" instinct takes. Its own counter asserts it saw the surface's
+    /// citations, so a scan that silently matched nothing cannot pass for a guard.
     #[test]
     fn no_agent_facing_text_names_a_tool_that_is_not_advertised() {
         let advertised: Vec<String> = tool_descriptors()
@@ -6571,12 +5867,16 @@ mod tests {
         // shape (`prefers_reduced_motion(…)`), the exception belongs here, named — never as a
         // loosening of the net.
         //
-        // THE TWO NETS MUST BE IN THE WATER, and that is asserted rather than assumed: a scan that
-        // silently matched nothing would be a green test guarding nothing at all.
+        // THE PHANTOM VOCABULARY IS EMPTY, and it is asserted rather than hoped for: a name the
+        // code declares and the wire does not carry is a phantom whether or not a text happens to
+        // cite it today, so the state itself is what is pinned. `spec_transition` was the last one
+        // and it is now advertised (PDR-0031). The sweep below stays armed for the day this set is
+        // non-empty again — it is written to sweep whatever it holds, never one pinned name.
         assert!(
-            unadvertised.contains(&&crate::mcp_tools_spec::SPEC_TRANSITION_TOOL.to_string()),
-            "spec_transition is declared and NOT advertised — the phantom this guard was written \
-             for must be in the vocabulary it sweeps: {unadvertised:?}"
+            unadvertised.is_empty(),
+            "declared and NOT advertised in tools/list: {unadvertised:?} — an agent that reads a \
+             text naming one gets method_not_found. Advertise the tool in `tool_descriptors()`, or \
+             drop the constant"
         );
         let mut call_shapes = 0usize;
 
@@ -6609,15 +5909,13 @@ mod tests {
     /// role that does not exist.**
     ///
     /// A role name is a word an agent SENDS — `agent_context(role: …)` refuses anything outside the
-    /// six — so prose naming a seventh sends a session into a refusal it cannot diagnose, and prose
+    /// list — so prose naming one more sends a session into a refusal it cannot diagnose, and prose
     /// omitting one hides a capability. The advertised vocabulary is therefore replayed through the
     /// very parser that accepts it, in BOTH directions, and the words nyx has never had (a
-    /// "reviewer": the role that audits is `auditor`) are swept out of every agent-facing text.
+    /// "reviewer", a "prototyper") are swept out of every agent-facing text.
     ///
-    /// `prototyper` is deliberately NOT swept: it is a real WORKFLOW SCOPE (`run_start`,
-    /// `workflow_create`), and the role beside it is `prototype`. Two vocabularies, one syllable
-    /// apart — which is exactly why the ROLE half is pinned to its parser rather than to a list
-    /// someone keeps by eye.
+    /// The ROLE half is pinned to its PARSER rather than to a list someone keeps by eye, which is
+    /// what makes it survive a change of vocabulary (PDR-0031 cut the roles to three).
     #[test]
     fn no_agent_facing_text_names_a_role_that_does_not_exist() {
         use crate::mcp_context::AgentRole;
@@ -6665,7 +5963,7 @@ mod tests {
             for phantom in ["reviewer", "role=prototyper", "role: prototyper"] {
                 assert!(
                     !lower.contains(phantom),
-                    "{surface} names '{phantom}', which is not a role nyx has (the six are \
+                    "{surface} names '{phantom}', which is not a role nyx has (the roles are \
                      {:?})\n{text}",
                     AgentRole::ALL.map(AgentRole::slug)
                 );
@@ -7115,26 +6413,6 @@ mod tests {
                 "v2.6 annexe tool {expected} must be listed"
             );
         }
-        // The v2.8 engine runtime tick (nyx_next) is advertised alongside, kept OUT of V1_TOOLS.
-        assert!(
-            names.contains(&crate::mcp_engine::NYX_NEXT_TOOL),
-            "v2.8 nyx_next engine tool must be listed"
-        );
-        // …and the run-lifecycle RECOVERY beside the entry: an un-advertised tool is
-        // undispatchable (N17), and a session that opened its run unbound has no other way out.
-        assert!(
-            names.contains(&crate::mcp_engine::RUN_BIND_SPEC_TOOL),
-            "run_bind_spec must be listed"
-        );
-        // The v2.8 GRAPH-AUTHORING tools (workflow_create/fork/assign + node CRUD + the v2.8-review
-        // reads workflow_list/workflow_get/run_list + workflow_delete) advertised alongside, kept
-        // OUT of V1_TOOLS (a new v2.8 surface).
-        for expected in crate::mcp_authoring::AUTHORING_TOOLS {
-            assert!(
-                names.contains(&expected),
-                "v2.8 authoring tool {expected} must be listed"
-            );
-        }
         // v2.7 Phase 2: the PROTOTYPE tools (the agent's constrained proto contract) advertised
         // alongside, kept OUT of V1_TOOLS (a new surface).
         for expected in crate::mcp_tools_proto::PROTO_TOOLS {
@@ -7187,11 +6465,9 @@ mod tests {
                 // (manage_command_group).
                 + 29
                 + 9
-                + 3
                 + crate::mcp_tools_spec::SPEC_TOOLS.len()
                 + crate::mcp_tools_idea::IDEA_TOOLS.len()
                 + crate::mcp_tools_annexe::ANNEXE_TOOLS.len()
-                + crate::mcp_authoring::AUTHORING_TOOLS.len()
                 + crate::mcp_tools_proto::PROTO_TOOLS.len()
                 + crate::mcp_tools_design::DESIGN_TOOLS.len(),
             "exactly the v1 surface plus probe + wait_for_command + \
@@ -7207,10 +6483,7 @@ mod tests {
              agent_context + repo_diff + repo_git_view + repo_watch + repo_unwatch + \
              review_comment_list + review_comment_post + review_comment_resolve + review_task_list + \
              review_task_structure + review_submit_feedback + the 12 v2.6 idea tools + \
-             the 4 v2.6 annexe tools + the 3 v2.8 engine runtime tools (run_start + its \
-             recovery twin run_bind_spec + nyx_next) + \
-             the 13 v2.8 graph-authoring tools (7 mutations + slot_bind + \
-             workflow_list/workflow_get/run_list reads + workflow_delete/run_delete) + the 16 v2.7 proto tools (9 read/lifecycle, \
+             the 4 v2.6 annexe tools + the 16 v2.7 proto tools (9 read/lifecycle, \
              incl. the agent recommendation proto_recommend_variant, + 7 creation/amorçage) + \
              the 6 v2.7 design tools (design_inventory + design_recipe + design_refresh_component + \
              design_delete_component + design_tokens + design_preview) extension tools"
@@ -7362,12 +6635,12 @@ mod tests {
         rx
     }
 
-    /// v2.8 L1 — THE freeze the user hit twice in one day, reproduced: a LONG `tools/call` must not
+    /// THE freeze the user hit twice in one day, reproduced: a LONG `tools/call` must not
     /// stop the MCP surface from serving anything else.
     ///
-    /// The real shape is a `nyx_next` whose `gate_check` runs the project's test suite inline (up to
-    /// `mcp_engine::GATE_TOTAL_TIMEOUT` = 90s); the user reproduced it by binding `sleep 60; bun
-    /// test` and watching the app freeze for a full minute. Here the duration is CONTROLLED — the
+    /// The real shape is a blocking wait parked on the dispatch path for up to a minute; the user
+    /// reproduced it with `sleep 60; bun test` and watched the app freeze for a full minute.
+    /// Here the duration is CONTROLLED — the
     /// slow tool parks until this test releases it — so the test asserts the structural property
     /// (the surface stays served) with no timing luck involved.
     ///
@@ -7416,7 +6689,7 @@ mod tests {
         assert_eq!(v["result"]["structuredContent"]["served"], "slow");
     }
 
-    /// v2.8 L1 — what happens when the pool SATURATES: the request WAITS for a free worker, and is
+    /// What happens when the pool SATURATES: the request WAITS for a free worker, and is
     /// then served normally. It is never dropped, never answered by anything other than the handler,
     /// and never met with a lie.
     ///
@@ -7463,14 +6736,13 @@ mod tests {
         }
     }
 
-    /// The dispatcher the two auto-map wire tests below share: it mirrors the real
+    /// The dispatcher the auto-map wire test below uses: it mirrors the real
     /// `SidecarDispatcher::call_with_caller` by threading the caller into
     /// `dispatch_extension_tool` against a live in-memory `Db`, over a throwaway no-op runner +
     /// host (the sidecar's own pre-runtime path).
     ///
-    /// It is at module level rather than inside one test because BOTH the `spec_create` seam and
-    /// the `run_start` seam need exactly it, and a second copy is a second thing to keep in step
-    /// with the production dispatcher.
+    /// It is at module level rather than inside the test so a second seam that needs it does not
+    /// grow a second copy to keep in step with the production dispatcher.
     struct AutoMapDispatcher {
         db: crate::db::Db,
     }
@@ -7742,113 +7014,6 @@ mod tests {
             1,
             "no X-Nyx-Terminal-Id header → no caller → the set is unchanged (no auto-map)"
         );
-    }
-
-    /// THE SEAM THE SESSION HOOK ACTUALLY USES — `run_start`, over the wire, with and without the
-    /// header (human review 01M1H5QY53WMGA8Y46DC2T655W).
-    ///
-    /// The test above proves the chain on `spec_create`, which is the tool `/nspec` reaches through
-    /// `.mcp.json` — a transport that has always carried `X-Nyx-Terminal-Id`. `/ndev` reaches
-    /// nothing of the sort at its start: the `UserPromptSubmit` HOOK
-    /// (`resources/claude-plugin/hooks/nyx-session-hook.cjs`) opens the run with a `run_start` of
-    /// its own, and it sent `content-type` / `content-length` and nothing else. So `run_start`
-    /// arrived with `caller_terminal_id: None`, `dispatch_extension_tool` skipped
-    /// `link_terminal_active_session_spec`, and the terminal's dev overlay never learnt which Spec
-    /// the run was on — `/nspec` mapped, `/ndev` never did.
-    ///
-    /// `run_start` is a MUTATING tool that reports the Spec it bound (`spec_id` in its result), so
-    /// it is auto-mappable exactly like `spec_create`; the header was the only missing half. This
-    /// pins BOTH directions over the real loopback wire so the fix cannot silently come undone.
-    #[test]
-    fn run_start_over_the_wire_auto_maps_only_when_the_terminal_header_is_sent() {
-        use crate::db::{self as ndb, SpecSections, SpecTransition};
-
-        let db = ndb::Db::in_memory();
-        db.with_conn(crate::seed::seed_builtin_workflows)
-            .expect("the built-in ndev/coder graphs the run resolves");
-
-        // A project with its root workspace, an in-progress Spec anchored on it, and a terminal
-        // hosting a LIVE agent session — the caller the header names.
-        let (spec_id, terminal_id) = db.with_conn(|c| {
-            let (project, root) =
-                ndb::create_project(c, "Proj", "/work-runstart", None).expect("project");
-            let (spec, _rev) = ndb::create_spec(
-                c,
-                &project.id,
-                "Spec driven by /ndev",
-                SpecSections {
-                    problem: "the overlay must know".into(),
-                    solution: "send the header".into(),
-                    ..Default::default()
-                },
-            )
-            .expect("spec");
-            ndb::transition_spec(c, &spec.id, SpecTransition::Ready, true).expect("ready");
-            ndb::transition_spec_with_workspace(
-                c,
-                &spec.id,
-                SpecTransition::Start,
-                true,
-                Some(&root.id),
-            )
-            .expect("start");
-            let terminal = ndb::create_terminal(c, "/work-runstart", None).expect("terminal");
-            ndb::record_session_start(
-                c,
-                &terminal.id,
-                ndb::AGENT_KIND_CLAUDE_CODE,
-                ndb::SessionCapture {
-                    external_session_id: "ext-runstart-1".into(),
-                    cwd: "/work-runstart".into(),
-                    ..Default::default()
-                },
-            )
-            .expect("session");
-            (spec.id, terminal.id)
-        });
-        let mapped = |db: &ndb::Db| {
-            db.with_conn(|c| ndb::specs_for_terminal(c, &terminal_id))
-                .unwrap()
-        };
-        assert!(mapped(&db).is_empty(), "nothing is mapped before the call");
-
-        let (server, port) = start_test_server();
-        server.set_dispatcher(Arc::new(AutoMapDispatcher { db: db.clone() }));
-        let run_start = |id: u32| {
-            format!(
-                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"{}","arguments":{{"spec_id":"{spec_id}"}}}}}}"#,
-                crate::mcp_engine::RUN_START_TOOL,
-            )
-        };
-
-        // 1) WITHOUT the header — the shape the hook shipped. The run opens, and NOTHING is mapped:
-        //    no caller, no `agent_session_specs` row, no overlay.
-        let (status, body) = http_post_mcp(port, &run_start(1), None);
-        assert!(status.contains("200"), "run_start call 200, got {status}");
-        let v: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["result"]["isError"], false, "run_start must succeed: {body}");
-        assert_eq!(
-            v["result"]["structuredContent"]["spec_id"], spec_id,
-            "the run IS bound to the Spec — the mapping's raw material was there all along: {body}"
-        );
-        assert!(
-            mapped(&db).is_empty(),
-            "no X-Nyx-Terminal-Id → no caller → no auto-map: this is the bug, pinned"
-        );
-
-        // 2) WITH the header — the shape the hook ships now. ONE `agent_session_specs` row, naming
-        //    that terminal's live session and that Spec.
-        let (status2, body2) = http_post_mcp(port, &run_start(2), Some(&terminal_id));
-        assert!(status2.contains("200"), "second run_start 200, got {status2}");
-        let v2: Value = serde_json::from_str(&body2).unwrap();
-        assert_eq!(v2["result"]["isError"], false, "run_start must succeed: {body2}");
-        let linked = mapped(&db);
-        assert_eq!(
-            linked.len(),
-            1,
-            "the header terminal's live session gains exactly the Spec the run is bound to"
-        );
-        assert_eq!(linked[0].id, spec_id);
     }
 
     #[test]

@@ -22,17 +22,17 @@
 //   prototype detaille (prototypes/pages/variants/rounds/feedback) s'absorbe a v2.7 (PDR-0009).
 //
 // PERIMETRE - CE QUI N'EST PAS MODELISE ICI, ET POURQUOI :
-// - Les tables d'EXECUTION du moteur d'orchestration - nodes, workflow_runs, command_slots,
-//   human_turns, gate_attempts - ne figurent pas dans ce fichier. Elles n'ont de sens que dans un
-//   workflow_run (elles sont correlees a un run_id / node_id) et decrivent le DEROULE d'un travail,
-//   pas le modele de domaine durable qu'un lecteur vient chercher ici. Leur schema autoritaire est
-//   crates/nyx-core/src/schema.rs. Seules workflows / agents / workflow_agents - la DEFINITION d'un
-//   flow, qui est une donnee de projet - sont ici (TableGroup agentic).
-// - Les tables OPERATIONNELLES de l'app - app_settings, managed_command_groups - non plus, pour la
-//   meme raison : ce sont des reglages d'installation, pas du domaine.
+// - Les tables d'EXECUTION du moteur d'orchestration - workflows, nodes, workflow_runs,
+//   command_slots, human_turns, gate_attempts - n'existent PLUS : le moteur behavior-tree livre en
+//   v2.8 a ete retire (PDR-0031), avec projects.workflow_id, au profit de manuels en prose par
+//   commande (docs/product/agent-manuals.md). Il ne reste donc aucun etat d'execution parallele a
+//   celui du Spec ; agents - la DEFINITION d'un role, qui est une donnee de projet - reste ici
+//   (TableGroup agentique).
+// - Les tables OPERATIONNELLES de l'app - app_settings, managed_command_groups - ne figurent pas
+//   ici : ce sont des reglages d'installation, pas du domaine.
 // - domain_events EST modelise malgre sa forme de journal append-only a ids de correlation :
 //   l'appartenance ne se lit pas de la FORME d'une table mais de ce qu'elle decrit. domain_events
-//   est l'historique metier du domaine ; gate_attempts est la trace d'execution d'un run.
+//   est l'historique metier du domaine.
 // - Consequence pratique : une table presente dans schema.rs et absente d'ici releve de cette regle
 //   ou d'un oubli, et c'est cette liste qui permet de trancher. Une nouvelle table d'execution ne
 //   s'ajoute pas ici ; une nouvelle table de domaine, si.
@@ -84,6 +84,8 @@ Enum priority {
   low
 }
 
+// PLUS LU ni expose depuis PDR-0031 : conserve parce que la colonne specs.mode l'est aussi.
+// Retrait differe a un prochain nettoyage de schema.
 Enum spec_mode {
   stepped
   autopilot
@@ -207,7 +209,6 @@ Table projects {
   key varchar [not null, unique]
   kind project_kind [not null, default: 'user']
   primary_workspace_id varchar
-  workflow_id varchar [ref: > workflows.id]
   resume_agent_sessions boolean [not null, default: false]
   created_at datetime [not null]
   updated_at datetime [not null]
@@ -310,7 +311,7 @@ Table specs {
   priority priority [not null, default: 'med']
   category_id varchar [ref: > categories.id]
   status spec_status [not null, default: 'draft']
-  mode spec_mode [not null, default: 'stepped']
+  mode spec_mode [not null, default: 'stepped', note: 'PLUS LUE ni exposee depuis le retrait du moteur (PDR-0031) : rien ne s arrete a une fin de phase. Colonne laissee en place, retrait differe a un prochain nettoyage de schema.']
   phases json [note: 'liste ordonnee [{number,name}] (PDR-0022) ; tasks.phase indexe cette liste ; statut de phase derive des tasks, pas de table de phases']
   current_revision_number integer [not null, default: 1]
   position integer [not null, default: 0]
@@ -500,7 +501,7 @@ Table managed_commands {
     (project_id, name) [unique]
   }
 
-  Note: 'Cible : soit repository_id (resolu par workspace, robuste), soit subfolder litteral (PDR-0013). gate (nullable) = point lifecycle ou la commande sert de CHECK deterministe (ex. pre-review : lint/test ; pre-ship : secrets) ; blocking = stoppe le flux si echec (PDR-0020). gate null = simple service managé.'
+  Note: 'Cible : soit repository_id (resolu par workspace, robuste), soit subfolder litteral (PDR-0013). gate (nullable) = point lifecycle ou la commande sert de CHECK deterministe (ex. pre-review : lint/test ; pre-ship : secrets) ; blocking = severite du check. gate null = simple service manage. Depuis le retrait du moteur (PDR-0031) plus aucun interpreteur ne bloque un flux : c est la NOTE de la commande, rendue dans list_commands et dans le contexte injecte, qui dit a l agent quand la lancer et ce qu un rouge implique (les slots command_slots / slot_bind sont supprimes).'
 }
 
 Table command_instances {
@@ -673,7 +674,7 @@ Table adrs {
 }
 
 // Directives = les RULES (PDR-0020) : consignes advisory projet, injectees dans le contexte d'un agent.
-// Les CHECKS deterministes vivent sur managed_commands (gate) ; les roles/hooks sur agents/workflows.
+// Les CHECKS deterministes vivent sur managed_commands (leur note dit quand les lancer) ; les roles sur agents.
 Table directives {
   id varchar [pk]
   project_id varchar [not null, ref: > projects.id]
@@ -686,7 +687,7 @@ Table directives {
   created_at datetime [not null]
   updated_at datetime [not null]
 
-  Note: 'RULE (PDR-0020) = consigne advisory injectee dans le contexte d un agent (rendu live par nyx-core). target = type d agent vise (spec/dev/doc/subagent ; null = tous) ; scope = quand (always, pre-review...). Ex : "Angular v20 idioms". Les checks deterministes = managed_commands.gate ; les roles = agents.'
+  Note: 'RULE (PDR-0020) = consigne advisory injectee dans le contexte d un agent (rendu live par nyx-core). target = type d agent vise (spec/dev/doc/subagent ; null = tous) ; scope = quand (always, pre-review...). Ex : "Angular v20 idioms". Les checks deterministes = managed_commands (gate + note) ; les roles = agents.'
 }
 
 Table documents {
@@ -813,12 +814,13 @@ Table document_attachments {
 }
 
 // -----------------------------------------------------------------------------
-// AGENTIQUE : AGENTS & WORKFLOWS (PDR-0020)
+// AGENTIQUE : AGENTS (PDR-0020, amende par PDR-0031)
 // -----------------------------------------------------------------------------
 
 // Definition d'agent = bibliotheque reutilisable. project_id null = defaut nyx / partage (reutilisable
-// entre projets) ; renseigne = custom prive. spec/dev/doc = principaux (1 chacun par workflow,
-// declenchables /nspec /ndev /ndoc) ; subagent = lance par un principal via le Task du provider (N par workflow).
+// entre projets) ; renseigne = custom prive. spec/dev/doc = les trois principaux, un par commande
+// (/nspec /ndev /ndoc) ; subagent = lance par un principal via le Task du provider, brieffe par lui
+// et encadre par la charte que nyx injecte au SubagentStart.
 Table agents {
   id varchar [pk]
   project_id varchar [ref: > projects.id]
@@ -830,35 +832,7 @@ Table agents {
   created_at datetime [not null]
   updated_at datetime [not null]
 
-  Note: 'Bibliotheque reutilisable (project_id null = builtin nyx, forkable + partageable entre projets). prompt_template = statique + marqueurs rules/checks/donnees live, rendu par nyx-core et injecte via hooks (additionalContext). tools_json = outils/skills (ex. agent-browser pour un ui-tester). Subagents = Task du provider, observes via SubagentStart/Stop.'
-}
-
-// Workflow = composition reutilisable (defaut nyx forkable), assignee a un projet via projects.workflow_id.
-Table workflows {
-  id varchar [pk]
-  project_id varchar [ref: > projects.id]
-  name varchar [not null]
-  builtin boolean [not null, default: false]
-  created_at datetime [not null]
-  updated_at datetime [not null]
-
-  Note: 'project_id null + builtin = workflow par defaut nyx. Compose 1 spec + 1 dev + 1 doc + N subagents via workflow_agents.'
-}
-
-// Liaison workflow -> agents. slot spec/dev/doc = unique par workflow ; slot subagent = multiple.
-Table workflow_agents {
-  id varchar [pk]
-  workflow_id varchar [not null, ref: > workflows.id]
-  agent_id varchar [not null, ref: > agents.id]
-  slot agent_type [not null]
-  scope varchar
-  position integer [not null, default: 0]
-
-  indexes {
-    (workflow_id, slot, position)
-  }
-
-  Note: 'slot = role dans le workflow. spec/dev/doc : un seul par workflow. subagent : plusieurs ; scope = point d injection (ex. pre-handoff pour ui-tester). dev lance les subagents via le Task du provider.'
+  Note: 'Bibliotheque reutilisable (project_id null = builtin nyx, forkable + partageable entre projets). prompt_template = statique + marqueurs rules/checks/donnees live, rendu par nyx-core et injecte via hooks (additionalContext) ; le texte livre des trois manuels et de la charte vit dans docs/product/agent-manuals.md. tools_json = outils/skills. Subagents = Task du provider, observes via SubagentStart/Stop. Aucune table de composition : les workflows et leur wiring sont retires (PDR-0031).'
 }
 
 // -----------------------------------------------------------------------------
@@ -997,6 +971,4 @@ TableGroup realtime_migration {
 
 TableGroup agentique {
   agents
-  workflows
-  workflow_agents
 }

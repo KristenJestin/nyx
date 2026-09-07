@@ -129,54 +129,7 @@ function detailFixture(): SpecDetail {
   };
 }
 
-/** The ndev graph + a run bound to the Spec — what the header's ORCHESTRATION RUN modal reads. */
-const ENGINE_WORKFLOW = {
-  id: "wf1",
-  project_id: null,
-  name: "ndev — dev loop (default)",
-  scope: "ndev",
-  root_node_id: "eroot",
-  forked_from: null,
-  created_at: 0,
-  updated_at: 0,
-};
-const ENGINE_NODES = [
-  {
-    id: "eroot",
-    workflow_id: "wf1",
-    parent_id: null,
-    order_index: 0,
-    type_: "sequence",
-    label: "/ndev",
-    config: "{}",
-    created_at: 0,
-    updated_at: 0,
-  },
-  {
-    id: "ecoder",
-    workflow_id: "wf1",
-    parent_id: "eroot",
-    order_index: 0,
-    type_: "spawn_subagent",
-    label: "coder",
-    config: JSON.stringify({ agent_id: "coder" }),
-    created_at: 0,
-    updated_at: 0,
-  },
-];
-const ENGINE_RUN = {
-  id: "run1",
-  workflow_id: "wf1",
-  spec_id: "s1",
-  parent_run_id: null,
-  current_node_id: "ecoder",
-  blackboard: JSON.stringify({ phase: "1/3" }),
-  status: "running",
-  started_at: 0,
-  updated_at: 0,
-};
-
-function installBackend(detail: SpecDetail = detailFixture(), specRuns: unknown[] = []) {
+function installBackend(detail: SpecDetail = detailFixture()) {
   mockIPC((cmd) => {
     switch (cmd) {
       case "list_projects":
@@ -185,12 +138,6 @@ function installBackend(detail: SpecDetail = detailFixture(), specRuns: unknown[
         return [];
       case "spec_detail":
         return detail;
-      case "engine_spec_runs":
-        return specRuns;
-      case "engine_workflow_graph":
-        return { workflow: ENGINE_WORKFLOW, nodes: ENGINE_NODES };
-      case "engine_effector_context":
-        return { context: "=== NYX CONTEXT — CODER ===" };
       case "workspace_timeline":
         return { workspace_id: "w1", entries: [] };
       case "spec_activity":
@@ -229,34 +176,6 @@ describe("SpecDetailPage", () => {
     for (const label of ["Spec", "Tasks", "Review", "Annexes", "Activity", "Runtime"]) {
       expect(screen.getByRole("tab", { name: new RegExp(label) })).toBeTruthy();
     }
-  });
-
-  // The RUNTIME lives with the Spec now (`/engine` is structural): the header carries the entry
-  // point onto the orchestration-run modal — the shared engine graph, the run's cursor on it, and
-  // the blackboard following the run's variables.
-  it("opens the orchestration-run modal from the header (graph + blackboard for the Spec's run)", async () => {
-    installBackend(detailFixture(), [ENGINE_RUN]);
-    const { baseElement } = renderDetail();
-    await screen.findByRole("heading", { name: "The detailed spec" });
-
-    // Closed by default — no graph leaked into the page.
-    expect(baseElement.querySelector('[data-testid="engine-canvas"]')).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: /orchestration run/i }));
-    expect(await screen.findByText("Orchestration run")).toBeTruthy();
-    await waitFor(() =>
-      expect(baseElement.querySelector('[data-node-type="spawn_subagent"]')).toBeTruthy(),
-    );
-    await waitFor(() => expect(baseElement.querySelector('[data-current="true"]')).toBeTruthy());
-    expect(screen.getByText("Blackboard")).toBeTruthy();
-    expect(screen.getByText("1/3")).toBeTruthy();
-  });
-
-  it("shows the run modal's empty state for a Spec that has never been orchestrated", async () => {
-    renderDetail(); // the default backend serves NO run for the Spec
-    await screen.findByRole("heading", { name: "The detailed spec" });
-    fireEvent.click(screen.getByRole("button", { name: /orchestration run/i }));
-    expect(await screen.findByText("No run for this Spec yet")).toBeTruthy();
   });
 
   it("shows the Spec revision sections on the default tab", async () => {

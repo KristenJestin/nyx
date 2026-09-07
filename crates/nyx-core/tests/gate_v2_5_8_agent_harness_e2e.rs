@@ -1,16 +1,28 @@
-//! GATE e2e (v2.5.8 agent harness, PRD 01KXC80E2CDSNN9PPMJFJFE3X7 / PDR-0020) — the
-//! Phase-4 done-criterion, proven GREEN and reproducible: a full **create → dev → doc**
-//! cycle is drivable through the native nyx MCP tools, with the role harness rendered LIVE
-//! at each step and ZERO depot in the path.
+//! GATE e2e (v2.5.8 agent harness, PRD 01KXC80E2CDSNN9PPMJFJFE3X7 / PDR-0020, re-pointed at
+//! PDR-0031) — the Phase-4 done-criterion, proven GREEN and reproducible: a full
+//! **create → dev → doc** cycle is drivable through the native nyx MCP tools, with the role
+//! manual rendered LIVE at each step and ZERO depot in the path.
+//!
+//! WHAT THE PROSE ASSERTIONS ARE PINNED TO. Every string this gate asserts on comes from the
+//! DELIVERED manuals — `crates/nyx-core/resources/agent-manuals/{nspec,ndev,ndoc}.md`, which are
+//! `docs/product/agent-manuals.md` §§1-3 word for word — or from a `{{…}}` block nyx renders into
+//! them. It used to assert on the retired orchestration engine's vocabulary (`nyx_next`, the
+//! "thin dispatcher" preamble, a "Current phase — N · Name" headline resolved from task status);
+//! none of that text exists any more, and asserting on it made the gate a test of a dead build.
 //!
 //! It exercises the REAL tool surface the sidecar dispatches (the exact functions
 //! [`nyx_core::mcp_tools_core::dispatch_extension_tool`] delegates to):
 //!   * `spec_create` / `spec_update_section` / `task_add` / `task_add_dependency` /
 //!     `spec_transition` / `task_transition` — via [`dispatch_spec_tool`] (the same routing
 //!     the MCP server uses), i.e. MCP = the actions;
-//!   * `agent_context` — via [`dispatch_context_tool`] — renders each role's manual (spec →
-//!     dev → coder/auditor → doc) LIVE from nyx state (the Spec's sections, the CURRENT
-//!     phase resolved from task status, the workspace + repos);
+//!   * `agent_context` — via [`dispatch_context_tool`] — renders each role's manual LIVE from
+//!     nyx state (the Spec's sections, the whole task plan with its blocking edges, the
+//!     workspace + repos, the managed commands). THE ROLES ARE THREE — `spec` / `dev` / `doc`,
+//!     one per nyx command (PDR-0031, `docs/product/agent-manuals.md` §5 row 5). `coder`,
+//!     `auditor` and `prototype` are GONE from this surface: those are sub-agents the /ndev
+//!     orchestrator briefs itself, and what nyx gives them is the §4 CHARTER, relayed by the
+//!     `SubagentStart` hook (proven in `hook_push_injection_e2e.rs` and in
+//!     `mcp_tools_core::tests::agent_session_event_subagent_start_returns_the_charter_as_context`);
 //!   * `review_comment_post` / `review_task_structure` / `review_comment_list` /
 //!     `review_task_list` — the review loop the dev orchestrator runs.
 //!
@@ -155,15 +167,9 @@ fn live_project() -> (TempDir, Db, String, String, String, String) {
 /// ([`dispatch_spec_tool`]) — the same entry point the sidecar dispatches. Panics on a
 /// mis-route or a tool error (a green cycle must never hit one).
 fn spec_tool(db: &Db, name: &str, args: Value) -> ToolOutcome {
-    // N17(b): `spec_transition` is no longer routed to the AGENT (nyx imposes every Spec transition
-    // at the graph node). The FUNCTION + its guards remain — the UI uses them, and this harness drives
-    // the lifecycle through it directly (the confirmation guard it asserts lives on the function).
-    let outcome = if name == "spec_transition" {
-        Some(nyx_core::mcp_tools_spec::spec_transition(db, &args))
-    } else {
-        dispatch_spec_tool(db, name, &args)
-    };
-    outcome
+    // `spec_transition` passe par le MÊME dispatcher que les autres depuis PDR-0031 : il n'y a plus
+    // de nœud de graphe pour imposer une transition, l'agent la demande et nyx tranche.
+    dispatch_spec_tool(db, name, &args)
         .unwrap_or_else(|| panic!("spec tool `{name}` was not routed"))
         .unwrap_or_else(|e| panic!("spec tool `{name}` failed: [{:?}] {}", e.code, e.message))
 }
@@ -242,18 +248,27 @@ fn create_dev_doc_cycle_is_drivable_via_nyx_tools_without_depot() {
     // + the anti-duplication weaving — and it pilots via nyx tools, not depot.
     let spec_manual = render(&db, json!({ "role": "spec", "spec_id": sid }));
     assert!(
-        spec_manual.contains("=== NYX CONTEXT — SPEC ==="),
-        "spec header"
+        spec_manual.starts_with("# nyx — Spec Author (/nspec)"),
+        "the /nspec manual is the delivered §1 text, from its first line: {}",
+        spec_manual.lines().next().unwrap_or_default(),
     );
-    assert!(spec_manual.contains("Spec Author"), "spec-author preamble");
     assert!(
-        spec_manual.contains("the human DUMPS raw, you GRILL")
-            || spec_manual.contains("The human DUMPS raw, you GRILL"),
+        spec_manual.contains("You turn a raw human intent into a nyx Spec"),
+        "the Spec Author mandate",
+    );
+    assert!(
+        spec_manual.contains("## 1. Grill — the part that matters most")
+            && spec_manual.contains("Interview the human until nothing is silently assumed"),
         "the grill contract is in the manual",
     );
     assert!(
-        spec_manual.contains("the human validates the SPEC, you decide the TASKS"),
+        spec_manual
+            .contains("## 3. Decompose — autonomous, you decide, the human does not review the tasks"),
         "autonomous slicing rule",
+    );
+    assert!(
+        spec_manual.contains("Only on an explicit yes: spec_transition(spec_id, to=\"ready\", user_confirmed=true)"),
+        "the manual routes `ready` through spec_transition with the human's explicit confirmation",
     );
     assert!(
         spec_manual.contains("batch imports block the UI")
@@ -325,12 +340,12 @@ fn create_dev_doc_cycle_is_drivable_via_nyx_tools_without_depot() {
     spec_tool(
         &db,
         "spec_transition",
-        json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+        json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
     );
     let started = spec_tool(
         &db,
         "spec_transition",
-        json!({ "spec_id": sid, "transition": "start", "user_confirmed": true, "workspace_id": workspace_id }),
+        json!({ "spec_id": sid, "to": "start", "user_confirmed": true, "workspace_id": workspace_id }),
     );
     assert_eq!(started.result["spec"]["status"], "in_progress");
     assert_eq!(
@@ -338,79 +353,87 @@ fn create_dev_doc_cycle_is_drivable_via_nyx_tools_without_depot() {
         "the start transition posed the dev workspace anchor (so agent_context(role=dev) resolves)",
     );
 
-    // --- DEV (/ndev): v2.8 — the dev context is now a THIN DISPATCHER (annex
-    //     `context-dev-dispatcher`). It calls `nyx_next` and performs EXACTLY the atomic action nyx
-    //     returns — it orients NOTHING itself (no state rule, no per-phase cadence, no review loop
-    //     in the session: that whole orchestration is the behavior-tree graph). The render still
-    //     weaves the LIVE current phase resolved from the task statuses. ---
+    // --- DEV (/ndev): the delivered §2 manual — an ORCHESTRATOR that sends others to do the
+    //     work and judges what comes back. There is no dispatcher, no `nyx_next`, no per-phase
+    //     cadence: phases are grouping LABELS and the render hands over the WHOLE plan with its
+    //     blocking edges, which is what lets the orchestrator run the frontier in parallel. ---
     let dev_manual = render(&db, json!({ "role": "dev", "workspace_id": workspace_id }));
     assert!(
-        dev_manual.contains("=== NYX CONTEXT — DEV ==="),
-        "dev header"
+        dev_manual.starts_with("# nyx — Dev Orchestrator (/ndev)"),
+        "the /ndev manual is the delivered §2 text, from its first line: {}",
+        dev_manual.lines().next().unwrap_or_default(),
     );
     assert!(
-        dev_manual.contains("Dev — dispatcher"),
-        "thin dispatcher preamble"
+        dev_manual.contains("Your single objective: code that WORKS and RESPECTS the Spec."),
+        "the orchestrator's single objective",
     );
     assert!(
-        dev_manual.contains("You do NOT orchestrate") && dev_manual.contains("nyx_next"),
-        "dispatcher mandate: call nyx_next, do the returned action, orchestrate nothing",
+        dev_manual.contains("## Rules of context hygiene")
+            && dev_manual.contains("Every question about the code goes to an Explore sub-agent"),
+        "the context-hygiene rules that make the orchestrator last",
     );
     assert!(
-        dev_manual.contains("orchestrate, loop, branch, or transition on your own initiative"),
-        "the session never loops/branches/transitions of its own initiative",
+        dev_manual.contains("nyx injects the workspace, the managed commands and its rules")
+            && dev_manual.contains("into every sub-agent when it starts; you paste none of it."),
+        "the manual states that nyx — not the orchestrator — briefs a sub-agent (the §4 charter)",
     );
-    // The ex-orchestrator prose (state rule, 2-axis auditor drive, review loop) is GONE from the
-    // session — it now lives in the graph, not the dispatcher context.
-    for gone in [
-        "Dev Orchestrator",
-        "The state rule",
-        "2-axis AUDITOR ONCE",
-        "review_comment_list",
-    ] {
+    assert!(
+        dev_manual.contains("## 3. The review loop") && dev_manual.contains("review_comment_list"),
+        "the review loop is back IN the session: the engine that used to own it is gone",
+    );
+    assert!(
+        dev_manual.contains("You may not: edit source files"),
+        "the orchestrator's interdictions",
+    );
+    // No verb of the retired engine survives in what nyx injects — the failure mode this gate
+    // exists to catch is a manual sending a live session at a tool that no longer answers.
+    for dead in ["nyx_next", "run_start", "workflow_", "slot_bind", "run_id"] {
         assert!(
-            !dev_manual.contains(gone),
-            "the ex-orchestrator prose `{gone}` must NOT survive in the dispatcher context",
+            !dev_manual.contains(dead),
+            "the retired `{dead}` must NOT survive in the injected /ndev manual",
         );
     }
-    // Live phase resolution: phase 1 is current (it still has open work), its task is listed,
-    // the phase-2 task is NOT. The NUMBER "1" is resolved LIVE from the task phases `task_add`
-    // materialized + task statuses; the NAME "Foundation" comes from the plan `task_add` built
-    // from the names — together they render the "N · Name" headline, end-to-end tool-driven.
+    // The `{{tasks}}` block: the WHOLE plan, both tasks, their statuses and the blocking edge —
+    // phases render as LABELS beside them and gate nothing.
     assert!(
-        dev_manual.contains("Current phase — 1 · Foundation"),
-        "current phase NUMBER (1) resolved LIVE from tool-driven task phase+status; name from the auto-built plan",
+        dev_manual.contains("## Tasks — the plan, in order"),
+        "the plan block is rendered",
     );
     assert!(
-        dev_manual.contains("wire the bounded channel"),
-        "phase-1 task listed"
+        dev_manual.contains("[todo] wire the bounded channel")
+            && dev_manual.contains("[todo] stream rows to the consumer"),
+        "BOTH tasks are listed with their live status — nothing is filtered by a current phase:\n{dev_manual}",
     );
     assert!(
-        !dev_manual.contains("stream rows to the consumer"),
-        "phase-2 task excluded from the current-phase list",
+        dev_manual.contains("phase=\"Foundation\"") && dev_manual.contains("phase=\"Delivery\""),
+        "the phase names materialized by task_add render as LABELS on the task lines",
+    );
+    assert!(
+        dev_manual.contains("blocked by: [todo] wire the bounded channel"),
+        "the blocking edge is named on the task it gates — the frontier, readable without walking the graph",
+    );
+    assert!(
+        dev_manual.contains("## Workspace") && dev_manual.contains("## Managed commands of this workspace"),
+        "the /ndev render carries the workspace and the managed-commands blocks",
     );
     assert_no_depot(&dev_manual, "dev");
 
-    // The dev FORWARDS sub-agents by pulling their manuals itself (generic, no hook): the
-    // coder and the auditor render on demand. v2.8 — the auditor has ONE manual: it audits the
-    // Spec COMMITMENT its spawn names (`subject`), so the render carries no review "axis" any more.
-    let coder_manual = render(&db, json!({ "role": "coder", "spec_id": sid }));
-    assert!(coder_manual.contains("Coder Agent"), "coder manual pulls");
-    let auditor = render(&db, json!({ "role": "auditor", "spec_id": sid }));
-    assert!(
-        auditor.contains("=== NYX CONTEXT — AUDITOR ==="),
-        "auditor manual pulls"
-    );
-    assert!(
-        auditor.contains("ONE COMMITMENT") && auditor.contains("`subject`"),
-        "the auditor audits the commitment its spawn names",
-    );
-    assert!(
-        !auditor.contains("Your axis"),
-        "the invented review axes are gone from the manual",
-    );
+    // THE ROLE SURFACE IS THE THREE COMMANDS. `coder` / `auditor` / `prototype` were manuals of
+    // the retired engine; a sub-agent is now briefed by its orchestrator and given nyx's §4
+    // CHARTER by the `SubagentStart` hook, so `agent_context` REFUSES them by name.
+    for gone in ["coder", "auditor", "prototype"] {
+        let err = dispatch_context_tool(&db, "agent_context", &json!({ "role": gone, "spec_id": sid }))
+            .expect("agent_context is routed")
+            .expect_err("a retired role is refused, not rendered");
+        assert_eq!(err.code, RpcCode::InvalidArgument, "role `{gone}`");
+        assert!(
+            err.message.contains("spec, dev, doc"),
+            "the refusal names the three roles that remain, got: {}",
+            err.message,
+        );
+    }
 
-    // --- Run the phases: close phase 1 → the current phase advances to 2 LIVE. ---
+    // --- Run the plan: close the first task → its status moves LIVE in the next render. ---
     spec_tool(
         &db,
         "task_transition",
@@ -422,14 +445,19 @@ fn create_dev_doc_cycle_is_drivable_via_nyx_tools_without_depot() {
         json!({ "task_id": t1_id, "transition": "done" }),
     );
     assert_eq!(t1_done.result["task"]["status"], "done");
-    let dev_after_p1 = render(&db, json!({ "role": "dev", "spec_id": sid }));
+    let dev_after_t1 = render(&db, json!({ "role": "dev", "spec_id": sid }));
     assert!(
-        dev_after_p1.contains("Current phase — 2 · Delivery"),
-        "the CURRENT phase NUMBER advanced to 2 (LIVE) once the tool-driven phase-1 task was \
-         done — the cadence is agent-driven; the '2 · Delivery' name comes from the auto-built plan",
+        dev_after_t1.contains("[done] wire the bounded channel"),
+        "the plan block reflects the tool-driven status LIVE:\n{dev_after_t1}",
+    );
+    assert!(
+        dev_after_t1.contains("blocked by: [done] wire the bounded channel"),
+        "the second task now reads its blocker as DONE — the frontier opened, and nothing but the \
+         task statuses said so",
     );
 
-    // Close phase 2, then (autopilot: all phases done) move the Spec to review.
+    // Close the second task, then ASK for review. Nothing auto-advances: the Spec's status is a
+    // transition the agent REQUESTS and nyx grants (`specs.mode` is dead — §5 row 3).
     spec_tool(
         &db,
         "task_transition",
@@ -443,7 +471,7 @@ fn create_dev_doc_cycle_is_drivable_via_nyx_tools_without_depot() {
     let reviewed = spec_tool(
         &db,
         "spec_transition",
-        json!({ "spec_id": sid, "transition": "review" }),
+        json!({ "spec_id": sid, "to": "review" }),
     );
     assert_eq!(reviewed.result["spec"]["status"], "in_review");
 
@@ -537,17 +565,27 @@ fn create_dev_doc_cycle_is_drivable_via_nyx_tools_without_depot() {
     // --- DOC (/ndoc): the doc-sync manual renders LIVE, still via nyx, no depot. ---
     let doc_manual = render(&db, json!({ "role": "doc", "spec_id": sid }));
     assert!(
-        doc_manual.contains("=== NYX CONTEXT — DOC ==="),
-        "doc header"
+        doc_manual.starts_with("# nyx — Doc-sync (/ndoc)"),
+        "the /ndoc manual is the delivered §3 text, from its first line: {}",
+        doc_manual.lines().next().unwrap_or_default(),
     );
-    assert!(doc_manual.contains("Doc-sync"), "doc-sync preamble");
     assert!(
-        doc_manual.contains("validate your own output — it is a REVIEW"),
-        "doc output is a review the human validates",
+        doc_manual
+            .contains("You reconcile the project's documentation with what the Spec actually shipped."),
+        "the doc-sync mandate",
+    );
+    assert!(
+        doc_manual.contains("Hand the result to the human as a REVIEW")
+            && doc_manual.contains("commit unless the human asks."),
+        "doc output is a review the human validates, and nothing is committed behind them",
     );
     assert!(
         doc_manual.contains("Streaming import pipeline"),
         "the live Spec title is woven into the doc manual",
+    );
+    assert!(
+        doc_manual.contains("## Workspace"),
+        "the /ndoc render carries the workspace block its Git range is read from",
     );
     assert_no_depot(&doc_manual, "doc");
 }
@@ -569,12 +607,13 @@ fn create_dev_doc_cycle_is_drivable_via_nyx_tools_without_depot() {
 fn user_scope_command_stubs_carry_the_injection_sentinel() {
     let root = commands_root();
     let compiled = nyx_core::plugin::USER_COMMAND_STUBS;
-    // All three stubs now inject the DISPATCHER (`role=dev`); nspec/ndoc carry their `scope=` so
-    // run_start opens the right flow (v2.8 review N1).
+    // ONE ROLE PER COMMAND, and no `scope=` (PDR-0031 §5 row 6): the role IS what selects a
+    // manual now. The old table sent all three to `role=dev` and discriminated on a `scope`
+    // naming a node of the retired engine.
     for (file, marker) in [
-        ("nspec.md", "role=dev scope=nspec"),
+        ("nspec.md", "role=spec"),
         ("ndev.md", "role=dev"),
-        ("ndoc.md", "role=dev scope=ndoc"),
+        ("ndoc.md", "role=doc"),
     ] {
         let path = root.join(file);
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
@@ -591,8 +630,12 @@ fn user_scope_command_stubs_carry_the_injection_sentinel() {
         );
         let text = String::from_utf8(bytes).expect("utf-8 stub");
         assert!(
-            text.contains(&format!("NYX-AGENT-CONTEXT {marker}")),
+            text.contains(&format!("<!-- NYX-AGENT-CONTEXT {marker} -->")),
             "`{file}` carries the `{marker}` sentinel the hook keys on",
+        );
+        assert!(
+            !text.contains("scope="),
+            "`{file}` must declare no `scope=` — the engine that gave a scope meaning is retired",
         );
         assert!(
             text.contains("$ARGUMENTS"),
@@ -602,6 +645,15 @@ fn user_scope_command_stubs_carry_the_injection_sentinel() {
             text.contains("agent_context"),
             "`{file}` documents the pull fallback (call agent_context) when the hook is absent",
         );
+        // A stub is what the session reads when the injected manual is ABSENT. One that still
+        // named a retired verb would aim it at a tool that no longer answers, in exactly the
+        // situation where nyx cannot correct it.
+        for dead in ["nyx_next", "run_start", "workflow_", "slot_bind", "run_id"] {
+            assert!(
+                !text.contains(dead),
+                "`{file}` still names the retired `{dead}`",
+            );
+        }
     }
 }
 
@@ -628,24 +680,27 @@ fn agent_context_pull_is_the_universal_fallback_without_any_stub() {
     spec_tool(
         &db,
         "spec_transition",
-        json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+        json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
     );
     spec_tool(
         &db,
         "spec_transition",
-        json!({ "spec_id": sid, "transition": "start", "user_confirmed": true, "workspace_id": workspace_id }),
+        json!({ "spec_id": sid, "to": "start", "user_confirmed": true, "workspace_id": workspace_id }),
     );
 
-    // Pull by spec_id.
-    assert!(render(&db, json!({ "role": "spec", "spec_id": sid })).contains("Spec Author"));
-    // Pull by workspace_id (the anchored dev workspace) — v2.8 thin dispatcher context.
+    // Pull by spec_id → the /nspec manual.
+    assert!(render(&db, json!({ "role": "spec", "spec_id": sid }))
+        .starts_with("# nyx — Spec Author (/nspec)"));
+    // Pull by workspace_id (the anchored dev workspace) → the /ndev manual.
     assert!(
         render(&db, json!({ "role": "dev", "workspace_id": workspace_id }))
-            .contains("Dev — dispatcher")
+            .starts_with("# nyx — Dev Orchestrator (/ndev)")
     );
     // Pull by cwd (a path nested under the workspace root) — the hook's `{ role, cwd }` shape.
     let nested = format!("{root}/crates/api");
-    assert!(render(&db, json!({ "role": "doc", "cwd": nested })).contains("Doc-sync"));
+    assert!(
+        render(&db, json!({ "role": "doc", "cwd": nested })).starts_with("# nyx — Doc-sync (/ndoc)")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -726,13 +781,11 @@ fn confirmation_guardrails_are_intact() {
     );
     let sid = created.result["spec"]["id"].as_str().unwrap().to_string();
 
-    // `ready` without confirmation → refused by the sensitive-transition guard (tested on the
-    // function directly — spec_transition is no longer agent-routed, N17(b)).
-    let err = nyx_core::mcp_tools_spec::spec_transition(
-        &db,
-        &json!({ "spec_id": sid, "transition": "ready" }),
-    )
-    .unwrap_err();
+    // `ready` sans confirmation → refusé par le garde-fou, à travers le ROUTAGE réel : c'est bien
+    // l'agent qui se fait refuser la transition, pas seulement la fonction.
+    let err = dispatch_spec_tool(&db, "spec_transition", &json!({ "spec_id": sid, "to": "ready" }))
+        .expect("spec_transition is routed")
+        .unwrap_err();
     assert_eq!(err.code, RpcCode::InvalidState);
     assert!(
         err.message.contains("sensitive"),
@@ -743,27 +796,26 @@ fn confirmation_guardrails_are_intact() {
     let ok = spec_tool(
         &db,
         "spec_transition",
-        json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+        json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
     );
     assert_eq!(ok.result["spec"]["status"], "ready");
     // `start` is sensitive too (it poses the anchor): confirm it + anchor on the workspace.
     spec_tool(
         &db,
         "spec_transition",
-        json!({ "spec_id": sid, "transition": "start", "user_confirmed": true, "workspace_id": workspace_id }),
+        json!({ "spec_id": sid, "to": "start", "user_confirmed": true, "workspace_id": workspace_id }),
     );
     spec_tool(
         &db,
         "spec_transition",
-        json!({ "spec_id": sid, "transition": "review" }),
+        json!({ "spec_id": sid, "to": "review" }),
     );
 
     // `done` (also sensitive) without confirmation → refused too.
-    let done_err = nyx_core::mcp_tools_spec::spec_transition(
-        &db,
-        &json!({ "spec_id": sid, "transition": "done" }),
-    )
-    .unwrap_err();
+    let done_err =
+        dispatch_spec_tool(&db, "spec_transition", &json!({ "spec_id": sid, "to": "completed" }))
+            .expect("spec_transition is routed")
+            .unwrap_err();
     assert_eq!(done_err.code, RpcCode::InvalidState);
     assert!(
         done_err.message.contains("sensitive"),
@@ -848,12 +900,12 @@ fn task_delete_is_draft_only_through_the_dispatch() {
     spec_tool(
         &db,
         "spec_transition",
-        json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+        json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
     );
     spec_tool(
         &db,
         "spec_transition",
-        json!({ "spec_id": sid, "transition": "start", "user_confirmed": true, "workspace_id": workspace_id }),
+        json!({ "spec_id": sid, "to": "start", "user_confirmed": true, "workspace_id": workspace_id }),
     );
     let refused = dispatch_spec_tool(&db, "task_delete", &json!({ "task_id": b }))
         .expect("task_delete routed")

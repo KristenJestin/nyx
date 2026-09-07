@@ -155,9 +155,7 @@ diesel::table! {
 //   every dev workspace of that project lands under, NULLABLE and NULL by default (a project that
 //   never sets it is asked for a path instead, so nothing changes for anyone who ignores it).
 //   Appended LAST on `projects` (positional decoding), same shape and same level as
-//   `resume_agent_sessions` (v8). The same migration widens `nodes.type` with `create_workspace`, the
-//   leaf that lands one from a graph; `20260828205640` widens it again with `set_category`, the leaf
-//   that classifies the run's bound Spec (PDR-0017).
+//   `resume_agent_sessions` (v8).
 // - the projects_kind_system_scope migration (le scope Système) adds `projects.kind` — TEXT NOT NULL
 //   DEFAULT 'user', CHECKed `user|system`, appended on `projects` (positional decoding). C'est
 //   l'UNIQUE source de vérité de la nature d'un conteneur : rien n'est ajouté sur `workspaces`, dont
@@ -667,58 +665,6 @@ diesel::table! {
     }
 }
 
-// - v34 (v2.8 Phase 2 — the ORCHESTRATION ENGINE domain, task 01KY71HZFPKW0P1ZRDVXXBRBGS) adds
-//   `workflows`, `nodes` and `workflow_runs`: the behavior tree stored as DATA (PRD "Orchestration
-//   = donnée"). `workflows`: `project_id` (Nullable FK CASCADE — NULL = a built-in nyx default flow),
-//   `name`, `scope` (TEXT CHECK ndev|nspec|ndoc|custom), `root_node_id` (Nullable FK → nodes SET NULL
-//   — the tree root, set after nodes exist), `forked_from` (Nullable self-FK SET NULL — fork
-//   provenance), epoch-ms `created_at`/`updated_at`. `nodes`: the PURE tree — `workflow_id` (FK
-//   CASCADE), `parent_id` (Nullable self-FK CASCADE — NULL = root), `order_index` (sibling order),
-//   `type` (TEXT CHECK: the 3 composites + the 14 leaves of `db::NODE_TYPES`; a SQL/Rust keyword,
-//   exposed as `type_` via `#[sql_name = "type"]` like `tasks`), `label`, `config` (TEXT JSON typed
-//   per node kind), epoch-ms timestamps. `workflow_runs`: one live execution — `workflow_id` (FK
-//   CASCADE), `spec_id` (Nullable FK → specs SET NULL), `current_node_id` (Nullable FK → nodes SET
-//   NULL — the cursor), `blackboard` (TEXT JSON scratchpad, default '{}'), `status` (TEXT CHECK
-//   running|blocked|done|failed), epoch-ms `started_at`/`updated_at`. The tree is reconstructible
-//   from the rows alone (root = `root_node_id`/`parent_id IS NULL`; a composite's ordered children =
-//   rows with `parent_id = it` sorted by `order_index`). Column ORDER here must match the SQL
-//   migration exactly (Diesel positional decoding).
-diesel::table! {
-    workflows (id) {
-        id -> Text,
-        project_id -> Nullable<Text>,
-        name -> Text,
-        scope -> Text,
-        root_node_id -> Nullable<Text>,
-        forked_from -> Nullable<Text>,
-        created_at -> BigInt,
-        updated_at -> BigInt,
-        builtin_revision -> Nullable<Integer>,
-        forked_from_revision -> Nullable<Integer>,
-    }
-}
-
-// - v46 adds `command_slots` — the per-PROJECT binding of a graph's command SLOT. A `gate_check` in
-//   a SHARED graph declares WHAT it needs verified (`config.slot`, e.g. "build_check"); this table
-//   says which managed commands THIS project answers that slot with, so the built-in never names
-//   `bun test` and never has to be forked to be armed. `project_id` (FK CASCADE), `slot` (TEXT — the
-//   name the node declares), `command_ids` (TEXT JSON array of `command_instances.id`,
-//   ORDER-preserving, default '[]'), epoch-ms `created_at`/`updated_at`. UNIQUE(project_id, slot) is
-//   the upsert key AND the invariant: a project answers a slot exactly once. v47 adds
-//   `workflows.forked_from_revision` (Nullable Integer) — the SOURCE's `builtin_revision` at the
-//   instant of the fork, so `run_start` can tell a project its fork has fallen behind. Column ORDER
-//   here must match the SQL migration exactly (Diesel positional decoding).
-diesel::table! {
-    command_slots (id) {
-        id -> Text,
-        project_id -> Text,
-        slot -> Text,
-        command_ids -> Text,
-        created_at -> BigInt,
-        updated_at -> BigInt,
-    }
-}
-
 // - v30 (v2.7 Phase 1 — the DESIGN-SYSTEM domain, task 01KY4DFM5BS3JVSEZYJZVEFBF6) adds
 //   `design` and `design_components`, the design-system rapatriated NATIVELY as the single
 //   authority (PDR-0010) so the later context seam can weave it into the coder's context and
@@ -821,21 +767,6 @@ diesel::table! {
 }
 
 diesel::table! {
-    nodes (id) {
-        id -> Text,
-        workflow_id -> Text,
-        parent_id -> Nullable<Text>,
-        order_index -> Integer,
-        #[sql_name = "type"]
-        type_ -> Text,
-        label -> Text,
-        config -> Text,
-        created_at -> BigInt,
-        updated_at -> BigInt,
-    }
-}
-
-diesel::table! {
     prototype_pages (id) {
         id -> Text,
         prototype_id -> Text,
@@ -893,23 +824,6 @@ diesel::table! {
 }
 
 diesel::table! {
-    workflow_runs (id) {
-        id -> Text,
-        workflow_id -> Text,
-        spec_id -> Nullable<Text>,
-        current_node_id -> Nullable<Text>,
-        blackboard -> Text,
-        status -> Text,
-        started_at -> BigInt,
-        updated_at -> BigInt,
-        traversal -> Nullable<Text>,
-        workspace_id -> Nullable<Text>,
-        parent_run_id -> Nullable<Text>,
-        pending_consent -> Nullable<Text>,
-    }
-}
-
-diesel::table! {
     prototype_rounds (id) {
         id -> Text,
         prototype_id -> Text,
@@ -959,24 +873,6 @@ diesel::table! {
     }
 }
 
-// - v48 (the consent check's lifetime fix) adds `human_turns`: the LAST prompt a human submitted
-//   on a terminal, keyed by `terminal_id` (one row per terminal). It carries the turn's IDENTITY
-//   (`turn_id` — Claude Code's `prompt_id` when it sends one), the raw `prompt` and its
-//   `submitted_at` (epoch ms). NO `joinable!` and no FK: the `UserPromptSubmit` hook that writes
-//   this row must never fail on a terminal nyx holds no row for.
-// - v49 (one turn, one commitment) adds `consumed_by`: the run whose consent that turn has ALREADY
-//   authorised, NULL while nobody has spent it. Nullable and FK-less on purpose — a CASCADE from a
-//   deleted run would un-spend a turn that really was spent.
-diesel::table! {
-    human_turns (terminal_id) {
-        terminal_id -> Text,
-        turn_id -> Text,
-        prompt -> Text,
-        submitted_at -> BigInt,
-        consumed_by -> Nullable<Text>,
-    }
-}
-
 // - the app-level preference store adds `app_settings`: ONE row per global preference of the
 //   installation, keyed by its stable `key` (a constant in `db.rs`, never a literal at a call
 //   site). `value` is the serialized preference — a scalar verbatim, a structured one as JSON —
@@ -988,37 +884,6 @@ diesel::table! {
         key -> Text,
         value -> Text,
         updated_at -> BigInt,
-    }
-}
-
-// - the gate EVIDENCE journal adds `gate_attempts`: ONE row per `gate_check` execution, APPEND-ONLY
-//   (insert is the only write — nothing updates or deletes a row). `sequence` is the rowid alias
-//   that orders the journal without depending on the clock. `run_id` / `spec_id` / `node_id` are
-//   CORRELATION ids with NO `joinable!` and no FK, exactly like `domain_events`': a CASCADE that can
-//   silently truncate an append-only proof would defeat its purpose. `expect` + `declared` are what
-//   the graph asked for, `outcome` (`passed` | `failed` | `indeterminate`) is what the check did,
-//   and `satisfied` is whether the second answered the first. `command_line` / `cwd` are the
-//   RESOLVED identity of the control, denormalised out of `commands_json` so comparing a red
-//   attempt with the green that follows it is a string comparison.
-diesel::table! {
-    gate_attempts (sequence) {
-        sequence -> BigInt,
-        run_id -> Text,
-        spec_id -> Nullable<Text>,
-        node_id -> Text,
-        slot -> Nullable<Text>,
-        expect -> Text,
-        declared -> Bool,
-        blocking -> Bool,
-        outcome -> Text,
-        satisfied -> Bool,
-        command_line -> Text,
-        cwd -> Text,
-        exit_code -> Nullable<Integer>,
-        duration_ms -> BigInt,
-        output_excerpt -> Text,
-        commands_json -> Text,
-        created_at -> BigInt,
     }
 }
 
@@ -1105,18 +970,9 @@ diesel::joinable!(tasks -> specs (spec_id));
 // `spec_depends_on` has TWO FKs into `specs` (from_spec_id + to_spec_id) — an ambiguous
 // self-join Diesel cannot declare a single `joinable!` for, so it is intentionally NOT
 // declared (the CRUD queries the two directions explicitly by column instead).
-diesel::joinable!(command_slots -> projects (project_id));
 diesel::joinable!(categories -> projects (project_id));
 diesel::joinable!(specs -> categories (category_id));
 diesel::joinable!(system_command_approvals -> projects (project_id));
-diesel::joinable!(workflows -> projects (project_id));
-diesel::joinable!(nodes -> workflows (workflow_id));
-diesel::joinable!(workflow_runs -> workflows (workflow_id));
-diesel::joinable!(workflow_runs -> specs (spec_id));
-// `nodes.parent_id -> nodes` is a self-join Diesel cannot declare a single `joinable!` for
-// (the CRUD queries children by `parent_id` explicitly). `workflows.root_node_id -> nodes` and
-// `workflow_runs.current_node_id -> nodes` are extra FKs into `nodes` used only as explicit
-// pointer lookups, so no `joinable!` is declared for them either.
 
 diesel::allow_tables_to_appear_in_same_query!(
     agent_session_prototypes,
@@ -1127,17 +983,13 @@ diesel::allow_tables_to_appear_in_same_query!(
     app_settings,
     categories,
     command_instances,
-    command_slots,
     design,
     design_components,
     domain_events,
-    gate_attempts,
-    human_turns,
     idea_specs,
     ideas,
     managed_command_groups,
     managed_commands,
-    nodes,
     projects,
     prototype_design_lock,
     prototype_feedback,
@@ -1158,7 +1010,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     task_dependencies,
     tasks,
     terminals,
-    workflow_runs,
-    workflows,
     workspaces,
 );

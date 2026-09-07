@@ -30,7 +30,8 @@ La V2 est complète uniquement lorsque les capacités utiles de Depot sont nativ
 | v2.5.11 | Boucle review : findings (tasks kind=review) + rework en rounds + résolution + retour-chat | 📋 PRD prêt |
 | v2.6 | Knowledge et mémoire projet | ⬜ à venir |
 | v2.7 | Machinerie prototype | ⬜ à venir |
-| v2.8 | Harnais customisable (rules/checks/agents/workflows + visualiser) | ⬜ à venir |
+| v2.8 | Harnais : moteur d'orchestration behavior-tree + visualiseur | ✅ livré, puis **retiré** (PDR-0031) |
+| v2.8.1 | Terrain-workflow : manuels en prose par commande + charte de sous-agent | 🚧 en cours |
 | v2.9 | Migration finale et extinction Depot | ⬜ à venir |
 | tardif | Délégation & reprise cross-machine (handoff continuable) | 🔮 capturé — post-v2.9, position provisoire |
 
@@ -140,15 +141,15 @@ Domaine Spec :
 
 Fonctionnement agentique (PDR-0020) — câblé ici :
 
-- tables **`agents`** (4 types spec/dev/doc/subagent) + **`workflows`** / **`workflow_agents`** ; `projects.workflow_id`
-  assigne un workflow ; nyx livre les défauts forkables ;
-- **rules** (`directives`) + **checks** (`managed_commands.gate` / `blocking`) qui décomposent les « directives »
-  Depot ;
+- table **`agents`** (bibliothèque de définitions de rôle) ; nyx livre les défauts forkables. La composition
+  `workflows` / `workflow_agents` et `projects.workflow_id`, câblées ici puis livrées avec le moteur v2.8, sont
+  **retirées** (PDR-0031) ;
+- **rules** (`directives`) + **checks** (commandes managées, leur note dit quand les lancer) qui décomposent les
+  « directives » Depot ;
 - **contextes agents rendus live par nyx-core** et **injectés via les hooks du plugin** (SessionStart /
   UserPromptSubmit), **zéro CLI, zéro fichier généré** ; déclencheurs = stubs fixes `/nspec` `/ndev` `/ndoc` ; MCP =
   actions seules ;
-- **install via Settings → Integrations** (plugin bundlé `nyx-claude-integration`, par provider) ;
-- `specs.mode` = **stepped** | **autopilot**.
+- **install via Settings → Integrations** (plugin bundlé `nyx-claude-integration`, par provider).
 
 Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/workspaces dupliqués ou présentation historique devenue inutile.
 
@@ -231,6 +232,8 @@ Ne pas porter : shell web Depot, daemon, serveur Hono, CLI agent, projets/worksp
 **Status: ready** — PRD `01KXC80E2CDSNN9PPMJFJFE3X7` (6 contextes rédigés : spec/dev/coder/auditor/doc/prototype)
 
 > Finit ce que v2.4 avait **promis mais pas livré**. Le RENDER des contextes existe (`agent_context`, en *pull*, rôles dev/coder/auditor) ; la **livraison** (hook push + stubs `/n…`) et les rôles **spec/doc** manquent → le Gate v2.4 « workflow complet **sans Depot** » n'est pas tenu. Point-release qui n'incrémente pas la suite.
+>
+> **Maj PDR-0031 :** les **six** contextes écrits ici retombent à **trois** (`spec`, `dev`, `doc`). Coder, auditeur et prototype ne sont plus des rôles nyx mais des **sous-agents** briefés par l'orchestrateur sous la charte `SubagentStart` ; le texte livré est celui d'[`agent-manuals.md`](agent-manuals.md).
 
 - ajouter les rôles **`spec`** (auteur-PRD qui grille) et **`doc`** au render live (aujourd'hui dev/coder/auditor seuls) ;
 - **livraison par hook** : `UserPromptSubmit` détecte le stub, appelle `agent_context` au sidecar (`127.0.0.1/mcp`) et injecte le manuel en `additionalContext` — **le patron SessionStart existe déjà** dans `nyx-session-hook.cjs` ;
@@ -305,20 +308,33 @@ Le **rôle prototype léger** + son entrée (`/nspec` propose un proto quand c'e
 
 **Gate :** un proto élu se distille en un dev fidèle au design retenu, sans Depot.
 
-## v2.8 - Harnais customisable (rules / checks / agents / workflows + visualiser)
+## v2.8 - Harnais : moteur d'orchestration behavior-tree (livré, puis retiré)
 
-PRD `01KY4DQS06B939Z1CM8CPE7TW0` (draft). Livre PDR-0011/0019/0020 en entier : le triptyque **rules / checks / agents** (ce que Depot entassait dans « directives ») devient de la **donnée éditable**.
+**Status: livré** (PRD `01KY4DQS06B939Z1CM8CPE7TW0`, 11/11 tâches, commit `4a2b07a`), **puis retiré** — PDR-0031.
 
-- **Défauts nyx clé-en-main** : les 6 rôles hardcodés en Rust deviennent des templates DB seedés + un workflow par défaut qui tourne sans config ;
-- **agents forkables** par projet + **subagents custom** réutilisables cross-projet (ui-tester…), observés (fini le sous-agent caché) ;
-- **rules** (table `directives`) advisory, catégorisées, injectées par scope via marqueur — lean (faits transverses ; le comportement de rôle vit dans le template) ;
-- **checks** = `managed_commands.gate` déterministes, blocking, scopés (robustes aux renames : ce sont des commandes, pas des ancres fichier) ;
-- **workflows** composables + wiring (subagent / check → scope), assignés via `projects.workflow_id` ; lancement / observation des subagents **abstrait par provider** (fallback = session nyx observée, aucun angle mort) ;
-- **authoring 100% MCP** + **VISUALISER UI** requis. Édition UI directe = itératif, plus tard.
+Ce qui a été **réellement livré**, et qui a tourné :
 
-Le **design-system rendu** reste en v2.7 ; ici c'est l'orchestration / rules / checks / agents.
+- un **interpréteur pur** (`Engine::tick`) sur un behavior tree stocké en donnée (`workflows` / `nodes` / `workflow_runs`) : composites `sequence` / `loop` / `selector`, feuilles `spawn_subagent`, `gate_check`, `judge`, `transition`, `transition_task`, `ask_human`, `note`, `query`, `produce`, `fork_spec`, `sub_workflow`, puis `set_category` (17 types) ;
+- la session agent réduite à un **dispatcher mince** bouclant sur le verbe `nyx_next` ; run repris d'une session à l'autre par un traversal persisté, avancé un tick à la fois, requêtes servies par un pool de workers MCP ;
+- l'**enforcement dans les handlers de verbes** : gate bloquant rouge qui refuse d'avancer (journal `gate_attempts`, `expect: red|green` pour le rouge-avant-vert des bugs), transitions de Spec par autorité gardée, consentement humain rattaché à la session interrogée (`human_turns`), slots de gate (`command_slots`) ;
+- le **visualiseur** de graphe et de blackboard dans le cockpit (page « Engine ») ;
+- le **simulateur de run** (`crates/nyx-core/examples/sim/`, commit `b903fa6`) : six scénarios rejouables sans agent ni app.
 
-**Gate :** un projet neuf tourne sur le workflow défaut ; un scénario customisé (rule + subagent custom wiré + check gate) se reflète dans les contextes rendus, l'exécution observée et le visualiser.
+Ce qui a été **retiré**, et pourquoi : le graphe décidait à la place de l'agent et décidait moins bien, au prix d'un interpréteur, de six tables, d'un jeu de graphes seedés versionnés et d'un simulateur. Le détail est dans **PDR-0031**. Tombent avec lui : les six tables d'exécution, `projects.workflow_id`, la famille MCP `nyx_next` / `run_*` / `workflow_*` / `node_*` / `slot_bind`, la page « Engine », le simulateur et le gate `gate_v2_8_engine_e2e`.
+
+Ce que **rules / checks / agents** deviennent sans moteur : les **rules** (table `directives`) restent la donnée advisory injectée par scope ; les **checks** redeviennent de simples **commandes managées** dont la **note** dit à l'agent quand les lancer (à la place des slots) ; les **agents** restent une bibliothèque de définitions de rôle. L'**authoring MCP** de tout ça et une surface UI de lecture restent à faire, sans graphe à visualiser.
+
+## v2.8.1 - Terrain-workflow : manuels en prose et charte de sous-agent
+
+**Status: en cours** — PDR-0031, texte livré dans [`agent-manuals.md`](agent-manuals.md).
+
+- **un manuel par commande** (`/nspec`, `/ndev`, `/ndoc`), injecté au `UserPromptSubmit`, rendu live avec la Spec, ses tâches, le workspace et les commandes managées ;
+- **une charte unique** injectée dans chaque sous-agent au `SubagentStart` — la mission vient de l'orchestrateur, la charte vient de nyx ;
+- `agent_context` s'ancre sur `spec_id` / `workspace_id` / `cwd` (fini `run_id`) et rend **trois** rôles (`spec`, `dev`, `doc`) au lieu de six ;
+- **`spec_transition` routé, décrit et exposé** (MCP + boutons de l'UI Spec), `user_confirmed=true` obligatoire pour `ready` / `completed` / `cancelled` ;
+- la migration qui droppe les tables du moteur ; `specs.mode` reste en base, n'est plus lue.
+
+**Gate :** taper `/ndev` sur une Spec `ready` la mène jusqu'à `in_review` — sous-agents briefés par l'orchestrateur, checks lancés par nyx, statuts tenus à jour — sans moteur, et la transition sensible ne part qu'après une phrase de l'humain. Observé avec un **agent réel sur un vrai client**, pas seulement sur le fil (leçon de PDR-0030).
 
 ## Autres capacités avancées (à cadrer, post-v2.9)
 
@@ -369,7 +385,8 @@ v2.0 consolidation Electron/Rust
 -> v2.5.11 boucle review (findings review_tasks + rework en rounds + retour-chat)
 -> v2.6 knowledge
 -> v2.7 machinerie prototype
--> v2.8 harnais (rules/checks/agents/workflows forkables + visualiser)
+-> v2.8 harnais (moteur d'orchestration — livré puis retiré, PDR-0031)
+-> v2.8.1 terrain-workflow (manuels en prose + charte de sous-agent)
 -> v2.9 migration et suppression Depot
 ```
 

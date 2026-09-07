@@ -2608,7 +2608,7 @@ mod tests {
 
     /// THE ANCHOR ARGUMENT INHERITS THE SHORT-REFERENCE GRAMMAR, at no cost to this tool. Both
     /// workspace tools read their `spec_id` through the SAME entry point as `agent_context` and
-    /// `run_start` ([`crate::mcp_context::resolve_spec_ref_in`]), so anchoring a workspace on the
+    /// `spec_transition` ([`crate::mcp_context::resolve_spec_ref_in`]), so anchoring a workspace on the
     /// human key — or on the `#N` the render prints, counted in the project this very call names —
     /// works WITHOUT a line of dedicated work here. That is the whole argument for one entry point,
     /// asserted rather than assumed.

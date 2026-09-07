@@ -3063,6 +3063,52 @@ impl Ctx<'_> {
                     .map_err(Self::db_err)
                     .and_then(|view| Self::json(&view))
             }
+            // `spec_transition` — the HUMAN half of the Spec lifecycle: the buttons on the Spec
+            // detail move it exactly where the agent's MCP verb does. `{ specId, to,
+            // userConfirmed?, workspaceId? }` -> `{ spec }`. A mutation → pushes `specs://changed`
+            // (the SAME `ChangedTopic::Specs` the MCP path emits, so board and detail re-pull).
+            //
+            // NOTHING IS RE-JUDGED HERE. The vocabulary of `to` is parsed by the tool layer's own
+            // `parse_spec_transition`, and the guards, the pre-ready / pre-done validations and the
+            // sensitive-transition confirmation guard-rail all live in
+            // `db::transition_spec_with_workspace` — the single authority both surfaces call. The
+            // refusals reach the app through `map_spec_transition_err`, so a human clicking
+            // "Ready" on an incomplete draft reads the same sentence the agent does.
+            //
+            // `workspaceId` is the anchor posed on the `in_progress` target and ignored elsewhere.
+            // An EMPTY string is REFUSED rather than read as "no anchor" — same rule as the MCP
+            // side, where an uninitialized caller variable must not silently un-anchor a Spec.
+            "spec_transition" => {
+                let spec_id = self.arg_str_nonempty("specId")?;
+                let to = self.arg_str_nonempty("to")?;
+                let transition = nyx_core::mcp_tools_spec::parse_spec_transition(&to)
+                    .map_err(|e| format!("{}: {}", self.command, e.message))?;
+                let user_confirmed = self.arg_opt_bool("userConfirmed").unwrap_or(false);
+                let workspace_id = self.arg_opt_str("workspaceId");
+                if workspace_id.as_deref() == Some("") {
+                    return Err(format!(
+                        "{}: 'workspaceId' must not be empty — omit it to leave the Spec's anchor \
+                         alone",
+                        self.command
+                    ));
+                }
+                let spec = self
+                    .db()
+                    .with_conn(|c| {
+                        db::transition_spec_with_workspace(
+                            c,
+                            &spec_id,
+                            transition,
+                            user_confirmed,
+                            workspace_id.as_deref(),
+                        )
+                    })
+                    .map_err(|e| nyx_core::mcp_tools_spec::map_spec_transition_err(e).message)?;
+                self.events.emit(Event::Changed {
+                    topic: "specs".to_string(),
+                });
+                Self::json(&serde_json::json!({ "spec": spec }))
+            }
             // ================================================================
             // v2.9 CATEGORY — the HUMAN half of PDR-0017 (phase 8)
             // ================================================================
@@ -3318,108 +3364,6 @@ impl Ctx<'_> {
                     "category": nyx_core::mcp_tools_spec::category_payload(&category),
                     "homonym_slugs": homonym_slugs,
                 }))
-            }
-            // ================================================================
-            // v2.8 ORCHESTRATION ENGINE — the read models the React Flow graph view consumes
-            // (Phase 6, task 01KY71J481RV2P108YP933RMV0). All pure reads over the SAME
-            // `nyx_core::db` engine accessors the Phase-2 interpreter + Phase-4 authoring use
-            // (one authority for UI + MCP, PDR-0005) — no second data path, nothing persisted.
-            // ================================================================
-
-            // `engine_workflow_list` — the workflows the graph picker offers: the BUILT-IN defaults
-            // (`project_id` IS NULL — the seeded ndev/nspec/ndoc) always, PLUS the active project's
-            // OWN (forked/custom) workflows when `projectId` is given. Newest-first within each scope,
-            // project workflows first. `{ projectId? }` → `Vec<db::Workflow>` (each row carries its
-            // `project_id`, so the UI groups built-in vs project).
-            "engine_workflow_list" => {
-                let project_id = self.arg_opt_str("projectId");
-                self.db()
-                    .with_conn(|c| {
-                        let mut rows = Vec::new();
-                        if let Some(p) = project_id.as_deref() {
-                            rows.extend(db::list_workflows(c, Some(p))?);
-                        }
-                        rows.extend(db::list_workflows(c, None)?);
-                        Ok::<_, diesel::result::Error>(rows)
-                    })
-                    .map_err(Self::db_err)
-                    .and_then(|rows| Self::json(&rows))
-            }
-            // `engine_workflow_graph` — ONE workflow + ALL its nodes (the DETERMINISTIC full dump the
-            // renderer reconstructs the PURE tree from — `parent_id` + `order_index`, mirroring
-            // `engine::Tree::from_rows`). `{ workflowId }` → `{ workflow, nodes }`, or an error for an
-            // unknown id (the UI shows an empty-state).
-            "engine_workflow_graph" => {
-                let workflow_id = self.arg_str("workflowId")?;
-                #[derive(serde::Serialize)]
-                struct WorkflowGraph {
-                    workflow: db::Workflow,
-                    nodes: Vec<db::Node>,
-                }
-                self.db()
-                    .with_conn(|c| {
-                        let Some(workflow) = db::get_workflow(c, &workflow_id)? else {
-                            return Ok(None);
-                        };
-                        let nodes = db::list_nodes(c, &workflow_id)?;
-                        Ok::<_, diesel::result::Error>(Some(WorkflowGraph { workflow, nodes }))
-                    })
-                    .map_err(Self::db_err)?
-                    .map_or_else(
-                        || {
-                            Err(format!(
-                                "engine_workflow_graph: unknown workflow {workflow_id}"
-                            ))
-                        },
-                        |graph| Self::json(&graph),
-                    )
-            }
-            // `engine_run_list` — the runs of a workflow, newest-first (the RUNTIME view reads the
-            // latest to surface `current_node_id` + the `blackboard` JSON). `{ workflowId }` →
-            // `Vec<db::WorkflowRun>`.
-            "engine_run_list" => {
-                let workflow_id = self.arg_str("workflowId")?;
-                self.db()
-                    .with_conn(|c| db::list_workflow_runs(c, &workflow_id))
-                    .map_err(Self::db_err)
-                    .and_then(|rows| Self::json(&rows))
-            }
-            // `engine_spec_runs` — the runs bound to ONE SPEC, across EVERY workflow, newest-first.
-            // The Spec-side RUNTIME view (the run modal opened from the Spec detail / the dev
-            // overlay) reads it: it starts from a Spec, not from a workflow, and a Spec is driven by
-            // its ndev run PLUS the child-workflow runs ndev spawns. `{ specId }` →
-            // `Vec<db::WorkflowRun>` (empty for an unknown Spec — the modal shows its empty state).
-            "engine_spec_runs" => {
-                let spec_id = self.arg_str("specId")?;
-                self.db()
-                    .with_conn(|c| db::list_runs_for_spec(c, &spec_id))
-                    .map_err(Self::db_err)
-                    .and_then(|rows| Self::json(&rows))
-            }
-            // `engine_effector_context` — the CONTEXT the node inspector shows when a `spawn_subagent`
-            // node is clicked, keyed by the spawn node's `role` (its `agent_id` slug). `specId` is
-            // OPTIONAL (review finding #35): with a run bound, `{ role, specId }` renders the LIVE
-            // `render_agent_context` (role template + `{{rules}}` resolved by scope + lineage); WITHOUT
-            // a run, `{ role }` renders the STATIC role template (the sub-agent's brief) whose
-            // run-specific sections are marked "resolved at run" — so a built-in with no run shows its
-            // brief instead of an empty inspector. `{ context }` (null only when a bound Spec is
-            // unknown). An unknown role IS an error (the UI falls back to the node config).
-            //
-            // `subject` is the spawn node's own `subject` (F6): passing it shows the inspector the
-            // SAME narrowed manual the run forwards — the Spec section that spawn is about, not all
-            // six. Omitted = the whole Spec, as before.
-            "engine_effector_context" => {
-                let role = self.arg_str("role")?;
-                let spec_id = self.arg_opt_str("specId");
-                let subject = self.arg_opt_str("subject");
-                let context = nyx_core::mcp_context::render_effector_context(
-                    self.db(),
-                    &role,
-                    spec_id.as_deref(),
-                    subject.as_deref(),
-                )
-                .map_err(|e| format!("{}: {}", self.command, e.message))?;
-                Self::json(&serde_json::json!({ "context": context }))
             }
             // --- DESIGN-SYSTEM read/render seam (v2.7 Phase 3, PDR-0010) -------------
             // The native design-system UI (iframe renderer / catalogue / composant detail) reads
@@ -4971,7 +4915,6 @@ mod tests {
             ("spec_list", serde_json::json!({ "projectId": pid })),
             ("idea_list", serde_json::json!({ "projectId": pid })),
             ("design_get", serde_json::json!({ "projectId": pid })),
-            ("engine_workflow_list", serde_json::json!({ "projectId": pid })),
             ("workspace_timeline", serde_json::json!({ "workspaceId": wid })),
             ("workspace_restore_plan", serde_json::json!({ "workspaceId": wid })),
         ];
@@ -5332,7 +5275,7 @@ mod tests {
     /// through the HUMAN bridge lands one instance on the singleton's one workspace, and the run
     /// directory the UI displays is the HOME.
     ///
-    /// The other four resolvers (MCP, boot restore, group, engine gate) are pinned in nyx-core by
+    /// The other three resolvers (MCP, boot restore, group) are pinned in nyx-core by
     /// `system_scope::tests::a_system_command_has_one_instance_and_every_runner_resolves_it_to_the_home`,
     /// where the two shared readers they all go through are asserted directly. THIS one has to be
     /// here: `command_instance_list` fills `cwd` in the bridge, not in the core.
@@ -7536,6 +7479,87 @@ mod tests {
         );
     }
 
+    /// DONE-CRITERION (PDR-0031, `docs/product/agent-manuals.md` §5 ligne 1) : **une surface
+    /// HUMAINE peut faire avancer un Spec**, par la même autorité que l'agent, et se fait refuser
+    /// aux mêmes endroits. Le refus vient de `db::transition_spec_with_workspace` à travers
+    /// `map_spec_transition_err` : la commande ne rejuge rien, elle relaie.
+    #[test]
+    fn spec_transition_moves_the_spec_refuses_a_sensitive_move_and_reopens_for_rework() {
+        let h = Harness::new();
+        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-spec-transition");
+        let spec_id = h
+            .runtime
+            .db()
+            .with_conn(|c| {
+                nyx_core::db::create_spec(
+                    c,
+                    &project_id,
+                    "A spec",
+                    nyx_core::db::SpecSections {
+                        problem: "a real problem".into(),
+                        solution: "a real solution".into(),
+                        ..Default::default()
+                    },
+                )
+                .map(|(spec, _rev)| spec.id)
+            })
+            .unwrap();
+
+        // SANS la confirmation de l'humain, `ready` est refusé — et un refus ne pousse rien.
+        let pushes_before = specs_changed(&h);
+        let refused = h
+            .run(
+                "spec_transition",
+                serde_json::json!({ "specId": spec_id, "to": "ready" }),
+            )
+            .unwrap_err();
+        assert!(
+            refused.contains("in the chat"),
+            "le refus renvoie vers l'humain, pas vers un drapeau : {refused}"
+        );
+        assert_eq!(
+            specs_changed(&h),
+            pushes_before,
+            "une transition refusée n'invalide aucune surface"
+        );
+
+        // Avec la confirmation : la Spec bouge, et les surfaces re-pull exactement une fois.
+        let moved: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "spec_transition",
+                serde_json::json!({ "specId": spec_id, "to": "ready", "userConfirmed": true }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(moved["spec"]["status"].as_str().unwrap(), "ready");
+        assert_eq!(specs_changed(&h), pushes_before + 1);
+
+        // `to="draft"` rouvre la Spec pour rework — non sensible, aucune confirmation demandée.
+        let reopened: serde_json::Value = serde_json::from_str(
+            &h.run(
+                "spec_transition",
+                serde_json::json!({ "specId": spec_id, "to": "draft" }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reopened["spec"]["status"].as_str().unwrap(), "draft");
+
+        // Un mot hors du vocabulaire est refusé en nommant l'ensemble accepté — la MÊME phrase que
+        // sur la surface MCP, parce que c'est le même parseur.
+        let unknown = h
+            .run(
+                "spec_transition",
+                serde_json::json!({ "specId": spec_id, "to": "finish" }),
+            )
+            .unwrap_err();
+        assert!(
+            unknown.contains("in_progress") && unknown.contains("cancelled"),
+            "le refus liste les cibles acceptées : {unknown}"
+        );
+    }
+
     /// DONE-CRITERION: "`spec_detail` expose id, slug, nom" + "Commandes
     /// list/assign/unassign/… disponibles" + "publient `ChangedTopic::Specs`".
     ///
@@ -9312,451 +9336,6 @@ mod tests {
         };
         assert_eq!(by_id(&b_id)["blocked_by_count"].as_i64().unwrap(), 1);
         assert_eq!(by_id(&a_id)["unblocks_count"].as_i64().unwrap(), 1);
-    }
-
-    /// v2.8 Phase 6 — the ENGINE GRAPH read models the React Flow view consumes.
-    /// `engine_workflow_list` surfaces the seeded built-in flows; `engine_workflow_graph` returns a
-    /// workflow + its node dump (the tree the renderer reconstructs); `engine_run_list` surfaces a
-    /// run's cursor + blackboard; `engine_effector_context` renders the effector manual for a spawn
-    /// node's role. All PURE READS — none pushes an invalidation.
-    #[test]
-    fn engine_read_commands_serve_the_graph_view() {
-        let h = Harness::new();
-
-        // The built-in defaults (ndev/nspec/ndoc) are seeded at `Db::open`.
-        let list = h
-            .run("engine_workflow_list", serde_json::json!({}))
-            .unwrap();
-        let workflows: serde_json::Value = serde_json::from_str(&list).unwrap();
-        let ndev = workflows
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|w| w["scope"] == "ndev")
-            .expect("the ndev built-in is listed");
-        let wf_id = ndev["id"].as_str().unwrap().to_string();
-
-        // The graph: the workflow + its nodes (the reconstructible tree — spawn leaf + phase loop).
-        let graph = h
-            .run(
-                "engine_workflow_graph",
-                serde_json::json!({ "workflowId": wf_id }),
-            )
-            .unwrap();
-        let graph: serde_json::Value = serde_json::from_str(&graph).unwrap();
-        let nodes = graph["nodes"].as_array().unwrap();
-        assert!(
-            nodes.iter().any(|n| n["type_"] == "spawn_subagent"),
-            "the ndev graph carries a spawn node"
-        );
-        assert!(
-            nodes.iter().any(|n| n["type_"] == "loop"),
-            "and its phase loop composite"
-        );
-        // An unknown workflow id is a readable error (the UI shows an empty-state).
-        assert!(h
-            .run(
-                "engine_workflow_graph",
-                serde_json::json!({ "workflowId": "nope" })
-            )
-            .is_err());
-
-        // A run bound to a Spec, parked on the spawn node with a blackboard.
-        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-engine");
-        let (spec_id, run_current) = h
-            .runtime
-            .db()
-            .with_conn(|c| {
-                let (spec, _rev) =
-                    nyx_core::db::create_spec(c, &project_id, "Checkout", Default::default())?;
-                let cursor = nyx_core::db::list_nodes(c, &wf_id)?
-                    .into_iter()
-                    .find(|n| n.type_ == "spawn_subagent")
-                    .map(|n| n.id);
-                let run = nyx_core::db::create_workflow_run(
-                    c,
-                    &wf_id,
-                    Some(&spec.id),
-                    cursor.as_deref(),
-                    "{\"phase\":1}",
-                )?;
-                Ok::<_, diesel::result::Error>((spec.id, run.current_node_id))
-            })
-            .unwrap();
-
-        let reads_before = h.pushes();
-
-        // engine_run_list → the run's cursor + blackboard (the runtime overlay reads them).
-        let runs = h
-            .run(
-                "engine_run_list",
-                serde_json::json!({ "workflowId": wf_id }),
-            )
-            .unwrap();
-        let runs: serde_json::Value = serde_json::from_str(&runs).unwrap();
-        let runs = runs.as_array().unwrap();
-        assert_eq!(runs.len(), 1, "the workflow's run is listed");
-        assert_eq!(runs[0]["current_node_id"], serde_json::json!(run_current));
-        assert_eq!(runs[0]["blackboard"].as_str().unwrap(), "{\"phase\":1}");
-
-        // engine_effector_context → the coder manual rendered for that Spec (the inspector).
-        let ctx = h
-            .run(
-                "engine_effector_context",
-                serde_json::json!({ "role": "coder", "specId": spec_id }),
-            )
-            .unwrap();
-        let ctx: serde_json::Value = serde_json::from_str(&ctx).unwrap();
-        assert!(
-            ctx["context"].as_str().unwrap().contains("Coder"),
-            "the coder effector manual is rendered"
-        );
-        // finding #35: WITHOUT a specId (no run bound), the inspector still gets the STATIC role
-        // template — the sub-agent's brief — with the run-specific parts marked "resolved at run".
-        let template = h
-            .run(
-                "engine_effector_context",
-                serde_json::json!({ "role": "coder" }),
-            )
-            .unwrap();
-        let template: serde_json::Value = serde_json::from_str(&template).unwrap();
-        let body = template["context"].as_str().unwrap();
-        assert!(
-            body.contains("Context: Coder Agent") && body.contains("(role template)"),
-            "the static role template renders with no run bound",
-        );
-        assert!(
-            body.contains("resolved at run"),
-            "its run-specific parts are marked resolved at run",
-        );
-        // An unknown role is a readable error (the inspector falls back to the node config).
-        assert!(h
-            .run(
-                "engine_effector_context",
-                serde_json::json!({ "role": "bogus", "specId": spec_id }),
-            )
-            .is_err());
-
-        assert_eq!(
-            h.pushes(),
-            reads_before,
-            "engine reads never push an invalidation"
-        );
-    }
-
-    /// `engine_spec_runs` — the SPEC-side half of the runtime read model, mirroring the
-    /// `engine_run_list` leg above from the other end. The Spec run modal (opened from
-    /// `/work/$specId` and from the dev overlay) starts from a SPEC, and a Spec is driven by its
-    /// ndev run PLUS the child-workflow runs ndev spawns — so the command lists the Spec's runs
-    /// ACROSS workflows, newest-first. Another Spec's run stays out, an unknown Spec is an EMPTY
-    /// list (the modal's empty state), and — like every engine read — it pushes no invalidation.
-    #[test]
-    fn engine_spec_runs_lists_a_specs_runs_across_workflows() {
-        let h = Harness::new();
-
-        // The seeded ndev built-in + a project-owned child workflow, both running the SAME Spec.
-        let list = h
-            .run("engine_workflow_list", serde_json::json!({}))
-            .unwrap();
-        let workflows: serde_json::Value = serde_json::from_str(&list).unwrap();
-        let ndev_id = workflows
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|w| w["scope"] == "ndev")
-            .expect("the ndev built-in is listed")["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-
-        let project_id = make_project(&h, "Nyx", "/tmp/dbcmd-spec-runs");
-        let (spec_id, other_spec_id, parent_run, child_run, foreign_run) = h
-            .runtime
-            .db()
-            .with_conn(|c| {
-                let (spec, _rev) =
-                    nyx_core::db::create_spec(c, &project_id, "Checkout", Default::default())?;
-                let (other, _rev2) =
-                    nyx_core::db::create_spec(c, &project_id, "Autre", Default::default())?;
-                let child_wf = nyx_core::db::create_workflow(
-                    c,
-                    Some(&project_id),
-                    "coder",
-                    nyx_core::db::WORKFLOW_SCOPE_CUSTOM,
-                    None,
-                )?;
-                let parent = nyx_core::db::create_workflow_run(
-                    c,
-                    &ndev_id,
-                    Some(&spec.id),
-                    None,
-                    "{\"phase\":1}",
-                )?;
-                let child =
-                    nyx_core::db::create_workflow_run(c, &child_wf.id, Some(&spec.id), None, "{}")?;
-                let foreign =
-                    nyx_core::db::create_workflow_run(c, &ndev_id, Some(&other.id), None, "{}")?;
-                // An UNBOUND run on ndev — it belongs to no Spec and must never surface.
-                nyx_core::db::create_workflow_run(c, &ndev_id, None, None, "{}")?;
-                Ok::<_, diesel::result::Error>((spec.id, other.id, parent.id, child.id, foreign.id))
-            })
-            .unwrap();
-
-        let reads_before = h.pushes();
-
-        let runs = h
-            .run("engine_spec_runs", serde_json::json!({ "specId": spec_id }))
-            .unwrap();
-        let runs: serde_json::Value = serde_json::from_str(&runs).unwrap();
-        let runs = runs.as_array().unwrap();
-        let ids: Vec<&str> = runs.iter().map(|r| r["id"].as_str().unwrap()).collect();
-        assert_eq!(ids.len(), 2, "both of the Spec's runs are listed");
-        assert!(
-            ids.contains(&parent_run.as_str()) && ids.contains(&child_run.as_str()),
-            "the ndev run AND the child-workflow run both surface for the Spec"
-        );
-        assert!(
-            !ids.contains(&foreign_run.as_str()),
-            "another Spec's run — and the unbound run — stay out"
-        );
-        // Newest-first: the child run was created last (same ms ⇒ the `id DESC` tiebreak still
-        // orders the UUIDv7s), and its blackboard rides along for the modal's panel.
-        assert!(runs
-            .iter()
-            .any(|r| r["blackboard"].as_str() == Some("{\"phase\":1}")));
-
-        // The other Spec sees only ITS run; an unknown Spec is an empty list, not an error.
-        let other = h
-            .run(
-                "engine_spec_runs",
-                serde_json::json!({ "specId": other_spec_id }),
-            )
-            .unwrap();
-        let other: serde_json::Value = serde_json::from_str(&other).unwrap();
-        assert_eq!(other.as_array().unwrap().len(), 1);
-        let unknown = h
-            .run("engine_spec_runs", serde_json::json!({ "specId": "nope" }))
-            .unwrap();
-        let unknown: serde_json::Value = serde_json::from_str(&unknown).unwrap();
-        assert!(unknown.as_array().unwrap().is_empty());
-
-        assert_eq!(
-            h.pushes(),
-            reads_before,
-            "engine_spec_runs never pushes an invalidation"
-        );
-    }
-
-    /// v2.8 Phase 7 GATE (clause 4 — "visualiser runtime fidèle", the IPC-read-command half): the
-    /// `engine_run_list` / `engine_workflow_graph` read-commands the React Flow view consumes
-    /// reflect a LIVE `nyx_next` run FAITHFULLY. We drive the SEEDED ndev through the REAL Phase-3
-    /// `nyx_next` verb over the same `Db` the read-commands read, then read back over the sidecar
-    /// transport: at each tick `engine_run_list` exposes the EXACT `current_node_id` + `blackboard`
-    /// nyx_next persisted, and `engine_workflow_graph` carries that cursor node (so the renderer's
-    /// `build-graph` can locate + highlight it). Composes with `build-graph.test.ts` (the highlight)
-    /// into end-to-end runtime fidelity.
-    #[test]
-    fn engine_run_list_reflects_a_live_nyx_next_run() {
-        let h = Harness::new();
-
-        // The seeded ndev built-in (seeded at `Db::open`).
-        let list = h
-            .run("engine_workflow_list", serde_json::json!({}))
-            .unwrap();
-        let workflows: serde_json::Value = serde_json::from_str(&list).unwrap();
-        let wf_id = workflows
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|w| w["scope"] == "ndev")
-            .expect("the ndev built-in is listed")["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-
-        // A run on ndev bound to a READY Spec carrying one open build task, so the entry `start` fires
-        // inline (ready → in_progress), the build gate (`spec_open_tasks` — there IS work) routes into
-        // the build, and the first SURFACED action is the coder SUB-WORKFLOW (lot 2 — the build is
-        // delegated to a coder child; ndev keeps the audit/review/Spec-transitions).
-        let (project_id, spec_id) = h
-            .runtime
-            .db()
-            .with_conn(|c| {
-                let (project, _root) =
-                    nyx_core::db::create_project(c, "P", "/tmp/sidecar-ndev", None).unwrap();
-                let (spec, _rev) = nyx_core::db::create_spec(
-                    c,
-                    &project.id,
-                    "S",
-                    nyx_core::db::SpecSections {
-                        problem: "p".into(),
-                        solution: "s".into(),
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-                nyx_core::db::create_task(
-                    c,
-                    &project.id,
-                    "t0",
-                    nyx_core::db::NewTaskInput {
-                        spec_id: Some(spec.id.clone()),
-                        phase_name: Some("Build".to_string()),
-                        ..nyx_core::db::NewTaskInput::slice()
-                    },
-                )
-                .unwrap();
-                nyx_core::db::transition_spec(c, &spec.id, nyx_core::db::SpecTransition::Ready, true)
-                    .unwrap();
-                (project.id, spec.id)
-            });
-
-        // ARM the coder child's per-task gate. The seeded coder ships it BLOCKING and declaring the
-        // `build_check` SLOT, and `nyx_next` REFUSES to advance past a gate nothing answers (it would
-        // certify a build nothing checked) — so take the route the refusal names: register the check
-        // and BIND it to this project's slot. Nothing is forked, so this project keeps running (and
-        // keeps receiving upgrades of) nyx's own coder graph.
-        //
-        // The always-green check is `exit 0`, NOT `true`. nyx runs a managed command as
-        // `<platform shell> <flag> <cmdline>` (`nyx_core::command::command_invocation`), and `true`
-        // is a POSIX PROGRAM NAME: on Windows the platform shell is PowerShell, which has no such
-        // program, so the gate stayed red and the coder child span until this test tripped its own
-        // runaway guard. `exit <n>` is shell SYNTAX — the one verdict all three shells nyx picks
-        // (POSIX, PowerShell, cmd) spell identically. Same reasoning, and the whole vocabulary of
-        // it, in nyx-core's `test_cmdline` module; only this one line is needed here, and a
-        // `#[cfg(test)]` module of that crate is not visible from this one.
-        std::fs::create_dir_all("/tmp/sidecar-ndev").expect("the gate needs a real cwd");
-        let gate_instance = h.runtime.db().with_conn(|c| {
-            let tpl = nyx_core::db::create_template(
-                c,
-                &project_id,
-                "gate",
-                "exit 0",
-                None,
-                Default::default(),
-            )
-            .unwrap();
-            nyx_core::db::instance_ids_for_template(c, &tpl.id)
-                .unwrap()
-                .into_iter()
-                .next()
-                .unwrap()
-        });
-        let authoring = |name: &str, args: serde_json::Value| -> serde_json::Value {
-            nyx_core::mcp_authoring::dispatch_authoring_tool(h.runtime.db(), name, &args)
-                .unwrap_or_else(|| panic!("`{name}` was not routed"))
-                .unwrap_or_else(|e| panic!("`{name}` failed: {}", e.message))
-                .result
-        };
-        authoring(
-            "slot_bind",
-            serde_json::json!({
-                "project_id": project_id,
-                "slot": nyx_core::seed::BUILD_CHECK_SLOT,
-                "command_ids": [gate_instance],
-            }),
-        );
-
-        let run_id = h
-            .runtime
-            .db()
-            .with_conn(|c| {
-                nyx_core::db::create_workflow_run(c, &wf_id, Some(&spec_id), None, "{}")
-            })
-            .unwrap()
-            .id;
-
-        // Drive the REAL `nyx_next` verb (Phase 3) over the SAME `Db` the read-commands serve. The
-        // caller session is empty — this deroulé reaches no consent question, so nyx has no human
-        // turn to look for.
-        let rt = nyx_core::mcp_engine::EngineRuntime::new();
-        let tick = |rid: &str, last: Option<serde_json::Value>| -> serde_json::Value {
-            let mut args = serde_json::json!({ "run_id": rid });
-            if let Some(l) = last {
-                args.as_object_mut()
-                    .unwrap()
-                    .insert("last_result".into(), l);
-            }
-            let caller = nyx_core::mcp_engine::CallerSession { terminal_id: None };
-            nyx_core::mcp_engine::nyx_next(h.runtime.db(), &rt, caller, &args)
-                .expect("nyx_next")
-                .result
-        };
-
-        // The IPC read-commands mirror the live cursor + the PERSISTED (full) blackboard — what the
-        // React Flow view reads from the DB. N22 made the tick OUTPUT a per-tick delta, but `persist`
-        // still writes the full board, so this read model is unaffected. Returns the persisted board.
-        let read_reflects = |cursor: &str| -> serde_json::Value {
-            let runs = h
-                .run("engine_run_list", serde_json::json!({ "workflowId": wf_id }))
-                .unwrap();
-            let runs: serde_json::Value = serde_json::from_str(&runs).unwrap();
-            let runs = runs.as_array().unwrap();
-            assert_eq!(runs.len(), 1, "the workflow's single run is listed");
-            assert_eq!(
-                runs[0]["current_node_id"],
-                serde_json::json!(cursor),
-                "engine_run_list reflects the live cursor nyx_next persisted"
-            );
-            let graph = h
-                .run("engine_workflow_graph", serde_json::json!({ "workflowId": wf_id }))
-                .unwrap();
-            let graph: serde_json::Value = serde_json::from_str(&graph).unwrap();
-            assert!(
-                graph["nodes"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|n| n["id"] == serde_json::json!(cursor)),
-                "the graph dump carries the live cursor node — the renderer can highlight it"
-            );
-            serde_json::from_str(runs[0]["blackboard"].as_str().unwrap()).unwrap()
-        };
-
-        // Tick 1 → the entry query + start fold INLINE, then the run OPENS the coder child and parks on
-        // the sub_workflow node.
-        let out1 = tick(&run_id, None);
-        assert_eq!(out1["action"]["type"], "sub_workflow");
-        let child_run_id = out1["action"]["child_run_id"].as_str().unwrap().to_string();
-        let cursor1 = out1["current_node_id"].as_str().unwrap().to_string();
-        let _board1 = read_reflects(&cursor1);
-
-        // Drive the coder child to done (it drives the phase's single task), like the real dispatcher.
-        let mut steps = 0;
-        let mut clast: Option<serde_json::Value> = None;
-        loop {
-            let cout = tick(&child_run_id, clast.take());
-            match cout["action"]["type"].as_str().unwrap() {
-                "done" => break,
-                "spawn_subagent" => clast = Some(serde_json::json!({ "diff": "d" })),
-                // The coder's CATEGORY PREFLIGHT (built-in revision 24): this fixture's Spec carries
-                // no category, so the flow classifies it explicitly before it routes on the genre.
-                // `feature` — the branch that owes no reproduction, which is the path this read-model
-                // test has always walked.
-                "judge" => clast = Some(serde_json::json!({ "verdict": "feature" })),
-                "note" => {}
-                other => panic!("unexpected coder child action '{other}'"),
-            }
-            steps += 1;
-            assert!(steps < 20, "runaway coder child");
-        }
-
-        // Tick the PARENT: it folds the child's VERIFIED result and parks on the AUDITOR spawn; the
-        // PERSISTED board now carries the folded sub_result.
-        let out2 = tick(&run_id, None);
-        assert_eq!(out2["action"]["type"], "spawn_subagent");
-        assert_eq!(out2["action"]["agent_id"], "auditor");
-        let cursor2 = out2["current_node_id"].as_str().unwrap().to_string();
-        assert_ne!(
-            cursor2, cursor1,
-            "the cursor MOVED — the read model tracks the live run, not a stale value"
-        );
-        let board2 = read_reflects(&cursor2);
-        assert_eq!(
-            board2["sub_result"]["status"],
-            serde_json::json!("done"),
-            "the persisted read model exposes the true folded state (the child's verified result)"
-        );
     }
 
     /// v2.7 Phase 3 — the DESIGN-SYSTEM read/render seam over the real dispatch: `design_get`

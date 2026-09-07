@@ -2,7 +2,6 @@ import { ArrowUpRightIcon, MessagesSquareIcon } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
 
 import { Button } from "@/components/ui/button";
-import { SpecRunButton } from "@/components/engine/run-modal";
 
 import type { Spec } from "../specs/types";
 
@@ -19,14 +18,10 @@ import type { Spec } from "../specs/types";
  *    labelled button ("Review") that jumps to the full-screen review page (`/work/$specId/review`,
  *    which re-derives the Spec's review context automatically — no route search-param pre-selection
  *    yet, that is a later iteration).
- *  - "Run" — ALWAYS shown. It does NOT navigate: it opens the ORCHESTRATION RUN modal in place (the
- *    shared engine graph + the run's blackboard), because the runtime belongs to the Spec being
- *    worked, not to the `/engine` page — and leaving the terminal to look at it would defeat the
- *    overlay.
  *
  * Navigation uses the `@tanstack/react-router` `useNavigate` idiom (same as `runtime-tab` /
  * `base-layout`). `e.stopPropagation()` on each click keeps a header/languette toggle handler from
- * firing — an action must NEVER close/toggle the panel; it only navigates (or opens the modal).
+ * firing — an action must NEVER close/toggle the panel; it only navigates.
  */
 export function OverlayPanelActions({ spec }: { spec: Spec }) {
   const navigate = useNavigate();
@@ -44,7 +39,6 @@ export function OverlayPanelActions({ spec }: { spec: Spec }) {
       >
         <ArrowUpRightIcon />
       </Button>
-      <SpecRunButton specId={spec.id} />
       {spec.status === "in_review" ? (
         <Button
           variant="outline"

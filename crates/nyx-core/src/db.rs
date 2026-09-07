@@ -49,13 +49,12 @@ const POOL_MAX_SIZE: u32 = 8;
 use crate::pathnorm;
 use crate::schema::{
     agent_session_prototypes, agent_session_specs, agent_sessions, annex_blobs, annexes,
-    app_settings, categories, command_instances, command_slots, design, design_components,
-    domain_events, gate_attempts, human_turns, idea_specs, ideas, managed_command_groups,
-    managed_commands, nodes, projects, prototype_design_lock, prototype_feedback,
-    prototype_page_versions, prototype_pages, prototype_round_pages, prototype_rounds,
+    app_settings, categories, command_instances, design, design_components, domain_events,
+    idea_specs, ideas, managed_command_groups, managed_commands, projects, prototype_design_lock,
+    prototype_feedback, prototype_page_versions, prototype_pages, prototype_round_pages,
+    prototype_rounds,
     prototype_variants, prototypes, repositories, review_comments, review_reads, review_tasks,
-    spec_depends_on, spec_revisions, specs, task_dependencies, tasks, terminals, workflow_runs,
-    workflows, workspaces,
+    spec_depends_on, spec_revisions, specs, task_dependencies, tasks, terminals, workspaces,
 };
 
 /// The migrations baked into the binary at compile time from `migrations/`.
@@ -512,7 +511,7 @@ pub struct Project {
     /// verbe configurable par projet dans un PRD separe"), shipped here on the user's explicit
     /// decision of 2026-08-18. It is BORNE to the WHERE (the root folder, and the derivation of a
     /// path under it); the WHAT — clone, worktree, root files, setup commands — stays out of scope
-    /// and belongs to idea 01M04W3RZ333NC01R216MNXAFK. Full note on `build_nspec` in `crate::seed`.
+    /// and belongs to idea 01M04W3RZ333NC01R216MNXAFK.
     pub worktrees_root: Option<String>,
     /// The NATURE of the container — [`PROJECT_KIND_USER`] (the default, every project a human
     /// creates) or [`PROJECT_KIND_SYSTEM`] (the singleton technical container of the **Système**
@@ -1435,11 +1434,6 @@ pub fn mark_review_read(
 /// unbounded log. The caller re-orders to oldest-first for display if it wants a chronology.
 /// This reads ONLY the small, business `domain_events` rows (each payload is a tiny JSON bag,
 /// never a terminal byte stream — see the v12 migration), so no terminal output can leak here.
-///
-/// The [`AGGREGATE_RUN`] rows are EXCLUDED. This fil is human-facing and the bound is a SQL
-/// `LIMIT` on the newest rows: an orchestration run journals one row PER TICK (F3), so a single
-/// run would push every "changement notable" out of the window and the cockpit would show nothing
-/// but machine grain. The run journal is an audit trail, read per run — not a timeline entry.
 pub fn recent_domain_events_for_workspace(
     conn: &mut SqliteConnection,
     workspace_id: &str,
@@ -1447,7 +1441,6 @@ pub fn recent_domain_events_for_workspace(
     limit: i64,
 ) -> QueryResult<Vec<DomainEvent>> {
     domain_events::table
-        .filter(domain_events::aggregate.ne(AGGREGATE_RUN))
         .filter(
             domain_events::workspace_id
                 .eq(Some(workspace_id))
@@ -1609,7 +1602,7 @@ pub fn recent_domain_events_for_spec(
 // --- Category domain models (PDR-0017) -----------------------------------
 
 /// `categories.created_by_type` — minted by nyx's per-project SEED. The four rows every project is
-/// born with, and the only ones a workflow may name by slug.
+/// born with.
 pub const CATEGORY_CREATED_BY_SYSTEM: &str = "system";
 /// `categories.created_by_type` — minted ON THE FLY by an agent that found nothing to reuse
 /// (PDR-0017: creation is a non-blocking fallback). Minted by
@@ -1642,12 +1635,11 @@ pub const CATEGORY_CREATED_BY_TYPES: [&str; 3] = [
 /// comments below, and for the same reason: the discipline is READ OFF THE SLUG, so two spellings
 /// that drift disarm it for every Spec rather than failing loudly.
 ///
-/// IT IS THE SAME STRING ON FOUR SIDES, which is why it is named rather than spelled at each site:
-/// the row this list seeds in every project, the slug [`crate::category::slugify_for`] refuses to
-/// let an agent's category land on, the value the `spec_category` query fact writes to the
-/// blackboard, and — since built-in revision 24 — the literal the seeded coder/nspec graphs' "bug
-/// discipline?" selector branches on ([`crate::seed`]) and the one `run_start`'s scanner reads to
-/// decide whether the reproduction slot is owed at all ([`crate::mcp_engine`]).
+/// IT IS THE SAME STRING ON TWO SIDES, which is why it is named rather than spelled at each site:
+/// the row this list seeds in every project, and the slug [`crate::category::slugify_for`] refuses
+/// to let an agent's category land on. It used to have two more readers inside the orchestration
+/// engine — a graph selector and `run_start`'s reproduction scanner — which left with it
+/// (PDR-0031); the discipline is now carried by the command manuals.
 pub const CATEGORY_SLUG_BUG: &str = "bug";
 
 /// The four SYSTEM categories every project is seeded with — `(slug, name, color_token)`, in the
@@ -2033,7 +2025,7 @@ pub fn record_spec_category_event(
 }
 
 /// Replay [`seed_system_categories_for_project`] over EVERY project — the boot BACKFILL, run once
-/// per start next to the built-in workflow seed.
+/// per start.
 ///
 /// A database that predates `20260828180916_create_categories` holds projects with no categories at
 /// all; without this they would have to be recreated to gain the vocabulary the harness reads. It
@@ -2518,32 +2510,6 @@ pub fn update_active_revision_section(
     })
 }
 
-/// THE ONE EXCEPTION TO THE FREEZE: the same in-place section edit as
-/// [`update_active_revision_section`], WITHOUT its `draft`-only state guard (H12).
-///
-/// WHY IT EXISTS. A build can reach a contradiction that no code change can settle: the audit files a
-/// finding, the coder fixes the code, and the next round finds the SPEC'S PROSE now wrong about the
-/// code (`implementation_decisions` promises `GET /healthz` where the code — rightly — serves
-/// `GET|HEAD`). The coder refuses, and is right to: it never redefines the Spec. But the Spec is
-/// `in_progress`, so its sections are frozen, and NOBODY could correct the text — not the coder, not
-/// the human. The build had no exit but a hand-made task reopening, i.e. a valid finding closed
-/// without being fixed.
-///
-/// WHY IT IS NOT A HOLE. This function is unreachable from a caller's own say-so: the only route to it
-/// is `spec_update_section` with a `run_id` whose run carries the grant nyx's ENGINE wrote from a
-/// HUMAN's answer at the escalation gate ([`crate::mcp_engine::spec_section_write_is_authorized`]).
-/// The freeze stays the rule; the human is its only exception, and the window closes with the branch
-/// that opened it.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn update_active_revision_section_human_gated(
-    conn: &mut SqliteConnection,
-    spec_id: &str,
-    section: SpecSection,
-    value: &str,
-) -> Result<bool, ContentWriteError> {
-    conn.transaction(|conn| write_active_revision_section(conn, spec_id, section, value))
-}
-
 /// The section WRITE itself (no state guard, no transaction of its own — the callers own both): set
 /// the active revision's column, bump the Spec's `updated_at`, and journal `spec.section_updated`.
 fn write_active_revision_section(
@@ -2746,6 +2712,7 @@ pub fn revise_spec(conn: &mut SqliteConnection, spec_id: &str) -> QueryResult<Sp
 //   draft ──ready──▶ ready ──start──▶ in_progress ──review──▶ in_review ──done──▶ completed
 //     │                │                   │                      │
 //     └────────────────┴───────cancel──────┴──────────────────────┴──────────▶ cancelled
+//     ◀────────────────┴──────revise───────┴──────────────────────┘
 //
 // (The canonical `spec_status` stores `in_review`/`completed`/`cancelled`; the
 // conceptual lifecycle points `review`/`done`/`cancel` map onto them.)
@@ -2759,12 +2726,14 @@ pub fn revise_spec(conn: &mut SqliteConnection, spec_id: &str) -> QueryResult<Sp
 //     an INCOMPLETE draft must NOT pass ready.
 //
 // GARDE-FOUS (guard-rails), in the spirit of depot's `--user-confirmed`: the SENSITIVE
-// transitions (`ready`, `start`, `done`, `cancel`) require an explicit user confirmation.
-// `start` is sensitive because it POSES the workspace anchor (ready→in_progress binds the
-// Spec to a dev workspace and kicks off implementation — a consequential, human-owned move).
-// The backend refuses them with [`SpecTransitionError::ConfirmationRequired`] unless the
-// caller passes `user_confirmed = true`, so a UI/MCP mutation cannot silently mark a
-// Spec ready/started/done/cancelled without the human's go-ahead.
+// transitions (`ready`, `done`, `cancel`) require an explicit user confirmation. The set is
+// PDR-0031's, and the line it draws is the IRREVERSIBLE-or-CONTRACTUAL one: handing a Spec to
+// /ndev (`ready`), declaring it done, abandoning it. The three other moves merely RECORD what
+// happened — `start` that work began, `review` that it is ready for an eye, `revise` that the
+// author took the design back — and none of them asks the human twice.
+// The backend refuses the sensitive ones with [`SpecTransitionError::ConfirmationRequired`]
+// unless the caller passes `user_confirmed = true`, so a UI/MCP mutation cannot silently mark a
+// Spec ready/done/cancelled without the human's go-ahead.
 
 /// A Spec lifecycle transition (the conceptual move, independent of the stored status
 /// string). Each maps to a canonical target `spec_status`, declares its legal source
@@ -2773,8 +2742,11 @@ pub fn revise_spec(conn: &mut SqliteConnection, spec_id: &str) -> QueryResult<Sp
 pub enum SpecTransition {
     /// draft → ready. Sensitive; runs the pre-ready VALIDATIONS.
     Ready,
-    /// ready → in_progress. Sensitive: it POSES the Spec's workspace anchor
-    /// ([`transition_spec_with_workspace`]) in the SAME operation.
+    /// ready → in_progress. NOT sensitive: it only RECORDS that work began (PDR-0031 names the
+    /// sensitive set, and `start` is not in it — the `/ndev` manual opens on a `to="in_progress"`
+    /// that carries no confirmation). It still POSES the Spec's workspace anchor
+    /// ([`transition_spec_with_workspace`]) in the SAME operation — the anchor is untouched by
+    /// that, only the consent requirement moved.
     Start,
     /// in_progress → in_review ("review"). Not sensitive.
     Review,
@@ -2782,6 +2754,15 @@ pub enum SpecTransition {
     Done,
     /// (draft|ready|in_progress|in_review) → cancelled. Sensitive.
     Cancel,
+    /// (ready|in_progress|in_review) → draft — le RETOUR EN ÉDITION d'une Spec déjà figée : le
+    /// `to="draft"` des manuels (`docs/product/agent-manuals.md` §1 étape 5). Le FORK n'est pas
+    /// fait ici : le manuel écrit deux gestes, `spec_fork` puis cette transition, et les garder
+    /// distincts est ce qui permet de rouvrir une Spec sans forcément la forker. [`revise_spec`]
+    /// reste l'atome qui enchaîne les deux pour un appelant interne.
+    ///
+    /// NON SENSIBLE : rouvrir en édition ne détruit rien, n'engage aucun humain et ne pose aucune
+    /// ancre — c'est le geste par lequel l'auteur reprend son propre travail.
+    Revise,
 }
 
 impl SpecTransition {
@@ -2793,6 +2774,7 @@ impl SpecTransition {
             SpecTransition::Review => SPEC_STATUS_IN_REVIEW,
             SpecTransition::Done => SPEC_STATUS_COMPLETED,
             SpecTransition::Cancel => SPEC_STATUS_CANCELLED,
+            SpecTransition::Revise => SPEC_STATUS_DRAFT,
         }
     }
 
@@ -2807,6 +2789,7 @@ impl SpecTransition {
             SpecTransition::Review => "review",
             SpecTransition::Done => "done",
             SpecTransition::Cancel => "cancel",
+            SpecTransition::Revise => "revise",
         }
     }
 
@@ -2828,20 +2811,34 @@ impl SpecTransition {
                     | SPEC_STATUS_IN_PROGRESS
                     | SPEC_STATUS_IN_REVIEW
             ),
+            // Revise remonte d'un statut FIGÉ vers `draft` : le manuel dit « une Spec déjà ready
+            // ou au-delà ». `draft` n'en est pas une source (rouvrir un brouillon ne veut rien
+            // dire), et les états terminaux (completed / cancelled / archived) non plus — une
+            // Spec close se rouvre par une nouvelle Spec, pas par une réédition silencieuse.
+            SpecTransition::Revise => matches!(
+                from,
+                SPEC_STATUS_READY | SPEC_STATUS_IN_PROGRESS | SPEC_STATUS_IN_REVIEW
+            ),
         }
     }
 
     /// Whether this transition is SENSITIVE and therefore requires an explicit user
-    /// confirmation (the guard-rail, à la depot `--user-confirmed`): `ready`, `start`,
-    /// `done`, `cancel`. `start` is sensitive because it POSES the workspace anchor
-    /// (ready→in_progress). Only `review` is routine and needs no confirmation.
+    /// confirmation (the guard-rail, à la depot `--user-confirmed`): `ready`, `done`, `cancel`
+    /// — exactly the set PDR-0031 names, the same three `agent-manuals.md` asks the agent to
+    /// relay with `user_confirmed=true`.
+    ///
+    /// The rule behind the set: the human's sentence is demanded where the move is
+    /// IRREVERSIBLE or CONTRACTUAL — `ready` hands the Spec to /ndev, `done` declares it
+    /// finished, `cancel` abandons it. It is NOT demanded where the move merely records that
+    /// work happened: `start` (work began), `review` (it is ready for an eye), `revise` (the
+    /// author took the design back). `start` used to sit in this set because it POSES the
+    /// workspace anchor in the same operation — it still does, but posing an anchor is a
+    /// consequence of starting, not a second decision to ask about, and requiring a
+    /// confirmation there made the `/ndev` manual's own opening call unusable.
     pub fn is_sensitive(self) -> bool {
         matches!(
             self,
-            SpecTransition::Ready
-                | SpecTransition::Start
-                | SpecTransition::Done
-                | SpecTransition::Cancel
+            SpecTransition::Ready | SpecTransition::Done | SpecTransition::Cancel
         )
     }
 }
@@ -3145,7 +3142,7 @@ pub enum SpecTransitionError {
     /// [`validate_done`] verdict, reported findings included, so the refusal shows the full
     /// picture and not just the half that refused.
     CompletionValidationFailed(Vec<DoneValidation>),
-    /// The GUARD-RAIL: a SENSITIVE transition (ready/start/done/cancel) was attempted
+    /// The GUARD-RAIL: a SENSITIVE transition (ready/done/cancel) was attempted
     /// without the user's explicit confirmation (`user_confirmed = false`).
     ConfirmationRequired,
     /// A `start` transition carried a `workspace_id` to anchor on, but no workspace resolves
@@ -3182,7 +3179,7 @@ pub fn transition_spec(
 /// the MCP transition tools route through it), so the lifecycle rules live in one place:
 ///
 ///   1. RESOLVE the Spec (unknown id → [`SpecTransitionError::NotFound`]).
-///   2. GUARD-RAIL: a SENSITIVE transition (ready/start/done/cancel) without `user_confirmed`
+///   2. GUARD-RAIL: a SENSITIVE transition (ready/done/cancel) without `user_confirmed`
 ///      is refused with [`SpecTransitionError::ConfirmationRequired`] — the human must
 ///      confirm (à la depot `--user-confirmed`).
 ///   3. GUARD: the current `status` must be a legal SOURCE ([`SpecTransition::source_allowed`]),
@@ -5669,11 +5666,6 @@ impl Db {
         if let Some(refusal) = schema_health(&mut conn).drift_refusal() {
             return Err(anyhow::anyhow!(refusal));
         }
-        // Seed the built-in default workflows (ndev / nspec / ndoc) once the schema is ready, so a
-        // brand-new project has the clé-en-main flows to run (v2.8 Phase 4). IDEMPOTENT — a re-boot
-        // finds them present and leaves them untouched.
-        crate::seed::seed_builtin_workflows(&mut conn)
-            .map_err(|e| anyhow::anyhow!("failed to seed built-in workflows: {e}"))?;
         // Bring up the Système singleton (the project-less scope of cross-project terminals and
         // commands) right after the schema is ready and before anything is served, so no read ever
         // observes a half-existing scope. IDEMPOTENT: a re-boot on a healthy scope writes nothing.
@@ -5925,13 +5917,6 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "command_instances.updated_at",
     "command_instances.was_running_on_shutdown",
     "command_instances.workspace_id",
-    "command_slots",
-    "command_slots.command_ids",
-    "command_slots.created_at",
-    "command_slots.id",
-    "command_slots.project_id",
-    "command_slots.slot",
-    "command_slots.updated_at",
     "design",
     "design.bundle_recipe_json",
     "design.content",
@@ -5966,30 +5951,6 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "domain_events.sequence",
     "domain_events.source",
     "domain_events.workspace_id",
-    "gate_attempts",
-    "gate_attempts.blocking",
-    "gate_attempts.command_line",
-    "gate_attempts.commands_json",
-    "gate_attempts.created_at",
-    "gate_attempts.cwd",
-    "gate_attempts.declared",
-    "gate_attempts.duration_ms",
-    "gate_attempts.exit_code",
-    "gate_attempts.expect",
-    "gate_attempts.node_id",
-    "gate_attempts.outcome",
-    "gate_attempts.output_excerpt",
-    "gate_attempts.run_id",
-    "gate_attempts.satisfied",
-    "gate_attempts.sequence",
-    "gate_attempts.slot",
-    "gate_attempts.spec_id",
-    "human_turns",
-    "human_turns.consumed_by",
-    "human_turns.prompt",
-    "human_turns.submitted_at",
-    "human_turns.terminal_id",
-    "human_turns.turn_id",
     "idea_specs",
     "idea_specs.created_at",
     "idea_specs.idea_id",
@@ -6021,21 +5982,16 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "idx_categories_project_slug",
     "idx_command_instances_command",
     "idx_command_instances_workspace",
-    "idx_command_slots_project_slot",
     "idx_design_components_project_name",
     "idx_design_project",
     "idx_domain_events_project",
     "idx_domain_events_workspace",
-    "idx_gate_attempts_run",
-    "idx_gate_attempts_spec",
     "idx_idea_specs_spec",
     "idx_ideas_project_status",
     "idx_ideas_project_theme",
     "idx_managed_command_groups_project",
     "idx_managed_commands_group",
     "idx_managed_commands_project",
-    "idx_nodes_parent",
-    "idx_nodes_workflow",
     "idx_one_active_revision_per_spec",
     "idx_one_active_session_per_terminal_agent",
     "idx_one_root_per_project",
@@ -6077,10 +6033,6 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "idx_tasks_project_status",
     "idx_tasks_spec_phase_round",
     "idx_tasks_spec_position",
-    "idx_workflow_runs_spec",
-    "idx_workflow_runs_workflow",
-    "idx_workflows_project",
-    "idx_workflows_scope",
     "idx_workspaces_project",
     "idx_workspaces_project_name",
     "managed_command_groups",
@@ -6110,16 +6062,6 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "managed_commands.source_script_name",
     "managed_commands.subfolder",
     "managed_commands.updated_at",
-    "nodes",
-    "nodes.config",
-    "nodes.created_at",
-    "nodes.id",
-    "nodes.label",
-    "nodes.order_index",
-    "nodes.parent_id",
-    "nodes.type",
-    "nodes.updated_at",
-    "nodes.workflow_id",
     "projects",
     "projects.accent",
     "projects.archived_at",
@@ -6370,30 +6312,6 @@ const EXPECTED_SCHEMA: &[&str] = &[
     "terminals.updated_at",
     "terminals.workspace_binding_mode",
     "terminals.workspace_id",
-    "workflow_runs",
-    "workflow_runs.blackboard",
-    "workflow_runs.current_node_id",
-    "workflow_runs.id",
-    "workflow_runs.parent_run_id",
-    "workflow_runs.pending_consent",
-    "workflow_runs.spec_id",
-    "workflow_runs.started_at",
-    "workflow_runs.status",
-    "workflow_runs.traversal",
-    "workflow_runs.updated_at",
-    "workflow_runs.workflow_id",
-    "workflow_runs.workspace_id",
-    "workflows",
-    "workflows.builtin_revision",
-    "workflows.created_at",
-    "workflows.forked_from",
-    "workflows.forked_from_revision",
-    "workflows.id",
-    "workflows.name",
-    "workflows.project_id",
-    "workflows.root_node_id",
-    "workflows.scope",
-    "workflows.updated_at",
     "workspaces",
     "workspaces.archived_at",
     "workspaces.branch",
@@ -11839,12 +11757,14 @@ pub fn propagate_idea_lifecycle_for_transition(
     spec_number: i32,
     transition: SpecTransition,
 ) -> QueryResult<usize> {
-    // Only start/done/cancel drive an idea move; ready/review are inert.
+    // Only start/done/cancel drive an idea move; ready/review/revise are inert.
     let action = match transition {
         SpecTransition::Start => IdeaLifecycleAction::Plan,
         SpecTransition::Done => IdeaLifecycleAction::Implement,
         SpecTransition::Cancel => IdeaLifecycleAction::Reopen,
-        SpecTransition::Ready | SpecTransition::Review => return Ok(0),
+        // `revise` (retour en édition) est inerte comme `ready`/`review` : la Spec continue
+        // d'adresser les mêmes idées, elle est seulement redevenue éditable.
+        SpecTransition::Ready | SpecTransition::Review | SpecTransition::Revise => return Ok(0),
     };
     let mut changed = 0usize;
     for idea in ideas_addressed_by_spec(conn, spec_id)? {
@@ -13507,324 +13427,6 @@ pub fn spec_dependency_view(
     })
 }
 
-// ============================================================================
-// ORCHESTRATION ENGINE domain (v34) — `workflows` + `nodes` + `workflow_runs`.
-//
-// The behavior tree stored as DATA (PRD v2.8 "Orchestration = donnée"). This is the LOW-LEVEL
-// CRUD floor: create/read/update/delete rows, and — crucially — reconstruct the PURE tree
-// (parent_id + order_index) from the rows alone. The typed-node INTERPRETER (task T3) lives in
-// [`crate::engine`] and consumes these rows; the `nyx_next` verb (T4) persists a run's cursor +
-// blackboard back through the run CRUD here.
-// ============================================================================
-
-/// A workflow's `scope` — which built-in flow the tree IS (CHECK-enforced in the migration).
-pub const WORKFLOW_SCOPE_NDEV: &str = "ndev";
-#[cfg_attr(not(test), allow(dead_code))]
-pub const WORKFLOW_SCOPE_NSPEC: &str = "nspec";
-#[cfg_attr(not(test), allow(dead_code))]
-pub const WORKFLOW_SCOPE_NDOC: &str = "ndoc";
-pub const WORKFLOW_SCOPE_CUSTOM: &str = "custom";
-/// SUB-WORKFLOW-ONLY scopes (v2.8 lot 2): a `sub_workflow` node resolves its child target BY SCOPE, so
-/// the coder / prototyper flows carry their own scope vocabulary. They ship NO `/coder` `/prototyper`
-/// command and NO default `run_start` wiring — they are reached only as a sub-workflow child. Protection
-/// (immutable when unowned + one-per-project) is automatic: [`crate::mcp_authoring`] treats every
-/// non-`custom` scope as a protected, single-per-project family.
-#[cfg_attr(not(test), allow(dead_code))]
-pub const WORKFLOW_SCOPE_CODER: &str = "coder";
-#[cfg_attr(not(test), allow(dead_code))]
-pub const WORKFLOW_SCOPE_PROTOTYPER: &str = "prototyper";
-
-/// A node's `type` — the FULL PRD behavior-tree vocabulary (the 3 composites + the 13 leaves),
-/// CHECK-enforced in the migration. The schema carries the COMPLETE model rather than the subset any
-/// one interpreter happens to run: it was written that way at T3, when the interpreter executed six
-/// of these leaves and no more, so that a graph authored then still reads today.
-pub const NODE_TYPE_SEQUENCE: &str = "sequence";
-pub const NODE_TYPE_LOOP: &str = "loop";
-pub const NODE_TYPE_SELECTOR: &str = "selector";
-pub const NODE_TYPE_SPAWN_SUBAGENT: &str = "spawn_subagent";
-pub const NODE_TYPE_JUDGE: &str = "judge";
-pub const NODE_TYPE_ASK_HUMAN: &str = "ask_human";
-pub const NODE_TYPE_PRODUCE: &str = "produce";
-pub const NODE_TYPE_GATE_CHECK: &str = "gate_check";
-pub const NODE_TYPE_TRANSITION: &str = "transition";
-pub const NODE_TYPE_WAIT: &str = "wait";
-pub const NODE_TYPE_NOTE: &str = "note";
-/// A `query` reads a VERIFIABLE nyx fact (a Spec's status, …) and writes it to the blackboard — a
-/// nyx-OWN inline effect the T4 handler runs itself (like gate_check / transition), never surfaced to
-/// the dispatcher. Lets a graph BRANCH on real state rather than on an LLM's say-so (v2.8 review B2).
-pub const NODE_TYPE_QUERY: &str = "query";
-/// A `fork_spec` FORKS the run's bound Spec into a NEW editable revision (the prior one superseded,
-/// its content snapshotted) and reopens it as a `draft` so it can be reworked — a nyx-OWN inline
-/// effect, gated on a preceding `ask_human` (like an engaging transition). It makes "revise a ready
-/// Spec" an EXPLICIT graph step instead of an implicit instruction to the effector (v2.8 review N13).
-pub const NODE_TYPE_FORK_SPEC: &str = "fork_spec";
-/// A `sub_workflow` opens a CHILD run of another flow (resolved by scope, or an explicit `workflow_id`),
-/// drives it through a FRESH sub-agent, and folds the child's VERIFIED blackboard result back onto the
-/// parent board — the one novel HYBRID leaf (a nyx-own inline effect that ALSO suspends the parent while
-/// the child runs). It reads the child result from the child run's persisted blackboard, never from the
-/// sub-agent's claim (v2.8 lot 2).
-pub const NODE_TYPE_SUB_WORKFLOW: &str = "sub_workflow";
-/// A `transition_task` marks a task through the guarded task lifecycle (start/done/block/skip) — a
-/// nyx-own inline effect, the task-level twin of the Spec `transition` node. It names its task via a
-/// blackboard key (`task_key`, default `task_id`) and is UNGATED by default (an optional `gate_on`)
-/// (v2.8 lot 2).
-pub const NODE_TYPE_TRANSITION_TASK: &str = "transition_task";
-/// A `create_workspace` opens the DEV WORKSPACE of the run's bound Spec — a nyx-own inline effect
-/// that calls the very same [`crate::mcp_runtime::create_workspace`] the MCP tool does, so the folder
-/// creation, the workspace row and the SPEC ANCHOR stay ONE guarded write with ONE compensation,
-/// never a second implementation of the anchor (the worktrees_root migration).
-///
-/// Where the folder goes is the node's whole configuration, and it is ONE value: a ROOT — the
-/// project's [`Project::worktrees_root`], or a root a preceding `ask_human` answered when none is
-/// configured — with a DERIVED name joined under it, always. The node used to take a second,
-/// un-derived "explicit path" source that won over the root; a human who answered the question with
-/// what it asked for (a root) got the root itself registered as the workspace. What goes IN the
-/// folder is not this node's business — `create_workspace` `mkdir`s and stops, so the workspace lands
-/// EMPTY (see the fill-strategy decisions recorded on that function).
-///
-/// HORS PERIMETRE ASSUME. This SIXTEENTH node type was added to the orchestration engine 2.8, which
-/// is FROZEN (in_progress), and outside the declared scope of PRD 01KYA475AX5JBGSS8WK5J8NM1S — whose
-/// out-of-scope item 01KYA49F5T2H02YY4VT7SCBGSX says so by name ("Internes du moteur d'orchestration
-/// 2.8 […] ce PRD fournit seulement le resolveur partage"). Shipped anyway on the user's explicit
-/// decision of 2026-08-18. The same crossing carries the engine vocabulary, the inline effect, the
-/// `project.worktrees_root` query fact and the widening of the `nodes.type` CHECK; the full note is
-/// on `build_nspec` in `crate::seed`, which names all THREE items this pass crossed.
-pub const NODE_TYPE_CREATE_WORKSPACE: &str = "create_workspace";
-/// A `set_category` CLASSIFIES the run's bound Spec — it writes the genre of work the Spec carries
-/// (`specs.category_id`) through the SAME [`crate::category::set_spec_category_by_label`] the MCP
-/// surface calls, so the same-project refusal, the on-the-fly MINT of an unknown label and the
-/// `spec.category_set` event are ONE authority and never a second implementation (PDR-0017).
-///
-/// Its whole configuration is `{category_key, gate_on?}`: `category_key` NAMES the blackboard key
-/// holding the category LABEL (a slug or a human name), never a literal — the label is a per-run
-/// answer (a `judge`'s verdict, a `query spec_category` reading, a human's reply) and a shared graph
-/// holds none of them. `gate_on` is the OPTIONAL affirmative board key the effect fires on (UNGATED
-/// when absent), the same shape as [`NODE_TYPE_TRANSITION_TASK`]'s.
-///
-/// IT WRITES NO BLACKBOARD KEY, AND THE ROUTING OUTPUT IS THE READ-BACK. The classification lands in
-/// the DOMAIN (`specs.category_id`), never on the run's board: a board copy would be a second truth,
-/// stale the instant a human recategorizes the Spec from the detail screen (which PDR-0017 allows at
-/// any status). A graph that BRANCHES on the genre of work therefore reads it back with a
-/// `query { query: "spec_category" }` — the fact answers the persisted SLUG — and a `selector` tests
-/// that. `set_category` is consequently absent from every `output_key` census
-/// ([`crate::mcp_authoring`]'s `node_written_board_keys`), deliberately and by name.
-///
-/// WHY A NODE AND NOT A SENTENCE. A prompt asking an agent to classify can be skipped, forgotten or
-/// argued with; a node of the graph cannot. The `bug` discipline this product hangs on the category
-/// (a red-before-green proof) is only as reliable as the classification under it, so the
-/// classification is IMPOSED by the engine — exactly the way `transition`, `fork_spec` and
-/// `create_workspace` impose theirs (ADR-0006).
-///
-/// HORS PERIMETRE ASSUME. This SEVENTEENTH node type is added to the orchestration engine 2.8, which
-/// is FROZEN (in_progress). The crossing is deliberate and it has an identical, documented precedent:
-/// [`NODE_TYPE_CREATE_WORKSPACE`], the sixteenth type, was added to the same frozen engine on the
-/// user's explicit decision of 2026-08-18. ADR-0006 records this one — "le nœud `set_category` est un
-/// type moteur complet : runtime, validation, authoring MCP, dataflow, rendu et inspection".
-pub const NODE_TYPE_SET_CATEGORY: &str = "set_category";
-
-/// The seventeen valid node `type` values, in the migration's CHECK order — the vocabulary the
-/// interpreter and the authoring layer validate against. Every [`NODE_TYPES`] entry round-trips
-/// through [`crate::engine::NodeType`].
-#[cfg_attr(not(test), allow(dead_code))]
-pub const NODE_TYPES: [&str; 17] = [
-    NODE_TYPE_SEQUENCE,
-    NODE_TYPE_LOOP,
-    NODE_TYPE_SELECTOR,
-    NODE_TYPE_SPAWN_SUBAGENT,
-    NODE_TYPE_JUDGE,
-    NODE_TYPE_ASK_HUMAN,
-    NODE_TYPE_PRODUCE,
-    NODE_TYPE_GATE_CHECK,
-    NODE_TYPE_TRANSITION,
-    NODE_TYPE_WAIT,
-    NODE_TYPE_NOTE,
-    NODE_TYPE_QUERY,
-    NODE_TYPE_FORK_SPEC,
-    NODE_TYPE_SUB_WORKFLOW,
-    NODE_TYPE_TRANSITION_TASK,
-    NODE_TYPE_CREATE_WORKSPACE,
-    NODE_TYPE_SET_CATEGORY,
-];
-
-/// A workflow_run's `status` (CHECK-enforced in the migration).
-pub const RUN_STATUS_RUNNING: &str = "running";
-pub const RUN_STATUS_BLOCKED: &str = "blocked";
-pub const RUN_STATUS_DONE: &str = "done";
-#[cfg_attr(not(test), allow(dead_code))]
-pub const RUN_STATUS_FAILED: &str = "failed";
-
-/// Whether a run `status` is TERMINAL — finished, never ticked again. The CHECK vocabulary is
-/// `running | blocked | done | failed`; the terminal set is `done` / `failed`, and its COMPLEMENT
-/// (`running` / `blocked`) is RESUMABLE. `blocked` is genuinely resumable: a blocked-on-gate run
-/// re-runs its gate on the next `nyx_next` (M5), so it must be RESUMED, not discarded (N20).
-pub fn run_status_is_terminal(status: &str) -> bool {
-    status == RUN_STATUS_DONE || status == RUN_STATUS_FAILED
-}
-
-/// A `workflows` row — one stored behavior tree. `project_id` NULL = a built-in nyx default
-/// flow; `root_node_id` NULL = an empty (un-rooted) draft. `Serialize` for the IPC/MCP boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
-#[diesel(table_name = workflows)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
-pub struct Workflow {
-    pub id: String,
-    /// The owning project, or `None` for a built-in nyx default flow.
-    pub project_id: Option<String>,
-    pub name: String,
-    /// `ndev` | `nspec` | `ndoc` | `custom`.
-    pub scope: String,
-    /// The tree's ROOT node (`None` while the tree has no nodes yet).
-    pub root_node_id: Option<String>,
-    /// The workflow this one was forked from (`None` = not a fork).
-    pub forked_from: Option<String>,
-    pub created_at: i64,
-    pub updated_at: i64,
-    /// For a BUILT-IN default (`project_id` NULL), the code revision that produced its stored tree —
-    /// the seeder upgrades the built-in when the code ships a newer revision (v2.8 review N11). `None`
-    /// for a project fork / custom template (never upgraded) and for a pre-N11 built-in.
-    pub builtin_revision: Option<i32>,
-    /// For a FORK, the SOURCE's [`Workflow::builtin_revision`] at the instant of the fork — what
-    /// makes a stale fork detectable (`run_start` compares it to the source's revision TODAY and
-    /// says so). `None` when the comparison cannot be made: a fork of a fork / of a `custom`
-    /// template (the source carries no revision), or a fork taken before migration v47.
-    pub forked_from_revision: Option<i32>,
-}
-
-#[derive(Debug, Clone, Insertable)]
-#[diesel(table_name = workflows)]
-struct NewWorkflowRow {
-    id: String,
-    project_id: Option<String>,
-    name: String,
-    scope: String,
-    forked_from: Option<String>,
-    created_at: i64,
-    updated_at: i64,
-}
-
-/// A `nodes` row — one typed node of a behavior tree. `parent_id` NULL = the workflow's root
-/// node; children of a composite are the rows with `parent_id = it`, ordered by `order_index`.
-/// The Rust field for `type` is `type_` (a keyword). `Serialize` for the IPC/MCP boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
-#[diesel(table_name = nodes)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
-pub struct Node {
-    pub id: String,
-    pub workflow_id: String,
-    /// The parent composite (`None` = the workflow's root node).
-    pub parent_id: Option<String>,
-    pub order_index: i32,
-    /// The node type — one of [`NODE_TYPES`]. The Rust field is `type_` (`type` is a keyword).
-    #[diesel(column_name = type_)]
-    pub type_: String,
-    pub label: String,
-    /// The typed config, a JSON object string whose shape depends on `type_`.
-    pub config: String,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, Insertable)]
-#[diesel(table_name = nodes)]
-struct NewNodeRow {
-    id: String,
-    workflow_id: String,
-    parent_id: Option<String>,
-    order_index: i32,
-    #[diesel(column_name = type_)]
-    type_: String,
-    label: String,
-    config: String,
-    created_at: i64,
-    updated_at: i64,
-}
-
-/// A `workflow_runs` row — one live execution: `current_node_id` is the cursor (the node the run
-/// is parked on), `blackboard` is the run's JSON scratchpad. `Serialize` for the IPC/MCP boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
-#[diesel(table_name = workflow_runs)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
-pub struct WorkflowRun {
-    pub id: String,
-    pub workflow_id: String,
-    /// The Spec this run drives (`None` = not bound to a Spec).
-    pub spec_id: Option<String>,
-    /// The cursor: the node the run is parked on (`None` before the first tick / after the end).
-    pub current_node_id: Option<String>,
-    /// The run's blackboard — a JSON object string the interpreter reads/writes.
-    pub blackboard: String,
-    /// `running` | `blocked` | `done` | `failed`.
-    pub status: String,
-    pub started_at: i64,
-    pub updated_at: i64,
-    /// The interpreter's traversal STACK, serialized by node id (`None` = never persisted, so the
-    /// run is not resumable across a session boundary). Distinct from `blackboard` (the run's data);
-    /// this is the engine's own cursor state — see [`crate::engine`] and migration v39.
-    pub traversal: Option<String>,
-    /// The dev WORKSPACE this run was opened against (`None` = opened by id alone / unbound). The
-    /// graph's entry `start` transition poses it as the Spec's anchor (v2.8 review N24, migration v42).
-    pub workspace_id: Option<String>,
-    /// The PARENT run a `sub_workflow` node opened this child run FROM (`None` = a top-level run). Set
-    /// by [`set_run_parent`] right after the child run is created (v2.8 lot 2, migration v43).
-    pub parent_run_id: Option<String>,
-    /// The consent question this run is parked on, as a [`PendingConsent`] JSON — the RECEIPT of an
-    /// asking: written by the ENGINE when the run suspends on an `ask_human` that gates an engaging
-    /// Spec transition, and cleared by the tick that accepts the answer. It records WHEN the question
-    /// was posed and to which session, which is what lets that tick tell a human's answer from a
-    /// session's (H6, migration v45). Nothing outside the engine writes it.
-    pub pending_consent: Option<String>,
-}
-
-#[derive(Debug, Clone, Insertable)]
-#[diesel(table_name = workflow_runs)]
-struct NewWorkflowRunRow {
-    id: String,
-    workflow_id: String,
-    spec_id: Option<String>,
-    current_node_id: Option<String>,
-    blackboard: String,
-    status: String,
-    started_at: i64,
-    updated_at: i64,
-}
-
-/// CREATE a workflow (an empty draft — `root_node_id` starts NULL; wire the root with
-/// [`set_workflow_root`] once its nodes exist). `project_id` is `None` for a built-in nyx default
-/// flow. `scope` names the flow (`ndev`/`nspec`/`ndoc`/`custom`). `forked_from` is the source it
-/// was forked from (`None` = not a fork). Returns the created [`Workflow`].
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn create_workflow(
-    conn: &mut SqliteConnection,
-    project_id: Option<&str>,
-    name: &str,
-    scope: &str,
-    forked_from: Option<&str>,
-) -> QueryResult<Workflow> {
-    let now = now_millis();
-    diesel::insert_into(workflows::table)
-        .values(NewWorkflowRow {
-            id: Uuid::now_v7().to_string(),
-            project_id: project_id.map(|p| p.to_string()),
-            name: name.to_string(),
-            scope: scope.to_string(),
-            forked_from: forked_from.map(|f| f.to_string()),
-            created_at: now,
-            updated_at: now,
-        })
-        .returning(Workflow::as_returning())
-        .get_result(conn)
-}
-
-/// Fetch ONE workflow by id, or `None` when unknown.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn get_workflow(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<Workflow>> {
-    workflows::table
-        .find(id)
-        .select(Workflow::as_select())
-        .first(conn)
-        .optional()
-}
-
 // --- DESIGN-SYSTEM domain (v2.7 Phase 1, v30, PDR-0010) --------------------
 //
 // The design-system rapatriated NATIVELY as nyx's single authority (PRD Impl Decisions):
@@ -13884,206 +13486,6 @@ pub fn get_design(conn: &mut SqliteConnection, project_id: &str) -> QueryResult<
         .select(Design::as_select())
         .first(conn)
         .optional()
-}
-
-/// LIST workflows, newest-first. `project_id = Some(p)` returns that project's OWN workflows;
-/// `project_id = None` returns the BUILT-IN nyx defaults (the rows whose `project_id` IS NULL).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn list_workflows(
-    conn: &mut SqliteConnection,
-    project_id: Option<&str>,
-) -> QueryResult<Vec<Workflow>> {
-    let mut query = workflows::table.into_boxed();
-    match project_id {
-        Some(p) => query = query.filter(workflows::project_id.eq(p.to_string())),
-        None => query = query.filter(workflows::project_id.is_null()),
-    }
-    query
-        .order((workflows::created_at.desc(), workflows::id.desc()))
-        .select(Workflow::as_select())
-        .load(conn)
-}
-
-/// RESOLVE the ACTIVE workflow to run for `(project_id, scope)`: the project's OWN workflow of that
-/// scope (the most recent when several exist — the `created_at DESC` order of [`list_workflows`]
-/// makes this deterministic), else the built-in DEFAULT of that scope (`project_id IS NULL`). This
-/// is the single "which workflow does /ndev run" resolution — `run_start` calls it so the entry
-/// point never has to guess which of several project workflows to pick (v2.8 review S3).
-pub fn resolve_active_workflow(
-    conn: &mut SqliteConnection,
-    project_id: Option<&str>,
-    scope: &str,
-) -> QueryResult<Option<Workflow>> {
-    if let Some(pid) = project_id {
-        if let Some(wf) = list_workflows(conn, Some(pid))?
-            .into_iter()
-            .find(|w| w.scope == scope)
-        {
-            return Ok(Some(wf));
-        }
-    }
-    // The built-in FALLBACK is the SEEDED default of the scope — `forked_from IS NULL`. A stray
-    // unowned FORK of a seeded scope (a `project_id NULL` fork left over from before the fork guard)
-    // must NOT shadow it here, even though it is more recent (v2.8 review N4).
-    Ok(list_workflows(conn, None)?
-        .into_iter()
-        .find(|w| w.scope == scope && w.forked_from.is_none()))
-}
-
-/// SET (or clear) a workflow's ROOT node pointer, bumping `updated_at`. Called after the tree's
-/// nodes exist. Returns the updated row, or `None` when the id is unknown.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn set_workflow_root(
-    conn: &mut SqliteConnection,
-    workflow_id: &str,
-    root_node_id: Option<&str>,
-) -> QueryResult<Option<Workflow>> {
-    diesel::update(workflows::table.find(workflow_id))
-        .set((
-            workflows::root_node_id.eq(root_node_id.map(|r| r.to_string())),
-            workflows::updated_at.eq(now_millis()),
-        ))
-        .returning(Workflow::as_returning())
-        .get_result(conn)
-        .optional()
-}
-
-/// STAMP a built-in workflow's `builtin_revision` — the code revision that produced its stored tree,
-/// which the seeder compares at boot to decide whether to upgrade it (v2.8 review N11). Returns the
-/// number of rows updated (0 when the id is unknown).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn set_builtin_revision(
-    conn: &mut SqliteConnection,
-    workflow_id: &str,
-    revision: i32,
-) -> QueryResult<usize> {
-    diesel::update(workflows::table.find(workflow_id))
-        .set(workflows::builtin_revision.eq(Some(revision)))
-        .execute(conn)
-}
-
-/// STAMP a FORK's `forked_from_revision` — the SOURCE's [`Workflow::builtin_revision`] at the instant
-/// of the fork (migration v47). Written ONCE, by `workflow_fork`, in the same transaction as the copy;
-/// `None` when the source carries no revision (a fork of a fork / of a `custom` template), which reads
-/// as "no comparison possible". Returns the number of rows updated (0 when the id is unknown).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn set_forked_from_revision(
-    conn: &mut SqliteConnection,
-    workflow_id: &str,
-    revision: Option<i32>,
-) -> QueryResult<usize> {
-    diesel::update(workflows::table.find(workflow_id))
-        .set(workflows::forked_from_revision.eq(revision))
-        .execute(conn)
-}
-
-// --- command SLOTS: the per-project binding of a shared graph's gate (v46) ---
-//
-// A `gate_check` in a SHARED graph declares WHAT it needs verified (`config.slot`), never WHICH
-// command runs it — `bun test` is PROJECT data and the built-in belongs to every project. These rows
-// are the other half: what THIS project answers that slot with.
-
-/// A `command_slots` row — ONE project's answer to ONE slot. `command_ids` is stored as a JSON array
-/// string; read it through [`command_slot_ids`], which is the accessor the gate resolution uses.
-#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
-#[diesel(table_name = command_slots)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
-pub struct CommandSlot {
-    pub id: String,
-    pub project_id: String,
-    /// The slot NAME a graph node declares (`gate_check.config.slot`).
-    pub slot: String,
-    /// The managed-command INSTANCE ids, as a JSON array string (ORDER-preserving).
-    pub command_ids: String,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, Insertable)]
-#[diesel(table_name = command_slots)]
-struct NewCommandSlotRow {
-    id: String,
-    project_id: String,
-    slot: String,
-    command_ids: String,
-    created_at: i64,
-    updated_at: i64,
-}
-
-/// BIND (or re-bind) `slot` for `project_id` to `command_ids` — an UPSERT on the
-/// `UNIQUE(project_id, slot)` index, so binding twice REPLACES rather than accumulating (a project
-/// answers a slot exactly once). Returns the stored [`CommandSlot`].
-pub fn bind_command_slot(
-    conn: &mut SqliteConnection,
-    project_id: &str,
-    slot: &str,
-    command_ids: &[String],
-) -> QueryResult<CommandSlot> {
-    let now = now_millis();
-    let encoded = serde_json::to_string(command_ids).unwrap_or_else(|_| "[]".to_string());
-    diesel::insert_into(command_slots::table)
-        .values(NewCommandSlotRow {
-            id: Uuid::now_v7().to_string(),
-            project_id: project_id.to_string(),
-            slot: slot.to_string(),
-            command_ids: encoded.clone(),
-            created_at: now,
-            updated_at: now,
-        })
-        .on_conflict((command_slots::project_id, command_slots::slot))
-        .do_update()
-        .set((
-            command_slots::command_ids.eq(encoded),
-            command_slots::updated_at.eq(now),
-        ))
-        .returning(CommandSlot::as_returning())
-        .get_result(conn)
-}
-
-/// The managed-command instance ids `project_id` binds `slot` to — EMPTY when the project has no
-/// binding for it, when the project is unknown, or when the stored array is malformed. Empty is the
-/// UNBOUND answer, and a blocking gate on it refuses to advance exactly like a gate with no commands:
-/// there is no third state to distinguish, so the caller never has to.
-pub fn command_slot_ids(
-    conn: &mut SqliteConnection,
-    project_id: &str,
-    slot: &str,
-) -> QueryResult<Vec<String>> {
-    let stored: Option<String> = command_slots::table
-        .filter(command_slots::project_id.eq(project_id))
-        .filter(command_slots::slot.eq(slot))
-        .select(command_slots::command_ids)
-        .first(conn)
-        .optional()?;
-    Ok(stored
-        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
-        .unwrap_or_default())
-}
-
-/// LIST a project's slot bindings, oldest-first — the READ behind `slot_bind`'s answer (what this
-/// project now answers, all of it, so the caller can see the binding they just made in context).
-pub fn list_command_slots(
-    conn: &mut SqliteConnection,
-    project_id: &str,
-) -> QueryResult<Vec<CommandSlot>> {
-    command_slots::table
-        .filter(command_slots::project_id.eq(project_id))
-        .order((command_slots::slot.asc(), command_slots::id.asc()))
-        .select(CommandSlot::as_select())
-        .load(conn)
-}
-
-/// DELETE every node of a workflow — the tree wipe the seeder does before rebuilding a built-in at a
-/// newer revision (v2.8 review N11). Deleting the nodes SET-NULLs the workflow's `root_node_id` and
-/// any run's `current_node_id` (ON DELETE SET NULL) — a run mid-flight on a replaced built-in thus
-/// loses its cursor, and its stale `traversal` makes `build_engine` REFUSE the resume rather than
-/// replay from the root. Returns the number of nodes removed.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn delete_nodes_for_workflow(
-    conn: &mut SqliteConnection,
-    workflow_id: &str,
-) -> QueryResult<usize> {
-    diesel::delete(nodes::table.filter(nodes::workflow_id.eq(workflow_id))).execute(conn)
 }
 
 /// UPSERT the design-system of `project_id` (the "1 per project" invariant, PDR-0010): INSERT
@@ -15342,28 +14744,6 @@ pub fn archive_page_version(
         .optional()
 }
 
-/// SET (or clear) a workflow's owning PROJECT, bumping `updated_at`. This is the `workflow_assign`
-/// authoring verb's write: `Some(project)` BINDS the workflow to a project (the project↔workflow
-/// link — "which workflow this project uses" — the criterion calls `projects.workflow_id`, modelled
-/// as this inverse FK because a project uses SEVERAL scoped flows, so ownership lives on the
-/// workflow, not a single scalar on the project); `None` re-homes it to a built-in/global default.
-/// Returns the updated row, or `None` when the id is unknown.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn set_workflow_project(
-    conn: &mut SqliteConnection,
-    workflow_id: &str,
-    project_id: Option<&str>,
-) -> QueryResult<Option<Workflow>> {
-    diesel::update(workflows::table.find(workflow_id))
-        .set((
-            workflows::project_id.eq(project_id.map(|p| p.to_string())),
-            workflows::updated_at.eq(now_millis()),
-        ))
-        .returning(Workflow::as_returning())
-        .get_result(conn)
-        .optional()
-}
-
 /// A `prototype_variants` row: one concrete rendering of a (page, version). `Serialize` for the
 /// IPC/MCP boundary. `composition_json` is the component TREE (PDR-0010); `states_json` the
 /// declared states; `is_main` the AGENT's within-version recommendation (≠ the USER's RETENU).
@@ -15723,56 +15103,6 @@ pub fn ignore_feedback(
         .optional()
 }
 
-/// DELETE a workflow and (via ON DELETE CASCADE) all its nodes + runs. Returns whether a row was
-/// removed.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn delete_workflow(conn: &mut SqliteConnection, id: &str) -> QueryResult<bool> {
-    let n = diesel::delete(workflows::table.find(id)).execute(conn)?;
-    Ok(n > 0)
-}
-
-/// CREATE a node in `workflow_id`. `parent_id = None` makes it a root node; `order_index` is its
-/// position among its siblings; `node_type` is one of [`NODE_TYPES`]; `config` is the typed JSON
-/// object string (`"{}"` when none). Returns the created [`Node`]. The CHECK on `type` rejects an
-/// unknown type at the DB; JSON-shape validation is the interpreter/authoring layer's job.
-#[cfg_attr(not(test), allow(dead_code))]
-#[allow(clippy::too_many_arguments)]
-pub fn create_node(
-    conn: &mut SqliteConnection,
-    workflow_id: &str,
-    parent_id: Option<&str>,
-    order_index: i32,
-    node_type: &str,
-    label: &str,
-    config: &str,
-) -> QueryResult<Node> {
-    let now = now_millis();
-    diesel::insert_into(nodes::table)
-        .values(NewNodeRow {
-            id: Uuid::now_v7().to_string(),
-            workflow_id: workflow_id.to_string(),
-            parent_id: parent_id.map(|p| p.to_string()),
-            order_index,
-            type_: node_type.to_string(),
-            label: label.to_string(),
-            config: config.to_string(),
-            created_at: now,
-            updated_at: now,
-        })
-        .returning(Node::as_returning())
-        .get_result(conn)
-}
-
-/// Fetch ONE node by id, or `None` when unknown.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn get_node(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<Node>> {
-    nodes::table
-        .find(id)
-        .select(Node::as_select())
-        .first(conn)
-        .optional()
-}
-
 /// SET a comment's `anchor_status` — `anchored` (carried / "porté") or `orphaned` ("à
 /// ré-ancrer") — as a new round reconciles which tree nodes still exist. Returns the updated row
 /// or `None` when unknown. The durability-cross-rounds write (PDR-0009).
@@ -15929,650 +15259,6 @@ pub fn current_round(
         .select(PrototypeRound::as_select())
         .first(conn)
         .optional()
-}
-
-/// ALL nodes of a workflow, ordered by `(parent_id, order_index)` — a DETERMINISTIC full dump the
-/// interpreter reconstructs the tree from (root = the workflow's `root_node_id`, or the node whose
-/// `parent_id` IS NULL; a composite's ordered children = the rows with `parent_id = it`).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn list_nodes(conn: &mut SqliteConnection, workflow_id: &str) -> QueryResult<Vec<Node>> {
-    nodes::table
-        .filter(nodes::workflow_id.eq(workflow_id))
-        .order((nodes::parent_id.asc(), nodes::order_index.asc()))
-        .select(Node::as_select())
-        .load(conn)
-}
-
-/// The ORDERED children of a composite node (the rows with `parent_id = parent_id`, by
-/// `order_index`). The direct-child read the tree walk uses.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn child_nodes(conn: &mut SqliteConnection, parent_id: &str) -> QueryResult<Vec<Node>> {
-    nodes::table
-        .filter(nodes::parent_id.eq(parent_id))
-        .order(nodes::order_index.asc())
-        .select(Node::as_select())
-        .load(conn)
-}
-
-/// UPDATE a node's authoring fields (`label`, `config`) and bump `updated_at`. A `None` argument
-/// leaves that field unchanged. Returns the updated row, or `None` when the id is unknown.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn update_node(
-    conn: &mut SqliteConnection,
-    id: &str,
-    label: Option<&str>,
-    config: Option<&str>,
-) -> QueryResult<Option<Node>> {
-    // Apply the provided fields; always bump updated_at. Diesel needs the SET tuple typed, so
-    // fold the optional columns into separate updates rather than a dynamic set.
-    if let Some(label) = label {
-        diesel::update(nodes::table.find(id))
-            .set((
-                nodes::label.eq(label.to_string()),
-                nodes::updated_at.eq(now_millis()),
-            ))
-            .execute(conn)?;
-    }
-    if let Some(config) = config {
-        diesel::update(nodes::table.find(id))
-            .set((
-                nodes::config.eq(config.to_string()),
-                nodes::updated_at.eq(now_millis()),
-            ))
-            .execute(conn)?;
-    }
-    if label.is_none() && config.is_none() {
-        diesel::update(nodes::table.find(id))
-            .set(nodes::updated_at.eq(now_millis()))
-            .execute(conn)?;
-    }
-    get_node(conn, id)
-}
-
-/// Set a node's sibling `order_index` (reorder), bumping `updated_at`. Returns the updated row,
-/// or `None` when the id is unknown.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn set_node_order(
-    conn: &mut SqliteConnection,
-    id: &str,
-    order_index: i32,
-) -> QueryResult<Option<Node>> {
-    diesel::update(nodes::table.find(id))
-        .set((
-            nodes::order_index.eq(order_index),
-            nodes::updated_at.eq(now_millis()),
-        ))
-        .returning(Node::as_returning())
-        .get_result(conn)
-        .optional()
-}
-
-/// Set a node's POSITION — both its `parent_id` (reparent, `None` = make it a root) and its
-/// sibling `order_index` — bumping `updated_at`. This is the authoring `node_reorder`'s move
-/// primitive: a plain order change passes the node's CURRENT parent; a reparent passes the new
-/// one. The resulting tree's COHERENCE (no cycle, no leaf-with-children) is validated ABOVE this
-/// low-level write, in the authoring layer's transaction. Returns the updated row, or `None` when
-/// the id is unknown.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn set_node_position(
-    conn: &mut SqliteConnection,
-    id: &str,
-    parent_id: Option<&str>,
-    order_index: i32,
-) -> QueryResult<Option<Node>> {
-    diesel::update(nodes::table.find(id))
-        .set((
-            nodes::parent_id.eq(parent_id.map(|p| p.to_string())),
-            nodes::order_index.eq(order_index),
-            nodes::updated_at.eq(now_millis()),
-        ))
-        .returning(Node::as_returning())
-        .get_result(conn)
-        .optional()
-}
-
-/// DELETE a node and (via ON DELETE CASCADE on `parent_id`) its whole subtree. Returns whether a
-/// row was removed.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn delete_node(conn: &mut SqliteConnection, id: &str) -> QueryResult<bool> {
-    let n = diesel::delete(nodes::table.find(id)).execute(conn)?;
-    Ok(n > 0)
-}
-
-/// CREATE a workflow run (status `running`). `spec_id` ties it to the Spec it drives (`None` =
-/// unbound); `current_node_id` is the initial cursor (usually the workflow's root, or `None`);
-/// `blackboard` is the initial JSON board (`"{}"` when empty). Returns the created [`WorkflowRun`].
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn create_workflow_run(
-    conn: &mut SqliteConnection,
-    workflow_id: &str,
-    spec_id: Option<&str>,
-    current_node_id: Option<&str>,
-    blackboard: &str,
-) -> QueryResult<WorkflowRun> {
-    let now = now_millis();
-    diesel::insert_into(workflow_runs::table)
-        .values(NewWorkflowRunRow {
-            id: Uuid::now_v7().to_string(),
-            workflow_id: workflow_id.to_string(),
-            spec_id: spec_id.map(|s| s.to_string()),
-            current_node_id: current_node_id.map(|n| n.to_string()),
-            blackboard: blackboard.to_string(),
-            status: RUN_STATUS_RUNNING.to_string(),
-            started_at: now,
-            updated_at: now,
-        })
-        .returning(WorkflowRun::as_returning())
-        .get_result(conn)
-}
-
-/// ANCHOR a run on the dev WORKSPACE it was opened against (`workflow_runs.workspace_id`). Called by
-/// `run_start` once the workspace is resolved (from an explicit `workspace_id` / the `cwd`);
-/// `apply_transition` then reads it back at the entry `start` transition to pose the Spec's anchor in
-/// the same op (v2.8 review N24). Returns the number of rows updated (0 when the id is unknown OR the
-/// run is already anchored).
-///
-/// Anchors an UNANCHORED run ONLY (`workspace_id IS NULL` in the WHERE), same shape as
-/// [`set_run_spec`]: `run_start` is idempotent (N20), so a second call on the same pair resumes the
-/// SAME run and would otherwise MOVE its anchor to whatever cwd that caller happened to sit in.
-/// Posing a missing anchor is a fact the run was lacking; changing one it already carries is a
-/// different decision, and this authority refuses it — 0 rows, nothing overwritten, even against a
-/// concurrent caller.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn set_run_workspace(
-    conn: &mut SqliteConnection,
-    run_id: &str,
-    workspace_id: &str,
-) -> QueryResult<usize> {
-    diesel::update(
-        workflow_runs::table
-            .find(run_id)
-            .filter(workflow_runs::workspace_id.is_null()),
-    )
-    .set((
-        workflow_runs::workspace_id.eq(workspace_id),
-        workflow_runs::updated_at.eq(now_millis()),
-    ))
-    .execute(conn)
-}
-
-/// BIND a run to the Spec it drives (`workflow_runs.spec_id`) — the LATE binding an authoring flow
-/// needs: a `/nspec` run legitimately starts with NO Spec (its graph CREATES one), and until it is
-/// bound every Spec fact the graph reads is inert (`spec_status` → null, `spec_open_tasks` → 0) and
-/// every transition it applies lands on nothing. Called right after the Spec is created, from the
-/// run of the session that created it (F5).
-///
-/// Binds an UNBOUND run ONLY (`spec_id IS NULL` in the WHERE): a run already bound is left strictly
-/// alone — 0 rows, no re-bind, nothing stolen — so the guard holds even against a concurrent caller.
-/// Returns the number of rows updated (0 when the id is unknown OR the run already carries a Spec).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn set_run_spec(
-    conn: &mut SqliteConnection,
-    run_id: &str,
-    spec_id: &str,
-) -> QueryResult<usize> {
-    diesel::update(workflow_runs::table.find(run_id).filter(workflow_runs::spec_id.is_null()))
-        .set((
-            workflow_runs::spec_id.eq(spec_id),
-            workflow_runs::updated_at.eq(now_millis()),
-        ))
-        .execute(conn)
-}
-
-/// ANCHOR a child run on the PARENT run a `sub_workflow` node opened it FROM
-/// (`workflow_runs.parent_run_id`). Called by the `nyx_next` sub_workflow drive right after the child
-/// run is created — the provenance link that ties an isolated child back to its parent (v2.8 lot 2).
-/// Returns the number of rows updated (0 when the id is unknown).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn set_run_parent(
-    conn: &mut SqliteConnection,
-    run_id: &str,
-    parent_run_id: &str,
-) -> QueryResult<usize> {
-    diesel::update(workflow_runs::table.find(run_id))
-        .set((
-            workflow_runs::parent_run_id.eq(parent_run_id),
-            workflow_runs::updated_at.eq(now_millis()),
-        ))
-        .execute(conn)
-}
-
-// --- HUMAN CONSENT: the one answer an agent cannot produce (H6) ------------
-//
-// An `ask_human` is answered by the DISPATCHER: it reports `{"decision":"yes"}` and the engine
-// folds it. For most questions that is right — the agent relays what the human said. For the
-// question that gates an ENGAGING Spec transition (ready / done / cancel) it is not: the engine
-// receives a string and cannot tell a human's decision from an agent's claim about one. Observed
-// live, a session answered `yes` "on the user's behalf" — because the user had said, ONE TURN
-// EARLIER, what they would answer — and a Spec reached `ready` they never validated.
-//
-// The missing fact is precise, and it is not "who typed the string": it is that NO HUMAN TURN
-// happened between the question being posed and the answer being reported. So the question is
-// RECORDED here, NAMING the last human turn nyx knew of at the moment it was posed
-// ([`HumanTurn`]); the answer still travels the ordinary `ask_human` route, and `nyx_next` refuses
-// it unless the last known turn is a DIFFERENT one. This column is the ASK RECEIPT, not an answer
-// channel — nothing but the engine ever writes it.
-//
-// BOTH SIDES OF THAT COMPARISON ARE ROWS, and that is the point. The ledger used to be a COUNTER
-// held in memory and dropped at `SessionEnd`, compared against this PERSISTED receipt — two
-// different lifetimes. A `claude -p` invocation is a whole session (start, one prompt, end), so the
-// counter restarted at zero on each one while the receipt still held a number from the previous
-// one: the same run, answered from `claude -p --resume`, was refused on two authentic answers in a
-// row, and — the silent half — numbers from two lifetimes can just as well compare "greater" and
-// accept an answer nobody gave. Naming the turn instead of counting turns removes the arithmetic
-// altogether: either the last turn is the one that stood at the asking, or it is another one.
-//
-// AND ONE TURN AUTHORISES ONE COMMITMENT. Naming it is not enough on its own, because nothing SPENT
-// it: two runs parked on a commitment question from the SAME terminal each named the turn standing at
-// their own asking, the human typed ONCE, and both then read a last turn different from theirs —
-// both accepted. One sentence carried two Spec commitments, the second of them exactly what this
-// mechanism exists to refuse, an answer nobody gave to that question. So accepting MARKS the turn it
-// spent ([`HumanTurn::consumed_by`]), and the marking is a CONDITIONAL write inside the very
-// transaction that closes the question ([`close_run_consent`]): of two runs reaching it on one turn,
-// exactly one writes, and the other is told what became of the words it was relaying.
-
-/// The consent question a run is parked on — decoded from `workflow_runs.pending_consent` (H6).
-///
-/// It records that nyx ASKED, and what it knew about the asking session at that instant. There is no
-/// `answer` field: the human answers in the conversation and the dispatcher relays it like any other
-/// `ask_human`, so the row's whole job is to let the tick that receives that answer check it against
-/// [`Self::human_turn_at_ask`].
-///
-/// `options` is carried WITH the question rather than re-read from the graph, so the audit row
-/// quotes what was actually put to the human even if the node is edited under a parked run.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PendingConsent {
-    /// The `ask_human` node the run is parked on — an answer belongs to THIS question and no other.
-    pub node_id: String,
-    /// The question as the human reads it (already interpolated against the run's blackboard).
-    pub prompt: String,
-    /// The CLOSED answer set the question was put with.
-    pub options: Vec<String>,
-    pub asked_at: i64,
-    /// The terminal of the session the question was POSED to — the `X-Nyx-Terminal-Id` the
-    /// `nyx_next` call carried. It is what [`open_run_consent`] re-arms on: the question belongs to
-    /// the session it is put to, and only that session's human can settle it.
-    ///
-    /// `None` is a receipt posed to NO session, which no human turn can ever satisfy (the ledger is
-    /// keyed by terminal, so there is nothing to read). nyx refuses to open one — a tick carrying no
-    /// terminal is refused AT the question — and re-arms a stored one onto the session that next
-    /// picks the run up, so such a receipt is a repairable state and never a run's dead end.
-    pub terminal_id: Option<String>,
-    /// WHICH human turn was the last one nyx knew of on that terminal when the question was posed
-    /// ([`HumanTurn::turn_id`]) — `None` when it knew of none. The answer is accepted only if the
-    /// last known turn is a DIFFERENT one when it arrives: the person typed something in between.
-    ///
-    /// An IDENTITY, not a count and not a clock. A count only means anything within one process's
-    /// lifetime and this row outlives several; two millisecond stamps can tie. Two ids either match
-    /// or they do not, whatever happened to the sidecar or the session in between.
-    pub human_turn_at_ask: Option<String>,
-}
-
-impl PendingConsent {
-    /// The question a run carries, or `None` when it is waiting on no human (or the column holds
-    /// something undecodable — an unreadable question is no question, and the engine re-opens it).
-    pub fn of(run: &WorkflowRun) -> Option<PendingConsent> {
-        serde_json::from_str(run.pending_consent.as_deref()?).ok()
-    }
-}
-
-/// The LAST prompt a HUMAN submitted on a terminal — one row per terminal (`human_turns`, v48).
-///
-/// This is the one fact on the MCP dispatch path an agent cannot manufacture: the `UserPromptSubmit`
-/// hook fires when the PERSON presses enter, and no tool call produces it. It is what settles a
-/// question a message cannot — "did the human answer, or did the session answer in their place?" —
-/// and the orchestration engine reads it before it lets an answer commit ([`crate::mcp_engine`], H6).
-///
-/// PERSISTED, unlike the live activity dot ([`crate::agent_activity`], which is runtime-only by
-/// design): a `claude -p` invocation is a whole session, so a ledger that died with the session died
-/// between a question and its answer. What it records is deliberately thin — the LAST turn only. The
-/// history of what a human typed is not nyx's to keep, and the one prompt that ever matters (the
-/// words that authorised a consent) is journaled into the outbox when it is spent.
-#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, Insertable)]
-#[diesel(table_name = human_turns)]
-pub struct HumanTurn {
-    pub terminal_id: String,
-    /// The turn's IDENTITY — Claude Code's `prompt_id` when the hook carries one, else an id nyx
-    /// generated. All the consent check asks of it is that a NEW prompt reads DIFFERENT.
-    pub turn_id: String,
-    /// The raw text of the prompt, kept so an accepted consent is journaled with the very words.
-    pub prompt: String,
-    pub submitted_at: i64,
-    /// The RUN whose commitment this turn has already authorised — `None` while nobody has spent it
-    /// (v49). One turn authorises ONE commitment, so this is what a second run's answer runs into.
-    ///
-    /// The run id is the commitment's identity; the WORDS of the question it settled are in the
-    /// outbox (`run.consent_answered`), so nothing of them is copied here.
-    pub consumed_by: Option<String>,
-}
-
-/// RECORD that the human submitted `prompt` on `terminal_id` — the `UserPromptSubmit` hook's write.
-/// UPSERT: the terminal's row IS its last turn, so a new prompt replaces the previous one.
-///
-/// `turn_id` is the identity the consent check compares: the provider's own prompt id when the hook
-/// carries one (Claude Code sends `prompt_id`), `None` when it does not — nyx then mints one, since
-/// all the check asks of it is that a NEW prompt reads DIFFERENT from the previous. Re-delivering
-/// the SAME `turn_id` (a hook POST that landed twice) rewrites the same row and moves nothing, so a
-/// duplicate delivery can never manufacture a turn nobody took.
-///
-/// Which is also why the CONSUMPTION mark follows the identity and not the row: a NEW turn replaces
-/// the row and lands UNSPENT, while a re-delivery keeps whatever the row already carries. Clearing it
-/// on every write would let a duplicated hook POST hand a spent turn back unspent — the same forgery
-/// the identity check refuses, through the write path instead of the read one.
-pub fn record_human_turn(
-    conn: &mut SqliteConnection,
-    terminal_id: &str,
-    turn_id: Option<&str>,
-    prompt: &str,
-) -> QueryResult<HumanTurn> {
-    conn.transaction(|conn| {
-        let turn_id = turn_id
-            .map(str::to_string)
-            .unwrap_or_else(|| Uuid::now_v7().to_string());
-        let turn = HumanTurn {
-            consumed_by: last_human_turn(conn, terminal_id)?
-                .filter(|previous| previous.turn_id == turn_id)
-                .and_then(|previous| previous.consumed_by),
-            terminal_id: terminal_id.to_string(),
-            turn_id,
-            prompt: prompt.to_string(),
-            submitted_at: now_millis(),
-        };
-        diesel::insert_into(human_turns::table)
-            .values(&turn)
-            .on_conflict(human_turns::terminal_id)
-            .do_update()
-            .set((
-                human_turns::turn_id.eq(&turn.turn_id),
-                human_turns::prompt.eq(&turn.prompt),
-                human_turns::submitted_at.eq(turn.submitted_at),
-                human_turns::consumed_by.eq(&turn.consumed_by),
-            ))
-            .returning(HumanTurn::as_returning())
-            .get_result(conn)
-    })
-}
-
-/// The LAST human turn nyx knows of on `terminal_id`, or `None` when it knows of none — a terminal
-/// nobody has typed into, or one nyx never saw a prompt from. `None` is a VERDICT ("no proof of a
-/// human turn"), not a missing value, and every caller reads it the same way.
-pub fn last_human_turn(
-    conn: &mut SqliteConnection,
-    terminal_id: &str,
-) -> QueryResult<Option<HumanTurn>> {
-    human_turns::table
-        .find(terminal_id)
-        .select(HumanTurn::as_select())
-        .first(conn)
-        .optional()
-}
-
-/// The `aggregate`-`run` event recording that nyx ASKED the human a gating question.
-pub const EVENT_RUN_CONSENT_ASKED: &str = "run.consent_asked";
-/// The `aggregate`-`run` event recording that the human's answer was ACCEPTED and folded.
-pub const EVENT_RUN_CONSENT_ANSWERED: &str = "run.consent_answered";
-
-/// OPEN (or re-read) the consent question `run_id` is parked on — called by the engine when the run
-/// suspends on an `ask_human` that gates an engaging transition. The receipt is kept for the SAME
-/// node ASKED OF THE SAME SESSION, and re-armed otherwise.
-///
-/// # Why the reference must FREEZE for the session being asked
-///
-/// A dispatcher waiting on the human POLLS `nyx_next`, and every poll re-poses the question. If each
-/// one re-read the ledger, the reference would follow the human: they type (last turn = B), the next
-/// poll re-arms the reference to B, and the answer then compares B against B and is refused — the
-/// question would be unanswerable by design. So for the session the question is already posed to,
-/// `human_turn_at_ask` stays the one from the first asking, which is the turn the answer must come
-/// after; the outbox likewise records the asking ONCE however many times the dispatcher polls.
-///
-/// # Why it must NOT freeze for anyone else
-///
-/// The question belongs to whoever it is PUT TO — its answer is checked against THAT terminal's
-/// ledger. A receipt naming another session (or no session at all, which no ledger can ever satisfy)
-/// therefore holds a reference the caller now being asked can never move: the question is re-posed to
-/// them, so it is re-armed on them, and THEIR next turn is what must follow. Without that, a run
-/// whose question was first asked by a caller nyx could not attribute stayed unanswerable for good,
-/// and the Spec behind it unfinishable.
-///
-/// A question for a DIFFERENT node replaces the one on the row: a run parks on one leaf at a time,
-/// and the previous question — whose leaf the walk has left — is no longer answerable.
-pub fn open_run_consent(
-    conn: &mut SqliteConnection,
-    run_id: &str,
-    node_id: &str,
-    prompt: &str,
-    options: &[String],
-    terminal_id: &str,
-    human_turn_at_ask: Option<&str>,
-) -> QueryResult<PendingConsent> {
-    conn.transaction(|conn| {
-        let Some(run) = get_workflow_run(conn, run_id)? else {
-            return Err(diesel::result::Error::NotFound);
-        };
-        if let Some(pending) = PendingConsent::of(&run)
-            .filter(|p| p.node_id == node_id && p.terminal_id.as_deref() == Some(terminal_id))
-        {
-            return Ok(pending);
-        }
-        let consent = PendingConsent {
-            node_id: node_id.to_string(),
-            prompt: prompt.to_string(),
-            options: options.to_vec(),
-            asked_at: now_millis(),
-            terminal_id: Some(terminal_id.to_string()),
-            human_turn_at_ask: human_turn_at_ask.map(str::to_string),
-        };
-        let stored = write_run_consent(conn, run_id, Some(&consent))?;
-        record_run_consent_event(conn, &stored, EVENT_RUN_CONSENT_ASKED, &consent, None)?;
-        Ok(consent)
-    })
-}
-
-/// What became of an answer relayed to a consent question — the verdict of [`close_run_consent`].
-///
-/// A verdict rather than a `bool` (or a silent `Ok(())`) because the three refusals are three
-/// different situations and the session must be told WHICH: what makes progress differs, and a
-/// message that describes the wrong one sends a well-meaning session looking for a bug in nyx.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConsentClose {
-    /// A human turn nyx witnessed stood behind the answer and NOBODY had spent it. The turn is now
-    /// spent on this run, the question is closed, the acceptance journaled — carrying the turn that
-    /// paid for it, whose raw words are the audit row.
-    Accepted(HumanTurn),
-    /// Nobody typed on the receipt's terminal since the question was posed — carrying the last turn
-    /// nyx holds there, `None` when it holds none at all (or the question was posed to no session).
-    NoTurnSince(Option<HumanTurn>),
-    /// The human DID speak since the asking — and those words have ALREADY been accepted as the
-    /// answer to another run's consent question. One turn authorises one commitment.
-    TurnAlreadySpent {
-        turn: HumanTurn,
-        /// The run whose commitment that turn paid for.
-        on_run: String,
-    },
-    /// The run carries NO receipt: nyx has no record of having asked, so it cannot tell what this
-    /// answer answers. Nothing was written — a close that finds nothing to close is not a success.
-    NoReceipt,
-}
-
-/// CLOSE the run's consent question with the answer relayed for it: SPEND the human turn behind it,
-/// drop the receipt and journal the acceptance — or say why none of that happened.
-///
-/// # Why the DECISION lives here and not in the caller
-///
-/// The check reads the ledger and the acceptance writes to it, and the two are one fact: a turn is
-/// spendable, and spending it is what makes it unspendable for the next question. Split across a read
-/// in the tick and a write here, two runs both read "unspent" and both write — which is the very
-/// defect this closes, returned through a smaller window. So the WHOLE verdict is taken inside ONE
-/// transaction: the receipt is read from the row, that terminal's ledger with it, the turn is marked
-/// spent and the question closed, all or nothing. What the caller keeps is the DECISION TO ASK — the
-/// tick decides that this answer needs a human behind it
-/// ([`crate::engine::Tree::ask_human_commitment`]); this decides whether one is.
-///
-/// The comparison: the last turn on the terminal the question was POSED to, its IDENTITY against the
-/// one that stood at the asking, AND its submission time against the asking time (review A11 — the
-/// identity alone accepted a turn that predated the question). A receipt naming no terminal has no
-/// ledger to read and can be satisfied by nothing — which is why nyx refuses to open one.
-///
-/// WHAT IT PROVES, STATED PLAINLY: that a human SPOKE on the asked session after being asked, and
-/// that nobody else has spent those words. NOT that they answered the question — nyx does not read
-/// the turn's meaning, and a guard that tried would be a judge in disguise. See the comparison site
-/// for what that costs and why it is the right trade.
-pub fn close_run_consent(
-    conn: &mut SqliteConnection,
-    run_id: &str,
-    answer: &str,
-) -> QueryResult<ConsentClose> {
-    conn.transaction(|conn| {
-        let Some(run) = get_workflow_run(conn, run_id)? else {
-            return Err(diesel::result::Error::NotFound);
-        };
-        let Some(consent) = PendingConsent::of(&run) else {
-            return Ok(ConsentClose::NoReceipt);
-        };
-        let last = match consent.terminal_id.as_deref() {
-            Some(terminal_id) => last_human_turn(conn, terminal_id)?,
-            None => None,
-        };
-        // A turn nyx knows of, NOT the one that stood when the question was posed, AND submitted
-        // after the question was put. Two conditions, and the second is what review A11 added.
-        //
-        // WHAT THIS CHECKS, AND WHAT IT DOES NOT. It checks that a human SPOKE, on the session that
-        // was asked, after being asked. It does NOT check that what they said ANSWERS the question —
-        // no guard can, and one that tried would be an LLM judge in disguise, failing opaquely. The
-        // audit accepted an `abandon` backed by a turn reading "reprend"; that is the structural
-        // limit, and it is named in the prose rather than papered over.
-        //
-        // What WAS wrong is that the identity comparison alone let an ANTERIOR turn through: it
-        // answers "is this a different turn from the reference?", and the reference can be stale or
-        // absent (a receipt re-armed onto a session nyx had never seen a prompt from carries
-        // `human_turn_at_ask = None`, which any turn already on the ledger differs from). Comparing
-        // the SUBMISSION TIME to the ASKING TIME is verifiable, cheap, and says exactly the thing the
-        // guard is named for.
-        //
-        // `>=` and not `>`: both stamps come from `now_millis()`, and a turn recorded in the same
-        // millisecond as the asking is one the asking's own ledger read did not see — so it is after
-        // it. The identity check remains the tiebreaker for that millisecond.
-        let turn = match last {
-            Some(turn)
-                if Some(&turn.turn_id) != consent.human_turn_at_ask.as_ref()
-                    && turn.submitted_at >= consent.asked_at =>
-            {
-                turn
-            }
-            other => return Ok(ConsentClose::NoTurnSince(other)),
-        };
-        // …and those words must still be UNSPENT. Read in THIS transaction and marked in it, so the
-        // gap the caller's read left is gone: a second run reading the same row either reads it
-        // before this commits — and then its own write is the one SQLite refuses — or reads it after,
-        // and gets here.
-        if let Some(on_run) = turn.consumed_by.clone() {
-            return Ok(ConsentClose::TurnAlreadySpent { turn, on_run });
-        }
-        diesel::update(human_turns::table.find(&turn.terminal_id))
-            .set(human_turns::consumed_by.eq(run_id))
-            .execute(conn)?;
-        let cleared = write_run_consent(conn, run_id, None)?;
-        record_run_consent_event(
-            conn,
-            &cleared,
-            EVENT_RUN_CONSENT_ANSWERED,
-            &consent,
-            Some((answer, &turn.prompt)),
-        )?;
-        Ok(ConsentClose::Accepted(turn))
-    })
-}
-
-/// Write (or clear) `workflow_runs.pending_consent`, returning the updated row. `updated_at` is
-/// bumped: asking a human and being answered are both movements of the run.
-fn write_run_consent(
-    conn: &mut SqliteConnection,
-    run_id: &str,
-    consent: Option<&PendingConsent>,
-) -> QueryResult<WorkflowRun> {
-    let json = match consent {
-        Some(c) => Some(serde_json::to_string(c).map_err(|e| {
-            diesel::result::Error::SerializationError(Box::new(std::io::Error::other(
-                e.to_string(),
-            )))
-        })?),
-        None => None,
-    };
-    diesel::update(workflow_runs::table.find(run_id))
-        .set((
-            workflow_runs::pending_consent.eq(json),
-            workflow_runs::updated_at.eq(now_millis()),
-        ))
-        .returning(WorkflowRun::as_returning())
-        .get_result(conn)
-}
-
-/// Journal ONE consent step in the `domain_events` outbox, INSIDE the caller's transaction — the
-/// question ASKED and, later, the answer ACCEPTED, so a Spec's consent history is readable after the
-/// fact and not only inferable from the state it produced. `answered` carries the answer and the RAW
-/// human prompt that authorised it (`None` for the asking row).
-///
-/// Like [`record_run_tick_event`], a run that resolves to NO project is not journaled (the outbox
-/// column is not nullable and inventing a project would file a row nobody can scope).
-fn record_run_consent_event(
-    conn: &mut SqliteConnection,
-    run: &WorkflowRun,
-    event_type: &str,
-    consent: &PendingConsent,
-    answered: Option<(&str, &str)>,
-) -> QueryResult<()> {
-    let Some(project_id) = run_project(conn, run)? else {
-        return Ok(());
-    };
-    let mut payload = serde_json::Map::new();
-    payload.insert("run_id".into(), run.id.clone().into());
-    payload.insert("node_id".into(), consent.node_id.clone().into());
-    payload.insert("prompt".into(), consent.prompt.clone().into());
-    payload.insert("options".into(), consent.options.clone().into());
-    if let Some(spec_id) = &run.spec_id {
-        payload.insert("spec_id".into(), spec_id.clone().into());
-    }
-    if let Some((answer, human_prompt)) = answered {
-        payload.insert("answer".into(), answer.into());
-        // The words the human actually typed on the turn nyx accepted as the authorisation. Stored
-        // VERBATIM: paraphrasing it here would leave the dispute it exists to settle unsettleable.
-        payload.insert("human_prompt".into(), human_prompt.into());
-    }
-    record_domain_event(
-        conn,
-        NewDomainEvent {
-            project_id,
-            workspace_id: run.workspace_id.clone(),
-            aggregate: AGGREGATE_RUN.to_string(),
-            event_type: event_type.to_string(),
-            // Both rows come from the `nyx_next` tick — the ask when the run parks, the answer when
-            // the dispatcher relays one nyx accepted. The AUTHORITY behind the answer is not the
-            // source but `human_prompt`: the turn the person took.
-            source: "mcp".to_string(),
-            actor: None,
-            payload: serde_json::Value::Object(payload).to_string(),
-            created_at: 0,
-        },
-    )?;
-    Ok(())
-}
-
-/// Fetch ONE workflow run by id, or `None` when unknown.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn get_workflow_run(conn: &mut SqliteConnection, id: &str) -> QueryResult<Option<WorkflowRun>> {
-    workflow_runs::table
-        .find(id)
-        .select(WorkflowRun::as_select())
-        .first(conn)
-        .optional()
-}
-
-/// DELETE ONE workflow run by id. Returns whether a row was removed (a `run_delete` on an unknown id
-/// is a no-op reporting `false`). A run is a leaf (nothing references it), so this cascades nothing —
-/// it is the way to clean up a run opened by mistake, incl. one on a built-in flow (v2.8 review N5).
-pub fn delete_workflow_run(conn: &mut SqliteConnection, id: &str) -> QueryResult<bool> {
-    let n = diesel::delete(workflow_runs::table.find(id)).execute(conn)?;
-    Ok(n > 0)
 }
 
 /// Fetch ONE round by id, or `None` when unknown.
@@ -16740,162 +15426,6 @@ pub fn get_round_page(
         .optional()
 }
 
-/// LIST the runs of a workflow, newest-first.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn list_workflow_runs(
-    conn: &mut SqliteConnection,
-    workflow_id: &str,
-) -> QueryResult<Vec<WorkflowRun>> {
-    workflow_runs::table
-        .filter(workflow_runs::workflow_id.eq(workflow_id))
-        .order((workflow_runs::started_at.desc(), workflow_runs::id.desc()))
-        .select(WorkflowRun::as_select())
-        .load(conn)
-}
-
-/// LIST the runs bound to a SPEC, across EVERY workflow, newest-first. `list_workflow_runs` answers
-/// "the runs of this workflow" and `find_runs_for_spec` "the runs of this workflow FOR this Spec";
-/// neither answers "the runs of THIS Spec" — what the Spec-side runtime view (the run modal opened
-/// from `/work/$specId` and the dev overlay) needs, since a Spec is driven by an ndev run AND by the
-/// coder/judge CHILD workflow runs it spawns. Unknown Spec ⇒ an empty list (never an error).
-///
-/// NEWEST-FIRST IS BY `started_at`, AND NOT EVERY CALLER KEEPS IT: `mcp_context::spec_live_runs`
-/// drops the terminal rows and RE-SORTS what is left by LAST ACTIVITY, because the `Run     :`
-/// header's question is "who is still moving?" and its cap must drop the runs nobody has touched in
-/// longest. This order is the one the UI reads; that one is the header's.
-pub fn list_runs_for_spec(
-    conn: &mut SqliteConnection,
-    spec_id: &str,
-) -> QueryResult<Vec<WorkflowRun>> {
-    workflow_runs::table
-        .filter(workflow_runs::spec_id.eq(spec_id))
-        .order((workflow_runs::started_at.desc(), workflow_runs::id.desc()))
-        .select(WorkflowRun::as_select())
-        .load(conn)
-}
-
-/// The `blocked` runs nothing has touched since `not_moved_since` (a millisecond timestamp),
-/// OLDEST-FIRST — the corpses `run_start` reports to the human (H14).
-///
-/// `blocked` is a NOMINAL, transient state: a run parks there on a red gate and re-runs that gate on
-/// its next tick (M5), so the status alone says nothing. What separates a run someone is about to
-/// come back to from one nobody ever will is TIME, and nothing else — hence the cutoff, and hence the
-/// caller's ownership of it (the policy is a product decision, the query is not). It spans EVERY
-/// workflow and both bound and unbound runs, since the point is to enumerate what a human has left
-/// behind, wherever they left it.
-///
-/// It DELETES nothing. A blocked run is still the human's, and the only thing missing was that
-/// somebody said it was there.
-pub fn blocked_runs_untouched_since(
-    conn: &mut SqliteConnection,
-    not_moved_since: i64,
-) -> QueryResult<Vec<WorkflowRun>> {
-    workflow_runs::table
-        .filter(workflow_runs::status.eq(RUN_STATUS_BLOCKED))
-        .filter(workflow_runs::updated_at.le(not_moved_since))
-        .order((workflow_runs::updated_at.asc(), workflow_runs::id.asc()))
-        .select(WorkflowRun::as_select())
-        .load(conn)
-}
-
-/// FIND the runs of a `(workflow_id, spec_id)` pair, newest-first — the finder N20 needs to converge
-/// `run_start` to AT MOST ONE live run per pair. `spec_id` `None` ENUMERATES the workflow's UNBOUND
-/// runs (`spec_id IS NULL`), distinct from a run bound to some Spec; those are independent sessions
-/// and never converge (see [`start_or_resume_workflow_run`]), so that form only ever OBSERVES them.
-pub fn find_runs_for_spec(
-    conn: &mut SqliteConnection,
-    workflow_id: &str,
-    spec_id: Option<&str>,
-) -> QueryResult<Vec<WorkflowRun>> {
-    let mut q = workflow_runs::table
-        .filter(workflow_runs::workflow_id.eq(workflow_id))
-        .into_boxed();
-    q = match spec_id {
-        Some(sid) => q.filter(workflow_runs::spec_id.eq(sid.to_string())),
-        None => q.filter(workflow_runs::spec_id.is_null()),
-    };
-    q.order((workflow_runs::started_at.desc(), workflow_runs::id.desc()))
-        .select(WorkflowRun::as_select())
-        .load(conn)
-}
-
-/// N20 — CONVERGE the runs of a `(workflow_id, spec_id)` pair to EXACTLY ONE live run, in ONE
-/// transaction — the idempotent `run_start`. When a RESUMABLE (non-terminal) run exists, RETURN the
-/// MOST RECENT one and DELETE every OTHER run of the pair (older resumable duplicates + terminal
-/// ones) — same run_id, no new row; otherwise (only terminal runs, or none) DELETE the stale run(s)
-/// and CREATE a fresh one. Returns `(run, created)` — `created` is `true` ONLY on the fresh-creation
-/// path, so the caller anchors the workspace (N24) only on a new run and a resume re-runs no start
-/// effect.
-///
-/// AN UNBOUND RUN IS NEVER A RESUME CANDIDATE. The convergence is keyed on the SPEC because the Spec
-/// IS the run's identity: two dispatchers pointed at one Spec are working the same thing, and that is
-/// what N20 refuses to open twice. A run with `spec_id IS NULL` carries no such identity, so the pair
-/// `(workflow, NULL)` is not an identity but a single global SLOT — and an authoring flow is a
-/// BUILT-IN (`project_id IS NULL`), so that slot is shared by every project of the installation. Any
-/// unfinished authoring run held it: the next `/nspec`, in any project, on any subject, resumed a
-/// stranger's abandoned session instead of opening its own. Unbound therefore ALWAYS creates, and
-/// deletes nothing — the other unbound runs are other sessions, not duplicates of this one.
-pub fn start_or_resume_workflow_run(
-    conn: &mut SqliteConnection,
-    workflow_id: &str,
-    spec_id: Option<&str>,
-    current_node_id: Option<&str>,
-    blackboard: &str,
-) -> QueryResult<(WorkflowRun, bool)> {
-    let Some(spec_id) = spec_id else {
-        let fresh = create_workflow_run(conn, workflow_id, None, current_node_id, blackboard)?;
-        return Ok((fresh, true));
-    };
-    let spec_id = Some(spec_id);
-    conn.transaction(|conn| {
-        let existing = find_runs_for_spec(conn, workflow_id, spec_id)?;
-        // Newest-first, so the FIRST non-terminal run is the most recent resumable one.
-        match existing
-            .iter()
-            .find(|r| !run_status_is_terminal(&r.status))
-            .cloned()
-        {
-            Some(live) => {
-                for r in &existing {
-                    if r.id != live.id {
-                        delete_workflow_run(conn, &r.id)?;
-                    }
-                }
-                Ok((live, false))
-            }
-            None => {
-                for r in &existing {
-                    delete_workflow_run(conn, &r.id)?;
-                }
-                let fresh =
-                    create_workflow_run(conn, workflow_id, spec_id, current_node_id, blackboard)?;
-                Ok((fresh, true))
-            }
-        }
-    })
-}
-
-// --- RUN TICK journal: what the engine DECIDED, in the outbox (F3) --------
-//
-// A `workflow_runs` row holds a run's CURRENT cursor and blackboard — the present, OVERWRITTEN at
-// every stop. Nothing recorded the DECISIONS, so once a run moved on there was no way to answer
-// "what did nyx hand the dispatcher at each step, and on what input did it decide that?" — exactly
-// what auditing a FINISHED run needs. Each stop therefore appends ONE `run.tick` row to the same
-// `domain_events` outbox the identity / Spec / prototype mutations use, INSIDE the transaction that
-// persists the run's state ([`update_workflow_run`]): the journal never claims a step that did not
-// persist, and never misses one that did.
-//
-// The auditable unit is the STOP — what the dispatcher was actually TOLD — not each internal engine
-// step. A `gate_check` / `query` / `transition` is walked THROUGH inside one stop and gets no row of
-// its own: its effect is already in the state that stop persists.
-//
-// BOUNDED BY CONSTRUCTION. The payload keeps the action's `type` string and NEVER its `context` — a
-// spawn's rendered role manual runs to ~70k chars, and this payload is "small by design, never
-// terminal bytes" ([`DomainEvent`]). The tick's INPUT (`last_result`) is what lets an auditor read
-// the decision, but it can carry an effector's ENTIRE report (a whole diff), so it rides as a capped
-// EXCERPT plus the REAL byte size of the full value: the size says what was there, the excerpt says
-// what it started with, and neither turns the outbox into a log sink.
-
 /// The `aggregate` string for an AGENT-SESSION event.
 pub const AGGREGATE_SESSION: &str = "session";
 /// The plugin hook TRIED to hand a session its run and its manual, and could not.
@@ -16946,629 +15476,6 @@ pub fn record_injection_failure(
         },
     )?;
     Ok(true)
-}
-
-/// The `aggregate` string for an orchestration-RUN event.
-pub const AGGREGATE_RUN: &str = "run";
-/// ONE STOP of `nyx_next`. A SINGLE dotted type carries every outcome — done, failed, blocked, or an
-/// action handed back — because the outcome is a payload field (`status`) and nothing consumes a
-/// finer distinction.
-pub const EVENT_RUN_TICK: &str = "run.tick";
-/// How many CHARS of the tick's `last_result` ride in the payload. Enough to recognise WHAT the
-/// engine decided on (a verdict, a decision, the head of a diff), small enough that a run's whole
-/// journal stays a business log rather than a copy of every effector report it ever received.
-const TICK_LAST_RESULT_CHARS: usize = 2000;
-/// Appended to a cut `last_result_excerpt`, so a shortened value never reads as a whole one.
-const TICK_EXCERPT_TRUNCATED: &str = "…[truncated]";
-
-/// What ONE stop of `nyx_next` journals BEYOND the run's own state — the two facts the persisted row
-/// does not already hold. Passed as a pair so neither can be mistaken for the other at a call site.
-pub struct TickTrace<'a> {
-    /// The `type` of the action this stop hands the dispatcher. `None` when it hands back none — a
-    /// refusal or a failure, which is itself what the stop decided.
-    pub action_type: Option<&'a str>,
-    /// What the dispatcher reported INTO this tick: the input the stop decided on.
-    pub last_result: Option<&'a serde_json::Value>,
-}
-
-/// Resolve the PROJECT a run's tick is correlated to: the run's Spec → its project, else the run's
-/// WORKSPACE → its project. `None` when neither resolves (a run opened by workflow id alone, bound
-/// to nothing). Read inside the caller's transaction, from the run as just persisted.
-fn run_project(conn: &mut SqliteConnection, run: &WorkflowRun) -> QueryResult<Option<String>> {
-    if let Some(spec_id) = run.spec_id.as_deref() {
-        if let Some((project_id, _)) = spec_correlation(conn, spec_id)? {
-            return Ok(Some(project_id));
-        }
-    }
-    let Some(workspace_id) = run.workspace_id.as_deref() else {
-        return Ok(None);
-    };
-    workspaces::table
-        .find(workspace_id)
-        .select(workspaces::project_id)
-        .first::<String>(conn)
-        .optional()
-}
-
-/// The BOUNDED excerpt of a tick's serialized `last_result`: at most [`TICK_LAST_RESULT_CHARS`]
-/// chars, marked when cut. Split on a CHAR index (a byte slice through a multi-byte code point would
-/// panic, and a broken code point is not a shorter string — it is an invalid one).
-fn tick_last_result_excerpt(full: &str) -> String {
-    match full.char_indices().nth(TICK_LAST_RESULT_CHARS) {
-        None => full.to_string(),
-        Some((cut, _)) => format!("{}{TICK_EXCERPT_TRUNCATED}", &full[..cut]),
-    }
-}
-
-/// Record ONE `run.tick` outbox row for a STOP of `nyx_next`, INSIDE the caller's transaction —
-/// atomic with the [`update_workflow_run`] it describes. `run` is the run AS JUST PERSISTED: its
-/// cursor and `status` are the ones this stop wrote, so the row describes what was committed and
-/// not what was intended.
-///
-/// A run that resolves to NO project ([`run_project`]) is NOT journaled: `domain_events.project_id`
-/// is not nullable, inventing a placeholder project would file a row nobody can scope, and the tick
-/// itself is perfectly legitimate — so the row is skipped and the stop succeeds. Every other failure
-/// BUBBLES (like [`record_spec_event`]), rolling back the state write it describes: a journal that
-/// can miss a persisted step is not a journal.
-///
-/// The `source` is `"mcp"` — a tick only ever happens through the `nyx_next` verb.
-fn record_run_tick_event(
-    conn: &mut SqliteConnection,
-    run: &WorkflowRun,
-    trace: &TickTrace<'_>,
-) -> QueryResult<()> {
-    let Some(project_id) = run_project(conn, run)? else {
-        return Ok(());
-    };
-    let mut payload = serde_json::Map::new();
-    payload.insert("run_id".into(), run.id.clone().into());
-    payload.insert("workflow_id".into(), run.workflow_id.clone().into());
-    payload.insert("status".into(), run.status.clone().into());
-    // The optional correlations are OMITTED when unset rather than carried as `null`: the payload
-    // describes what this stop actually had.
-    if let Some(spec_id) = &run.spec_id {
-        payload.insert("spec_id".into(), spec_id.clone().into());
-    }
-    if let Some(parent_run_id) = &run.parent_run_id {
-        payload.insert("parent_run_id".into(), parent_run_id.clone().into());
-    }
-    if let Some(node_id) = &run.current_node_id {
-        payload.insert("node_id".into(), node_id.clone().into());
-        // The node TYPE is the readable half of the cursor (`spawn_subagent` vs a UUID). Absent when
-        // the node is gone from the tree — the id alone is still an honest record.
-        if let Some(node) = get_node(conn, node_id)? {
-            payload.insert("node_type".into(), node.type_.into());
-        }
-    }
-    if let Some(action_type) = trace.action_type {
-        payload.insert("action_type".into(), action_type.into());
-    }
-    // `null` is the wire's way of saying "nothing reported" — journal it as absent, not as a value.
-    if let Some(last_result) = trace.last_result.filter(|v| !v.is_null()) {
-        let full = last_result.to_string();
-        payload.insert("last_result_bytes".into(), full.len().into());
-        payload.insert(
-            "last_result_excerpt".into(),
-            tick_last_result_excerpt(&full).into(),
-        );
-    }
-    record_domain_event(
-        conn,
-        NewDomainEvent {
-            project_id,
-            workspace_id: run.workspace_id.clone(),
-            aggregate: AGGREGATE_RUN.to_string(),
-            event_type: EVENT_RUN_TICK.to_string(),
-            source: "mcp".to_string(),
-            actor: None,
-            payload: serde_json::Value::Object(payload).to_string(),
-            created_at: 0,
-        },
-    )?;
-    Ok(())
-}
-
-/// PERSIST one STOP of `nyx_next`: the run's live state AND its `run.tick` journal row, in ONE
-/// transaction. This is the seam the engine calls each time it stops ([`crate::mcp_engine`]) — the
-/// state write ([`update_workflow_run`], same arguments) plus the audit row that describes it
-/// ([`record_run_tick_event`]). Atomic on purpose: a journal that can claim a step the run never
-/// took, or miss one it did, is worse than none. Returns the updated row, or `None` when the id is
-/// unknown (a run deleted under the tick — nothing was written, so nothing is journaled).
-pub fn persist_run_tick(
-    conn: &mut SqliteConnection,
-    id: &str,
-    current_node_id: Option<&str>,
-    blackboard: &str,
-    status: &str,
-    traversal: Option<&str>,
-    trace: &TickTrace<'_>,
-) -> QueryResult<Option<WorkflowRun>> {
-    conn.transaction(|conn| {
-        let updated =
-            update_workflow_run(conn, id, current_node_id, blackboard, status, traversal)?;
-        if let Some(run) = &updated {
-            record_run_tick_event(conn, run, trace)?;
-        }
-        Ok(updated)
-    })
-}
-
-// --- gate_attempts: the APPEND-ONLY evidence journal ---------------------------------------
-//
-// Every `gate_check` execution lands here, and nothing ever overwrites one. The whole rationale —
-// why a table instead of a blackboard key, why the correlation ids carry no FK — is written once, in
-// `migrations/20260828230451_create_gate_attempts/up.sql`, and not repeated here.
-
-/// `gate_attempts.expect` — the check must PASS. The default meaning, and every pre-expectation gate.
-pub const GATE_EXPECT_GREEN: &str = "green";
-/// `gate_attempts.expect` — the check must FAIL, by exiting non-zero after running to completion.
-pub const GATE_EXPECT_RED: &str = "red";
-/// The `expect` vocabulary the migration's CHECK closes. Confronted with the live CHECK by
-/// `mod tests`, so the two spellings cannot drift.
-pub const GATE_EXPECTATIONS: [&str; 2] = [GATE_EXPECT_GREEN, GATE_EXPECT_RED];
-
-/// `gate_attempts.outcome` — every command terminated normally with status 0.
-pub const GATE_OUTCOME_PASSED: &str = "passed";
-/// `gate_attempts.outcome` — a command TERMINATED NORMALLY with a non-zero status. A verdict about
-/// the work, and the ONLY outcome that can answer an `expect: red`.
-pub const GATE_OUTCOME_FAILED: &str = "failed";
-/// `gate_attempts.outcome` — NO verdict was produced: a timeout, a cancellation, a spawn failure, an
-/// unreachable service. It answers NEITHER expectation.
-pub const GATE_OUTCOME_INDETERMINATE: &str = "indeterminate";
-/// The `outcome` vocabulary the migration's CHECK closes.
-pub const GATE_OUTCOMES: [&str; 3] = [
-    GATE_OUTCOME_PASSED,
-    GATE_OUTCOME_FAILED,
-    GATE_OUTCOME_INDETERMINATE,
-];
-
-/// # THE OUTPUT POLICY of the gate evidence journal — bounding and sanitisation
-///
-/// A gate's captured output is the one part of an attempt whose SIZE and CONTENT nyx does not
-/// control: it is whatever an arbitrary project command printed. Stored raw and unbounded in a
-/// durable, append-only table, it would be two problems at once — a journal that grows without
-/// limit (one attempt per gate per tick, forever, for every project) and a journal that may hold
-/// whatever a command happened to echo. So the boundary between "what the PTY captured" and "what
-/// is persisted" carries an explicit policy, and this is it. Four rules:
-///
-/// 1. **BOUNDED, from the END.** At most [`GATE_EVIDENCE_EXCERPT_CHARS`] characters are kept, taken
-///    from the tail, with [`GATE_EVIDENCE_TRUNCATED`] prepended when the value was cut so a
-///    shortened excerpt never reads as a whole one. The end is kept because the end is what explains
-///    a failure — the assertion, the stack trace, the summary line. This bound applies ON TOP of the
-///    16 KiB tail the capture path already keeps in memory: the journal is a durable record, not a
-///    copy of the terminal.
-/// 2. **INERT.** ANSI/OSC escape sequences are stripped ([`crate::ansi::strip_ansi`]) and the
-///    remaining control characters (other than `\n` and `\t`) are dropped. A record an auditor reads
-///    must be text: an OSC sequence surviving into a stored excerpt is a small injection surface
-///    into whatever renders it, and a NUL byte is a value SQLite will happily store and no reader
-///    handles.
-/// 3. **REDACTED where a secret is SELF-DISCLOSED.** A `NAME=value` (or `NAME: value`) whose NAME
-///    looks like a credential — one of [`SECRET_NAME_FRAGMENTS`] as a whole segment of it, and the
-///    name half must look like a name at all ([`name_looks_like_a_credential`]) — has its VALUE
-///    replaced by [`GATE_EVIDENCE_REDACTED`], and an authorization header's `Bearer <token>` is
-///    redacted likewise ([`bearer_header_at`]). This is a deliberate, NARROW rule: it catches
-///    the shape a leak actually takes in command output (a dumped env, a curl trace) without
-///    attempting content-level secret detection, which would mangle legitimate test output — a
-///    journal that silently corrupts the evidence it exists to preserve would be worse than one that
-///    misses a disclosure.
-/// 4. **NO ENVIRONMENT VALUES, EVER — and that one is upstream.** A gate command's persisted `env`
-///    reaches `cmd.env` and nothing else ([`crate::mcp_engine`]'s runner); the capture path takes
-///    the command's OUTPUT only. Rule 3 exists precisely because rule 4 cannot cover what a command
-///    chooses to print about itself.
-///
-/// What this function does NOT do is decide WHETHER to record. Every attempt is journaled, including
-/// the ones that produced no verdict: an auditor is told to treat what they cannot see recorded as
-/// absent, so a journal allowed to skip entries would turn a harness fault into a missing attempt.
-pub fn gate_evidence_excerpt(raw: &str) -> String {
-    let redacted = sanitise_free_text(raw);
-    // Bound LAST, so a redaction never gets half-applied by a cut that landed inside a value.
-    match redacted
-        .char_indices()
-        .nth_back(GATE_EVIDENCE_EXCERPT_CHARS.saturating_sub(1))
-    {
-        Some((cut, _)) if cut > 0 => format!("{GATE_EVIDENCE_TRUNCATED}{}", &redacted[cut..]),
-        _ => redacted,
-    }
-}
-
-/// RULES 2 AND 3 OF [`gate_evidence_excerpt`], ON THEIR OWN — the INERT + REDACTED prelude, with no
-/// bound applied. ANSI/OSC sequences stripped, control bytes other than `\n` / `\t` dropped, and a
-/// self-disclosed credential's value replaced by [`GATE_EVIDENCE_REDACTED`].
-///
-/// `pub` because a gate's captured output is NOT the only untrusted free text that reaches a stored,
-/// rendered surface: the `bug` discipline's MANUAL route records a HUMAN's answer — a pasted
-/// terminal transcript, a `curl -v` trace — and the auditor's context promises that answer is
-/// "bounded and sanitised exactly like a command's output extract" ([`crate::mcp_context`]). It said
-/// so while applying neither rule, so a pasted OSC sequence and an unredacted `Bearer …` went
-/// straight through. One function, called from both, is what makes the promise true; two copies of
-/// the policy would be the same defect waiting to reappear.
-///
-/// The newline SURVIVES here on purpose: rule 3 is line-oriented, so any folding a caller wants must
-/// happen after this, never before.
-pub fn sanitise_free_text(raw: &str) -> String {
-    let inert: String = crate::ansi::strip_ansi(raw)
-        .chars()
-        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-        .collect();
-    redact_disclosed_secrets(&inert)
-}
-
-/// How many CHARS of a gate's combined output ride in the journal — see [`gate_evidence_excerpt`].
-/// 4 KiB is ample for a failing test's summary plus a stack trace or two (the reason the tail is the
-/// half kept), and small enough that a Spec's whole red→green sequence stays a record rather than a
-/// transcript.
-pub const GATE_EVIDENCE_EXCERPT_CHARS: usize = 4096;
-/// Prepended to a CUT excerpt (the head is what was dropped), so a shortened value never reads as a
-/// whole one.
-pub const GATE_EVIDENCE_TRUNCATED: &str = "…[truncated]\n";
-/// What replaces a SELF-DISCLOSED secret's value — see rule 3 of [`gate_evidence_excerpt`].
-pub const GATE_EVIDENCE_REDACTED: &str = "«redacted»";
-
-/// The NAME fragments that make an assignment in command output look like a credential — rule 3 of
-/// [`gate_evidence_excerpt`]. Matched case-insensitively against a WHOLE SEGMENT of the name (the
-/// pieces `_`, `-` and `.` separate), so `GITHUB_TOKEN`, `npm_password` and `x-api-key` all land
-/// while `authoritative`, `tokenizer` and `secretary` do not.
-///
-/// A fragment spelled with an `_` is a RUN of segments (`api_key` matches `API_KEY`, `x-api-key`
-/// and `aws.api.key` alike) — the separator is not part of the comparison, only the boundaries are.
-const SECRET_NAME_FRAGMENTS: [&str; 11] = [
-    "token",
-    "secret",
-    "password",
-    "passwd",
-    "api_key",
-    "apikey",
-    "auth",
-    "authorization",
-    "bearer",
-    "credential",
-    "private_key",
-];
-
-/// Whether the NAME half of an assignment looks like a credential — rule 3's test, ANCHORED.
-///
-/// It used to be `name.contains(fragment)`, which is not a test on a name at all: `test auth`,
-/// `thread 'main' panicked at src/auth.rs` and `test token_parser` all contain a fragment, and every
-/// one of them is an ordinary line of a `cargo test` run — the exact output a red-vs-green
-/// comparison is made of. Redacted, those lines lost the very thing the auditor reads them for.
-///
-/// So the name must first LOOK like a name (no whitespace, no path separator, no `::`), and the
-/// fragment must then match a RUN OF WHOLE SEGMENTS of it, `_`, `-` and `.` all counting as the
-/// separator. That keeps every shape a dumped credential really takes (`GITHUB_TOKEN`,
-/// `npm_password`, `x-api-key`, `AWS.SECRET`, `X-Private-Key`) and lets prose through untouched.
-fn name_looks_like_a_credential(name: &str) -> bool {
-    if name.is_empty()
-        || name.contains(char::is_whitespace)
-        || name.contains('/')
-        || name.contains('\\')
-        || name.contains("::")
-    {
-        return false;
-    }
-    let segments: Vec<&str> = name.split(['_', '-', '.']).filter(|s| !s.is_empty()).collect();
-    SECRET_NAME_FRAGMENTS.iter().any(|fragment| {
-        let wanted: Vec<&str> = fragment.split('_').collect();
-        segments.windows(wanted.len()).any(|w| w == wanted.as_slice())
-    })
-}
-
-/// Where a line's `bearer ` really is an AUTHORIZATION HEADER carrying a token — the byte offset of
-/// the word, or `None`.
-///
-/// Two shapes qualify, and nothing else: the canonical `Bearer ` capitalisation (what a `curl -v`
-/// trace prints), and any capitalisation on a line whose NAME HALF is an `authorization` header
-/// (HTTP/2 lower-cases header names, so `authorization: bearer …` is the same disclosure). In both
-/// cases the rest of the line must hold a non-empty token — `Bearer` with nothing after it discloses
-/// nothing and is not worth destroying a line for.
-fn bearer_header_at(line: &str) -> Option<usize> {
-    let lowered = line.to_ascii_lowercase();
-    let at = lowered.find("bearer ")?;
-    if lowered[at + "bearer ".len()..].trim().is_empty() {
-        return None;
-    }
-    let canonical = line[at..].starts_with("Bearer ");
-    let authorization_header = line
-        .find(':')
-        .filter(|sep| *sep < at)
-        .is_some_and(|sep| line[..sep].trim().to_ascii_lowercase().ends_with("authorization"));
-    (canonical || authorization_header).then_some(at)
-}
-
-/// Rule 3 of [`gate_evidence_excerpt`]: replace the VALUE of a credential-looking assignment, and
-/// the token of a `Bearer …`, with [`GATE_EVIDENCE_REDACTED`].
-///
-/// Line-oriented and deliberately simple. A secret dumped by a command appears on its own line (an
-/// `env` dump, a config echo, a curl `-v` header); a regex-grade parser over arbitrary output would
-/// buy no precision and would cost the property that matters here — that a reader can predict
-/// exactly what the journal will and will not keep.
-///
-/// **NARROW IS THE POINT**, and the doc above says why: a journal that silently corrupts the
-/// evidence it exists to preserve is worse than one that misses a disclosure. Both halves of the
-/// rule are therefore anchored — see [`name_looks_like_a_credential`] for the assignment, and the
-/// `Bearer ` branch below, which requires the header's own capitalisation followed by a non-empty
-/// token rather than firing on any line that happens to contain the word.
-fn redact_disclosed_secrets(text: &str) -> String {
-    text.lines()
-        .map(|line| {
-            // `Bearer <token>` — an authorization header. IT MUST LOOK LIKE ONE: the canonical
-            // `Bearer ` spelling, or a lower-cased one carried by a header line whose name half IS
-            // an `authorization` (HTTP/2 lower-cases header names, so both really occur). Plus a
-            // NON-EMPTY token after it. Firing on any line containing the word truncated
-            // `test bearer token handling ... ok` — a test name, on which no credential ever was.
-            if let Some(at) = bearer_header_at(line) {
-                let head = &line[..at + "bearer ".len()];
-                return format!("{head}{GATE_EVIDENCE_REDACTED}");
-            }
-            let Some(sep) = line.find(['=', ':']) else {
-                return line.to_string();
-            };
-            let name = line[..sep].trim().to_ascii_lowercase();
-            if name_looks_like_a_credential(&name) {
-                format!("{}{}{GATE_EVIDENCE_REDACTED}", &line[..sep], &line[sep..=sep])
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// A `gate_attempts` row — ONE recorded `gate_check` execution. `Serialize` for the diagnostic
-/// surfaces that read it back.
-#[derive(Debug, Clone, PartialEq, Eq, Queryable, Selectable, serde::Serialize)]
-#[diesel(table_name = gate_attempts)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
-pub struct GateAttemptRow {
-    /// Monotonic append order — THE ordering key of the journal (never the clock).
-    pub sequence: i64,
-    pub run_id: String,
-    pub spec_id: Option<String>,
-    pub node_id: String,
-    pub slot: Option<String>,
-    /// [`GATE_EXPECT_GREEN`] | [`GATE_EXPECT_RED`].
-    pub expect: String,
-    /// Whether the node SPELLED its expectation (vs. defaulting to green).
-    pub declared: bool,
-    pub blocking: bool,
-    /// [`GATE_OUTCOME_PASSED`] | [`GATE_OUTCOME_FAILED`] | [`GATE_OUTCOME_INDETERMINATE`].
-    pub outcome: String,
-    /// Whether `outcome` answered `expect`.
-    pub satisfied: bool,
-    /// The RESOLVED command line(s), newline-joined — the identity an auditor compares.
-    pub command_line: String,
-    /// The RESOLVED run director(ies), newline-joined.
-    pub cwd: String,
-    /// The deciding command's exit status; `None` when none was ever read.
-    pub exit_code: Option<i32>,
-    pub duration_ms: i64,
-    /// The bounded, sanitised extract of the combined output — [`gate_evidence_excerpt`].
-    pub output_excerpt: String,
-    /// The per-command detail as JSON, bounded by the same policy.
-    pub commands_json: String,
-    pub created_at: i64,
-}
-
-/// A new `gate_attempts` row. `sequence` is OMITTED — SQLite assigns the rowid, which IS the
-/// journal's order.
-#[derive(Debug, Clone, Insertable)]
-#[diesel(table_name = gate_attempts)]
-pub struct NewGateAttempt {
-    pub run_id: String,
-    pub spec_id: Option<String>,
-    pub node_id: String,
-    pub slot: Option<String>,
-    pub expect: String,
-    pub declared: bool,
-    pub blocking: bool,
-    pub outcome: String,
-    pub satisfied: bool,
-    pub command_line: String,
-    pub cwd: String,
-    pub exit_code: Option<i32>,
-    pub duration_ms: i64,
-    pub output_excerpt: String,
-    pub commands_json: String,
-    pub created_at: i64,
-}
-
-/// ONE `run.gate_attempt` — the RUN-aggregate event that points at a recorded attempt.
-///
-/// It exists so a reader of the run's own journal can get from "this run ticked" to "and here is
-/// what the gate did, recorded under this sequence" without having to know the evidence table. The
-/// payload carries `evidence_sequence`, which is the primary key of the [`GateAttemptRow`] it
-/// describes — the reference, not a copy: the attempt's bounded output stays in the evidence table
-/// and never gets duplicated into the outbox, whose rows are small by design.
-pub const EVENT_RUN_GATE_ATTEMPT: &str = "run.gate_attempt";
-
-/// APPEND one gate attempt to the journal and, in the SAME transaction, record the
-/// [`EVENT_RUN_GATE_ATTEMPT`] run event that REFERENCES it.
-///
-/// Append-only in the strict sense: this is the only write to `gate_attempts` in the codebase, and
-/// it is an INSERT. Two attempts on the same gate of the same run produce two rows, ordered by
-/// `sequence` — which is exactly what makes a red followed by a green readable as one sequence
-/// instead of a single overwritten key.
-///
-/// The two writes are ATOMIC and their failure modes are NOT symmetric, deliberately:
-///
-///   * the evidence row is the point of the call and its failure propagates;
-///   * the run EVENT is skipped — without failing — when the run resolves to no project, because
-///     `domain_events.project_id` is not nullable and a run bound to neither Spec nor workspace is a
-///     legitimate state. The same choice [`record_run_tick_event`] makes, for the same reason. The
-///     evidence is still recorded; only the pointer to it is not filed.
-pub fn append_gate_attempt(
-    conn: &mut SqliteConnection,
-    mut attempt: NewGateAttempt,
-) -> QueryResult<GateAttemptRow> {
-    conn.transaction(|conn| {
-        if attempt.created_at == 0 {
-            attempt.created_at = now_millis();
-        }
-        let row: GateAttemptRow = diesel::insert_into(gate_attempts::table)
-            .values(&attempt)
-            .returning(GateAttemptRow::as_returning())
-            .get_result(conn)?;
-        record_gate_attempt_event(conn, &row)?;
-        Ok(row)
-    })
-}
-
-/// The `run.gate_attempt` outbox row for `row`, inside the caller's transaction. Skipped (without
-/// failing) when the run is gone or resolves to no project — see [`append_gate_attempt`].
-fn record_gate_attempt_event(
-    conn: &mut SqliteConnection,
-    row: &GateAttemptRow,
-) -> QueryResult<()> {
-    let Some(run) = get_workflow_run(conn, &row.run_id)? else {
-        return Ok(());
-    };
-    let Some(project_id) = run_project(conn, &run)? else {
-        return Ok(());
-    };
-    let mut payload = serde_json::Map::new();
-    payload.insert("run_id".into(), row.run_id.clone().into());
-    payload.insert("node_id".into(), row.node_id.clone().into());
-    payload.insert("expect".into(), row.expect.clone().into());
-    payload.insert("outcome".into(), row.outcome.clone().into());
-    payload.insert("satisfied".into(), row.satisfied.into());
-    payload.insert("blocking".into(), row.blocking.into());
-    // THE REFERENCE: the evidence row's primary key. A reader follows it to the full attempt.
-    payload.insert("evidence_sequence".into(), row.sequence.into());
-    if let Some(spec_id) = &row.spec_id {
-        payload.insert("spec_id".into(), spec_id.clone().into());
-    }
-    if let Some(slot) = &row.slot {
-        payload.insert("slot".into(), slot.clone().into());
-    }
-    record_domain_event(
-        conn,
-        NewDomainEvent {
-            project_id,
-            workspace_id: run.workspace_id.clone(),
-            aggregate: AGGREGATE_RUN.to_string(),
-            event_type: EVENT_RUN_GATE_ATTEMPT.to_string(),
-            source: "mcp".to_string(),
-            actor: None,
-            payload: serde_json::Value::Object(payload).to_string(),
-            created_at: 0,
-        },
-    )?;
-    Ok(())
-}
-
-/// A Spec's gate attempts, OLDEST FIRST — the order they happened in, which is the order the proof
-/// is read in. The auditor's "the red precedes the fix" and the resume engine's "has this Spec
-/// already produced its red" are both this query.
-pub fn list_gate_attempts_for_spec(
-    conn: &mut SqliteConnection,
-    spec_id: &str,
-) -> QueryResult<Vec<GateAttemptRow>> {
-    gate_attempts::table
-        .filter(gate_attempts::spec_id.eq(spec_id))
-        .order(gate_attempts::sequence.asc())
-        .select(GateAttemptRow::as_select())
-        .load(conn)
-}
-
-/// A RUN's gate attempts, oldest first — the diagnostic read (a run card, a resume that holds the
-/// run id but not the Spec).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn list_gate_attempts_for_run(
-    conn: &mut SqliteConnection,
-    run_id: &str,
-) -> QueryResult<Vec<GateAttemptRow>> {
-    gate_attempts::table
-        .filter(gate_attempts::run_id.eq(run_id))
-        .order(gate_attempts::sequence.asc())
-        .select(GateAttemptRow::as_select())
-        .load(conn)
-}
-
-/// PERSIST a run's live state — the cursor (`current_node_id`), the `blackboard` JSON, the `status`,
-/// and the engine's serialized `traversal` stack — bumping `updated_at`. The state half of
-/// [`persist_run_tick`], which is what the `nyx_next` tick (T4) calls after advancing the graph.
-/// `traversal` (`None` clears it to NULL) is the interpreter's stack keyed by node id, so a LATER
-/// session can resume the exact walk rather than replaying from the root (v2.8 review B1). Returns
-/// the updated row, or `None` when the id is unknown.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn update_workflow_run(
-    conn: &mut SqliteConnection,
-    id: &str,
-    current_node_id: Option<&str>,
-    blackboard: &str,
-    status: &str,
-    traversal: Option<&str>,
-) -> QueryResult<Option<WorkflowRun>> {
-    diesel::update(workflow_runs::table.find(id))
-        .set((
-            workflow_runs::current_node_id.eq(current_node_id.map(|n| n.to_string())),
-            workflow_runs::blackboard.eq(blackboard.to_string()),
-            workflow_runs::status.eq(status.to_string()),
-            workflow_runs::traversal.eq(traversal.map(|t| t.to_string())),
-            workflow_runs::updated_at.eq(now_millis()),
-        ))
-        .returning(WorkflowRun::as_returning())
-        .get_result(conn)
-        .optional()
-}
-
-/// The blackboard key carrying the M4 marker "this run's GRAPH was REPLACED under it": what replaced
-/// it and with what, recorded on the run ITSELF at the moment of the replacement. `run_start` reads
-/// it off the run it is about to drop, so its warning names the REAL cause instead of inferring one
-/// from the wreckage. It lives on the blackboard rather than in a column because that is the run's
-/// own persisted scratchpad — no schema change, and it rides along wherever the run is read.
-pub const RUN_GRAPH_REPLACED_KEY: &str = "graph_replaced";
-
-/// The runs of `workflow_id` that a change to its TREE would actually cost something: LIVE
-/// (non-terminal) AND already WALKED INTO the tree — they carry a cursor, or a persisted traversal,
-/// or both (M4). Newest-first.
-///
-/// This is the single definition of "a run that would LOSE its progress if the graph moved", and the
-/// two guards share it: the seeder MARKS exactly these runs before replacing a built-in's tree
-/// ([`mark_runs_graph_replaced`]), and the authoring verbs REFUSE a structural edit while one exists
-/// ([`crate::mcp_authoring`]). A live run that has never ticked is deliberately EXCLUDED: with no
-/// walk recorded it simply starts from the root of whatever tree it finds, losing nothing.
-pub fn walking_runs_for_workflow(
-    conn: &mut SqliteConnection,
-    workflow_id: &str,
-) -> QueryResult<Vec<WorkflowRun>> {
-    Ok(list_workflow_runs(conn, workflow_id)?
-        .into_iter()
-        .filter(|r| {
-            !run_status_is_terminal(&r.status)
-                && (r.current_node_id.is_some() || r.traversal.is_some())
-        })
-        .collect())
-}
-
-/// RECORD, on every run of `workflow_id` that has actually WALKED it
-/// ([`walking_runs_for_workflow`]), that its graph is being REPLACED under it (M4). The seeder calls
-/// this right BEFORE it wipes a stale built-in's nodes ([`delete_nodes_for_workflow`]), so the loss
-/// is deliberate and traceable instead of incidental: the wipe nulls those runs' cursors and strands
-/// their `traversal`, and `run_start` will later drop them — with this marker it can say WHY.
-///
-/// `marker` is stored verbatim under [`RUN_GRAPH_REPLACED_KEY`]; a run whose blackboard is not a JSON
-/// object gets a fresh one. Returns the ids marked, so the caller can report the destruction.
-pub fn mark_runs_graph_replaced(
-    conn: &mut SqliteConnection,
-    workflow_id: &str,
-    marker: &serde_json::Value,
-) -> QueryResult<Vec<String>> {
-    let mut marked = Vec::new();
-    for run in walking_runs_for_workflow(conn, workflow_id)? {
-        let mut board = match serde_json::from_str::<serde_json::Value>(&run.blackboard) {
-            Ok(serde_json::Value::Object(map)) => map,
-            _ => serde_json::Map::new(),
-        };
-        board.insert(RUN_GRAPH_REPLACED_KEY.to_string(), marker.clone());
-        diesel::update(workflow_runs::table.find(&run.id))
-            .set((
-                workflow_runs::blackboard.eq(serde_json::Value::Object(board).to_string()),
-                workflow_runs::updated_at.eq(now_millis()),
-            ))
-            .execute(conn)?;
-        marked.push(run.id);
-    }
-    Ok(marked)
 }
 
 /// ELECT the USER's RETENU variant for `(round_id, page_id)`: set `chosen_variant_id` + the
@@ -21918,8 +19825,8 @@ mod tests {
     fn spec_ready_to_review(conn: &mut SqliteConnection, project_id: &str) -> String {
         let (spec, _) = create_spec(conn, project_id, "Spec", complete_sections()).unwrap();
         transition_spec(conn, &spec.id, SpecTransition::Ready, true).unwrap();
-        // `start` is now sensitive (it poses the workspace anchor) → confirm it.
-        transition_spec(conn, &spec.id, SpecTransition::Start, true).unwrap();
+        // `start` and `review` are routine: neither asks the human anything.
+        transition_spec(conn, &spec.id, SpecTransition::Start, false).unwrap();
         transition_spec(conn, &spec.id, SpecTransition::Review, false).unwrap();
         spec.id
     }
@@ -21938,8 +19845,8 @@ mod tests {
         // draft → ready (sensitive: confirmed).
         let s = transition_spec(&mut conn, &spec.id, SpecTransition::Ready, true).unwrap();
         assert_eq!(s.status, SPEC_STATUS_READY);
-        // ready → in_progress (sensitive: it poses the anchor — confirmed).
-        let s = transition_spec(&mut conn, &spec.id, SpecTransition::Start, true).unwrap();
+        // ready → in_progress ("start", routine: it records that work began).
+        let s = transition_spec(&mut conn, &spec.id, SpecTransition::Start, false).unwrap();
         assert_eq!(s.status, SPEC_STATUS_IN_PROGRESS);
         // in_progress → in_review ("review", routine).
         let s = transition_spec(&mut conn, &spec.id, SpecTransition::Review, false).unwrap();
@@ -21983,9 +19890,9 @@ mod tests {
         let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
         let (spec, _) = create_spec(&mut conn, &project.id, "Spec", complete_sections()).unwrap();
 
-        // start requires source=ready; on a draft it is an invalid source. `start` is now
-        // sensitive, so confirm it to reach the source guard (the guard-rail is checked first).
-        let err = transition_spec(&mut conn, &spec.id, SpecTransition::Start, true).unwrap_err();
+        // start requires source=ready; on a draft it is an invalid source (and it asks for no
+        // confirmation, so the source guard is what refuses).
+        let err = transition_spec(&mut conn, &spec.id, SpecTransition::Start, false).unwrap_err();
         match err {
             SpecTransitionError::InvalidSource { from, to } => {
                 assert_eq!(from, SPEC_STATUS_DRAFT);
@@ -22006,15 +19913,27 @@ mod tests {
         assert!(matches!(err, SpecTransitionError::InvalidSource { .. }));
     }
 
-    /// DONE-CRITERION: "garde-fous (confirmation) sur ready/start/done/cancel." A SENSITIVE
-    /// transition without user confirmation is refused with `ConfirmationRequired`, writing
-    /// nothing; WITH confirmation it proceeds. `start` is now sensitive (it poses the
-    /// workspace anchor); only `review` stays routine (no confirmation needed).
+    /// DONE-CRITERION (PDR-0031, `agent-manuals.md` « Principes communs ») : les transitions
+    /// SENSIBLES sont EXACTEMENT `ready`, `done` et `cancel`. Sans confirmation elles sont
+    /// refusées avec `ConfirmationRequired` et n'écrivent rien ; avec, elles passent. `start`,
+    /// `review` et `revise` ne demandent RIEN — le manuel `/ndev` ouvre sur un
+    /// `to="in_progress"` sans `user_confirmed`, et il doit passer.
     #[test]
     fn sensitive_transitions_require_user_confirmation() {
         let mut conn = open_in_memory();
         let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
         let (spec, _) = create_spec(&mut conn, &project.id, "Spec", complete_sections()).unwrap();
+
+        // L'ENSEMBLE, nommé variante par variante — c'est la liste du PDR, pas une paraphrase.
+        assert!(SpecTransition::Ready.is_sensitive());
+        assert!(SpecTransition::Done.is_sensitive());
+        assert!(SpecTransition::Cancel.is_sensitive());
+        assert!(
+            !SpecTransition::Start.is_sensitive(),
+            "start ne fait qu'acter que le travail commence — le manuel /ndev l'appelle sans confirmation"
+        );
+        assert!(!SpecTransition::Review.is_sensitive());
+        assert!(!SpecTransition::Revise.is_sensitive());
 
         // ready is sensitive: unconfirmed → refused, nothing written.
         let err = transition_spec(&mut conn, &spec.id, SpecTransition::Ready, false).unwrap_err();
@@ -22025,23 +19944,14 @@ mod tests {
             "an unconfirmed sensitive transition writes nothing"
         );
 
-        // Confirmed ready proceeds. `start` is ALSO sensitive now: unconfirmed → refused,
-        // still `ready` (nothing written).
+        // Confirmed ready proceeds. `start` is NOT sensitive: unconfirmed, it goes through —
+        // this is the exact call the delivered `/ndev` manual makes.
         transition_spec(&mut conn, &spec.id, SpecTransition::Ready, true).unwrap();
-        let err = transition_spec(&mut conn, &spec.id, SpecTransition::Start, false).unwrap_err();
-        assert!(
-            matches!(err, SpecTransitionError::ConfirmationRequired),
-            "start is sensitive (it poses the anchor) — unconfirmed is refused"
-        );
-        assert_eq!(
-            get_spec(&mut conn, &spec.id).unwrap().unwrap().status,
-            SPEC_STATUS_READY,
-            "an unconfirmed start writes nothing"
-        );
+        let started = transition_spec(&mut conn, &spec.id, SpecTransition::Start, false)
+            .expect("an unconfirmed start is the manual's own call — it must pass");
+        assert_eq!(started.status, SPEC_STATUS_IN_PROGRESS);
 
-        // Confirmed start proceeds; review is routine (no confirmation needed).
-        transition_spec(&mut conn, &spec.id, SpecTransition::Start, true)
-            .expect("confirmed start proceeds");
+        // review is routine too (no confirmation needed).
         transition_spec(&mut conn, &spec.id, SpecTransition::Review, false)
             .expect("review needs no confirmation");
 
@@ -23525,12 +21435,12 @@ mod tests {
     // --- Spec ↔ workspace LINK + DERIVED repos/project (v2.4 Phase 3, v15) ----
 
     /// Drive a Spec to `in_progress` (unanchored) so the standalone anchor tests can exercise
-    /// `set_spec_workspace` — which is now STATE-GUARDED to `in_progress`. Confirms the two
-    /// sensitive steps (ready, start) and leaves the anchor unset (start with no workspace).
+    /// `set_spec_workspace` — which is now STATE-GUARDED to `in_progress`. Confirms the one
+    /// sensitive step (ready) and leaves the anchor unset (start with no workspace).
     fn spec_in_progress_unanchored(conn: &mut SqliteConnection, project_id: &str) -> Spec {
         let (spec, _) = create_spec(conn, project_id, "S", complete_sections()).unwrap();
         transition_spec(conn, &spec.id, SpecTransition::Ready, true).unwrap();
-        transition_spec(conn, &spec.id, SpecTransition::Start, true).unwrap();
+        transition_spec(conn, &spec.id, SpecTransition::Start, false).unwrap();
         get_spec(conn, &spec.id).unwrap().unwrap()
     }
 
@@ -24788,6 +22698,50 @@ mod tests {
             phase1_tasks.iter().any(|t| t.id == finding.id),
             "the phased finding is part of phase 1's tasks → it enters the gauge"
         );
+    }
+
+    /// DONE-CRITERION (PDR-0031, `agent-manuals.md` §1 étape 5 / §5 ligne 2) : une Spec déjà
+    /// `ready` ou au-delà REDEVIENT éditable — `spec_fork` ouvre la révision, `revise` rouvre le
+    /// statut. Le geste est celui du manuel, en deux appels, et pas un fork déguisé : la
+    /// transition seule ne touche pas aux révisions.
+    #[test]
+    fn revise_reopens_a_frozen_spec_as_draft_without_confirmation() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let sections = SpecSections {
+            problem: "a real problem".into(),
+            solution: "a real solution".into(),
+            ..SpecSections::empty()
+        };
+        let (spec, revision) = create_spec(&mut conn, &project.id, "Spec", sections).unwrap();
+        transition_spec(&mut conn, &spec.id, SpecTransition::Ready, true).unwrap();
+
+        // NON SENSIBLE : aucun `user_confirmed` n'est demandé pour rendre la main à l'auteur.
+        let reopened =
+            transition_spec(&mut conn, &spec.id, SpecTransition::Revise, false).expect("revise");
+        assert_eq!(reopened.status, SPEC_STATUS_DRAFT);
+        assert_eq!(
+            get_active_revision(&mut conn, &spec.id).unwrap().unwrap().id,
+            revision.id,
+            "la transition seule ne forke pas — spec_fork est l'autre moitié du geste"
+        );
+
+        // Les SOURCES légales : figées oui, brouillon non, terminales non.
+        assert!(SpecTransition::Revise.source_allowed(SPEC_STATUS_READY));
+        assert!(SpecTransition::Revise.source_allowed(SPEC_STATUS_IN_PROGRESS));
+        assert!(SpecTransition::Revise.source_allowed(SPEC_STATUS_IN_REVIEW));
+        assert!(
+            !SpecTransition::Revise.source_allowed(SPEC_STATUS_DRAFT),
+            "rouvrir un brouillon ne veut rien dire"
+        );
+        for terminal in [SPEC_STATUS_COMPLETED, SPEC_STATUS_CANCELLED] {
+            assert!(
+                !SpecTransition::Revise.source_allowed(terminal),
+                "{terminal} est terminal : on repart d'une nouvelle Spec, pas d'une réédition"
+            );
+        }
+        assert!(!SpecTransition::Revise.is_sensitive());
+        assert_eq!(SpecTransition::Revise.verb(), "revise");
     }
 
     /// DONE-CRITERION (v2.5.11 Phase 2, task 01KXR1CZPJY42PD91VRMPYSJJE "Statut in-place"): the Spec
@@ -30708,79 +28662,6 @@ mod tests {
         );
     }
 
-    // --- ORCHESTRATION ENGINE domain (v34) ---------------------------------
-
-    /// The full `workflows` + `nodes` + `workflow_runs` model (v34) round-trips, and the PURE
-    /// tree is RECONSTRUCTIBLE from the rows alone. CREATE a built-in workflow (project_id NULL),
-    /// build a small typed tree (sequence → [spawn, loop → [judge], gate]), wire the root, then
-    /// rebuild the tree from `list_nodes`/`child_nodes` (order + type + config preserved). Then
-    /// `update_node` / `set_node_order` mutate authoring fields, and a run persists its cursor +
-    /// blackboard. Proves the v34 migration + `schema.rs` tables + the model columns are
-    /// consistent and that the done-criterion "arbre reconstructible" holds.
-    #[test]
-    fn resolve_active_workflow_prefers_project_then_builtin_deterministically() {
-        let mut conn = open_in_memory();
-        let (project, _ws) = create_project(&mut conn, "P", "/tmp/raw-ws", None).unwrap();
-
-        // Only a BUILT-IN ndev exists → it is the fallback for the project.
-        let builtin =
-            create_workflow(&mut conn, None, "ndev-builtin", WORKFLOW_SCOPE_NDEV, None).unwrap();
-        assert_eq!(
-            resolve_active_workflow(&mut conn, Some(&project.id), WORKFLOW_SCOPE_NDEV)
-                .unwrap()
-                .unwrap()
-                .id,
-            builtin.id,
-            "no project workflow yet → the built-in default"
-        );
-
-        // Two PROJECT-OWNED ndev workflows → the MOST RECENT wins (created_at DESC, id DESC on a
-        // same-ms tie; UUID v7 ids are time-ordered, so this is deterministic — review S3).
-        let _older =
-            create_workflow(&mut conn, Some(&project.id), "ndev-a", WORKFLOW_SCOPE_NDEV, None)
-                .unwrap();
-        let newer =
-            create_workflow(&mut conn, Some(&project.id), "ndev-b", WORKFLOW_SCOPE_NDEV, None)
-                .unwrap();
-        assert_eq!(
-            resolve_active_workflow(&mut conn, Some(&project.id), WORKFLOW_SCOPE_NDEV)
-                .unwrap()
-                .unwrap()
-                .id,
-            newer.id,
-            "the project's most-recent workflow of the scope wins over its older one AND the built-in"
-        );
-
-        // A scope with no project or built-in match resolves to nothing.
-        assert!(
-            resolve_active_workflow(&mut conn, Some(&project.id), WORKFLOW_SCOPE_NSPEC)
-                .unwrap()
-                .is_none(),
-            "no nspec workflow anywhere → None"
-        );
-    }
-
-    #[test]
-    fn resolve_active_workflow_ignores_an_unowned_fork_of_a_seeded_scope() {
-        let mut conn = open_in_memory();
-        // The REAL seeded built-in (forked_from NULL).
-        let builtin = create_workflow(&mut conn, None, "ndev", WORKFLOW_SCOPE_NDEV, None).unwrap();
-        // A stray UNOWNED fork of it (project NULL, forked_from set), created LATER — a leftover from
-        // before the fork guard. It must NOT shadow the seeded built-in despite being more recent (N4).
-        let rogue =
-            create_workflow(&mut conn, None, "ndev-fork", WORKFLOW_SCOPE_NDEV, Some(&builtin.id))
-                .unwrap();
-        assert_eq!(
-            resolve_active_workflow(&mut conn, None, WORKFLOW_SCOPE_NDEV)
-                .unwrap()
-                .unwrap()
-                .id,
-            builtin.id,
-            "the seeded built-in (forked_from NULL) wins over a more-recent unowned fork"
-        );
-        let _ = rogue;
-    }
-
     #[test]
     fn content_writes_are_state_guarded_by_spec_status() {
         let mut conn = open_in_memory();
@@ -30839,859 +28720,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn workflow_engine_crud_tree_round_trip_and_reconstruct() {
-        let mut conn = open_in_memory();
-
-        // A BUILT-IN nyx default flow: project_id = None.
-        let wf = create_workflow(&mut conn, None, "ndev default", WORKFLOW_SCOPE_NDEV, None)
-            .expect("create workflow");
-        assert_eq!(wf.project_id, None, "a built-in flow owns no project");
-        assert_eq!(wf.scope, WORKFLOW_SCOPE_NDEV);
-        assert_eq!(wf.root_node_id, None, "an empty draft has no root yet");
-        assert_eq!(wf.forked_from, None);
-
-        // Build the tree. Root = a sequence; its ordered children = spawn, loop, gate; the loop's
-        // child = a judge whose verdict the loop's `until` reads.
-        let root = create_node(
-            &mut conn,
-            &wf.id,
-            None,
-            0,
-            NODE_TYPE_SEQUENCE,
-            "phase",
-            "{}",
-        )
-        .expect("create root sequence");
-        let spawn_cfg = serde_json::json!({ "agent_id": "coder" }).to_string();
-        let spawn = create_node(
-            &mut conn,
-            &wf.id,
-            Some(&root.id),
-            0,
-            NODE_TYPE_SPAWN_SUBAGENT,
-            "code it",
-            &spawn_cfg,
-        )
-        .unwrap();
-        let loop_cfg =
-            serde_json::json!({ "until": { "var": "verdict", "eq": "clair" } }).to_string();
-        let loop_node = create_node(
-            &mut conn,
-            &wf.id,
-            Some(&root.id),
-            1,
-            NODE_TYPE_LOOP,
-            "grill",
-            &loop_cfg,
-        )
-        .unwrap();
-        let judge_cfg =
-            serde_json::json!({ "prompt": "assez clair ?", "output_schema": {} }).to_string();
-        let judge = create_node(
-            &mut conn,
-            &wf.id,
-            Some(&loop_node.id),
-            0,
-            NODE_TYPE_JUDGE,
-            "clear?",
-            &judge_cfg,
-        )
-        .unwrap();
-        let gate_cfg =
-            serde_json::json!({ "command_ids": ["typecheck"], "blocking": true }).to_string();
-        let gate = create_node(
-            &mut conn,
-            &wf.id,
-            Some(&root.id),
-            2,
-            NODE_TYPE_GATE_CHECK,
-            "typecheck",
-            &gate_cfg,
-        )
-        .unwrap();
-
-        // Wire the root pointer (done after the nodes exist).
-        let wf = set_workflow_root(&mut conn, &wf.id, Some(&root.id))
-            .unwrap()
-            .unwrap();
-        assert_eq!(wf.root_node_id.as_deref(), Some(root.id.as_str()));
-
-        // RECONSTRUCT the tree from the rows alone. `list_nodes` = the full deterministic dump.
-        let all = list_nodes(&mut conn, &wf.id).unwrap();
-        assert_eq!(all.len(), 5, "root + 3 children + 1 grandchild");
-        // The root = the workflow's root_node_id (equivalently, the node with parent_id NULL).
-        let roots: Vec<&Node> = all.iter().filter(|n| n.parent_id.is_none()).collect();
-        assert_eq!(roots.len(), 1, "exactly one root");
-        assert_eq!(roots[0].id, root.id);
-        assert_eq!(roots[0].type_, NODE_TYPE_SEQUENCE);
-
-        // The root's ORDERED children come back by order_index: spawn, loop, gate.
-        let children = child_nodes(&mut conn, &root.id).unwrap();
-        assert_eq!(
-            children.iter().map(|n| n.id.clone()).collect::<Vec<_>>(),
-            vec![spawn.id.clone(), loop_node.id.clone(), gate.id.clone()],
-            "children ordered by order_index"
-        );
-        assert_eq!(children[0].type_, NODE_TYPE_SPAWN_SUBAGENT);
-        assert_eq!(children[1].type_, NODE_TYPE_LOOP);
-        assert_eq!(children[2].type_, NODE_TYPE_GATE_CHECK);
-
-        // The loop's single child is the judge; the config JSON round-trips byte-for-byte and
-        // decodes to the typed shape.
-        let loop_children = child_nodes(&mut conn, &loop_node.id).unwrap();
-        assert_eq!(loop_children.len(), 1);
-        assert_eq!(loop_children[0].id, judge.id);
-        let judge_json: serde_json::Value =
-            serde_json::from_str(&loop_children[0].config).expect("judge config is valid JSON");
-        assert_eq!(judge_json["prompt"], "assez clair ?");
-        let loop_json: serde_json::Value = serde_json::from_str(&loop_node.config).unwrap();
-        assert_eq!(loop_json["until"]["var"], "verdict");
-        assert_eq!(loop_json["until"]["eq"], "clair");
-
-        // UPDATE a node's authoring fields; a None arg leaves the field untouched.
-        let updated = update_node(&mut conn, &judge.id, Some("clear enough?"), None)
-            .unwrap()
-            .unwrap();
-        assert_eq!(updated.label, "clear enough?");
-        assert_eq!(updated.config, judge_cfg, "config left untouched when None");
-
-        // REORDER: move the gate before the spawn (order_index 0), spawn to 2.
-        set_node_order(&mut conn, &gate.id, 0).unwrap();
-        set_node_order(&mut conn, &spawn.id, 2).unwrap();
-        let reordered = child_nodes(&mut conn, &root.id).unwrap();
-        assert_eq!(
-            reordered[0].id, gate.id,
-            "the gate is now the first child after reorder"
-        );
-
-        // A RUN persists its cursor + blackboard. Start at the root, then advance to the spawn
-        // with a populated blackboard and a blocked status.
-        let (project, _ws) = create_project(&mut conn, "P", "/tmp/wf-ws", None).unwrap();
-        let (spec, _rev) = create_spec(&mut conn, &project.id, "S", SpecSections::empty()).unwrap();
-        let run = create_workflow_run(&mut conn, &wf.id, Some(&spec.id), Some(&root.id), "{}")
-            .expect("create run");
-        assert_eq!(run.status, RUN_STATUS_RUNNING);
-        assert_eq!(run.current_node_id.as_deref(), Some(root.id.as_str()));
-        assert_eq!(run.spec_id.as_deref(), Some(spec.id.as_str()));
-
-        let board = serde_json::json!({ "spawns": 1, "gate_green": false }).to_string();
-        let traversal = r#"{"stack":[{"kind":"sequence","node":"root","next":1}],"awaiting":"sp","replay":false}"#;
-        let ticked = update_workflow_run(
-            &mut conn,
-            &run.id,
-            Some(&spawn.id),
-            &board,
-            RUN_STATUS_BLOCKED,
-            Some(traversal),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(ticked.current_node_id.as_deref(), Some(spawn.id.as_str()));
-        assert_eq!(ticked.status, RUN_STATUS_BLOCKED);
-        assert_eq!(
-            ticked.traversal.as_deref(),
-            Some(traversal),
-            "the serialized traversal stack round-trips (B1)"
-        );
-        let board_json: serde_json::Value = serde_json::from_str(&ticked.blackboard).unwrap();
-        assert_eq!(board_json["spawns"], 1);
-        assert_eq!(board_json["gate_green"], false);
-
-        assert_eq!(
-            get_workflow_run(&mut conn, &run.id)
-                .unwrap()
-                .unwrap()
-                .status,
-            RUN_STATUS_BLOCKED
-        );
-        assert_eq!(list_workflow_runs(&mut conn, &wf.id).unwrap().len(), 1);
-        assert_eq!(
-            list_workflows(&mut conn, None).unwrap().len(),
-            1,
-            "the built-in flow is listed under the NULL-project scope"
-        );
-    }
-
-    /// The v34 FK behaviour: the CHECK vocabularies reject junk, deleting a workflow CASCADES to
-    /// its nodes + runs, deleting a composite CASCADES its subtree, and the pointer FKs
-    /// (`spec_id`, `forked_from`) SET NULL rather than cascade — a run/fork outlives what it
-    /// points at. Requires `PRAGMA foreign_keys = ON` (enabled in `open_in_memory`).
-    #[test]
-    fn workflow_engine_cascades_checks_and_set_null() {
-        let mut conn = open_in_memory();
-        let wf = create_workflow(&mut conn, None, "wf", WORKFLOW_SCOPE_CUSTOM, None).unwrap();
-        let root = create_node(&mut conn, &wf.id, None, 0, NODE_TYPE_SEQUENCE, "r", "{}").unwrap();
-        let child = create_node(
-            &mut conn,
-            &wf.id,
-            Some(&root.id),
-            0,
-            NODE_TYPE_WAIT,
-            "w",
-            "{}",
-        )
-        .unwrap();
-
-        // The `type` CHECK rejects an unknown node type.
-        assert!(
-            create_node(&mut conn, &wf.id, None, 0, "not_a_type", "x", "{}").is_err(),
-            "an unknown node type is rejected by the CHECK"
-        );
-        // The run `status` CHECK rejects an unknown status.
-        let run = create_workflow_run(&mut conn, &wf.id, None, Some(&root.id), "{}").unwrap();
-        assert!(
-            update_workflow_run(&mut conn, &run.id, None, "{}", "bogus", None).is_err(),
-            "an unknown run status is rejected by the CHECK"
-        );
-
-        // Deleting a COMPOSITE cascades its subtree (parent_id ON DELETE CASCADE).
-        delete_node(&mut conn, &root.id).unwrap();
-        assert!(
-            get_node(&mut conn, &child.id).unwrap().is_none(),
-            "the child cascaded away with its parent composite"
-        );
-
-        // spec_id SET NULL: a run bound to a Spec survives the Spec's deletion, losing the pointer.
-        let (project, _ws) = create_project(&mut conn, "P", "/tmp/wf2-ws", None).unwrap();
-        let (spec, _rev) = create_spec(&mut conn, &project.id, "S", SpecSections::empty()).unwrap();
-        let bound = create_workflow_run(&mut conn, &wf.id, Some(&spec.id), None, "{}").unwrap();
-        delete_project(&mut conn, &project.id).unwrap(); // cascades the spec away
-        let after = get_workflow_run(&mut conn, &bound.id).unwrap().unwrap();
-        assert_eq!(
-            after.spec_id, None,
-            "spec_id SET NULL on the Spec's deletion"
-        );
-
-        // forked_from SET NULL: a fork outlives its origin.
-        let base = create_workflow(&mut conn, None, "base", WORKFLOW_SCOPE_CUSTOM, None).unwrap();
-        let fork = create_workflow(
-            &mut conn,
-            None,
-            "fork",
-            WORKFLOW_SCOPE_CUSTOM,
-            Some(&base.id),
-        )
-        .unwrap();
-        assert_eq!(fork.forked_from.as_deref(), Some(base.id.as_str()));
-        delete_workflow(&mut conn, &base.id).unwrap();
-        let fork_after = get_workflow(&mut conn, &fork.id).unwrap().unwrap();
-        assert_eq!(
-            fork_after.forked_from, None,
-            "forked_from SET NULL when the origin is deleted"
-        );
-
-        // Deleting a workflow CASCADES its nodes + runs.
-        let n = create_node(&mut conn, &wf.id, None, 0, NODE_TYPE_NOTE, "n", "{}").unwrap();
-        let r = create_workflow_run(&mut conn, &wf.id, None, None, "{}").unwrap();
-        delete_workflow(&mut conn, &wf.id).unwrap();
-        assert!(
-            get_node(&mut conn, &n.id).unwrap().is_none(),
-            "nodes cascaded"
-        );
-        assert!(
-            get_workflow_run(&mut conn, &r.id).unwrap().is_none(),
-            "runs cascaded"
-        );
-    }
-
-    /// schema.rs ↔ v34 migration consistency: exercise EVERY column of `workflows` / `nodes` /
-    /// `workflow_runs` (both nullable states, the `type_`→"type" keyword mapping, the enum
-    /// vocabularies) through real inserts + typed selects against the migrated DB. A drift in a
-    /// column name/type would fail to compile or to run here.
-    #[test]
-    fn workflow_engine_schema_matches_migration() {
-        let mut conn = open_in_memory();
-        let (project, _ws) = create_project(&mut conn, "P", "/tmp/wf3-ws", None).unwrap();
-        let (spec, _rev) = create_spec(&mut conn, &project.id, "S", SpecSections::empty()).unwrap();
-
-        // A project-owned workflow (project_id Some) and a fork chain (forked_from Some).
-        let owned = create_workflow(
-            &mut conn,
-            Some(&project.id),
-            "owned",
-            WORKFLOW_SCOPE_CUSTOM,
-            None,
-        )
-        .unwrap();
-        assert_eq!(owned.project_id.as_deref(), Some(project.id.as_str()));
-        let fork = create_workflow(
-            &mut conn,
-            Some(&project.id),
-            "fork",
-            WORKFLOW_SCOPE_NSPEC,
-            Some(&owned.id),
-        )
-        .unwrap();
-        assert_eq!(fork.forked_from.as_deref(), Some(owned.id.as_str()));
-
-        // A root node (parent_id None) + a child (parent_id Some) covering the keyword `type`
-        // column via the `type_` field, plus a non-zero order_index.
-        let root = create_node(
-            &mut conn,
-            &owned.id,
-            None,
-            0,
-            NODE_TYPE_SELECTOR,
-            "sel",
-            "{}",
-        )
-        .unwrap();
-        let branch_cfg =
-            serde_json::json!({ "branches": [{ "cond": null, "child": 0 }] }).to_string();
-        let child = create_node(
-            &mut conn,
-            &owned.id,
-            Some(&root.id),
-            7,
-            NODE_TYPE_TRANSITION,
-            "to review",
-            &branch_cfg,
-        )
-        .unwrap();
-        assert_eq!(child.order_index, 7, "order_index round-trips");
-        assert_eq!(
-            child.type_, NODE_TYPE_TRANSITION,
-            "the `type` keyword column maps to type_"
-        );
-        assert_eq!(child.parent_id.as_deref(), Some(root.id.as_str()));
-
-        // A run bound to a Spec + cursor (both Some) and one with both None.
-        let bound = create_workflow_run(
-            &mut conn,
-            &owned.id,
-            Some(&spec.id),
-            Some(&root.id),
-            "{\"k\":1}",
-        )
-        .unwrap();
-        assert_eq!(bound.spec_id.as_deref(), Some(spec.id.as_str()));
-        assert_eq!(bound.current_node_id.as_deref(), Some(root.id.as_str()));
-        assert_eq!(bound.blackboard, "{\"k\":1}");
-        let unbound = create_workflow_run(&mut conn, &owned.id, None, None, "{}").unwrap();
-        assert_eq!(unbound.spec_id, None);
-        assert_eq!(unbound.current_node_id, None);
-
-        // Typed selects load them back (positional decoding matches the migration column order).
-        let wfs = list_workflows(&mut conn, Some(&project.id)).unwrap();
-        assert_eq!(wfs.len(), 2, "both project-owned workflows load");
-        let nodes_dump = list_nodes(&mut conn, &owned.id).unwrap();
-        assert_eq!(nodes_dump.len(), 2);
-        let runs = list_workflow_runs(&mut conn, &owned.id).unwrap();
-        assert_eq!(runs.len(), 2);
-    }
-
-    /// MIGRATION v46 + the slot CRUD: a project's binding for a slot ROUND-TRIPS, binding the SAME
-    /// (project, slot) twice REPLACES rather than piling up (the UNIQUE index is the invariant that
-    /// makes "the commands this project answers that slot with" a single unambiguous read), an
-    /// unbound slot reads as EMPTY (which is what makes a gate on it refuse), and the binding dies
-    /// with its project (FK CASCADE). Peeling v47 then v46 removes the table, proving v46 is the one
-    /// migration that creates it — and that a DB already at v45 upgrades cleanly.
-    #[test]
-    fn command_slots_bind_upsert_and_cascade_with_their_project() {
-        let mut conn = open_in_memory();
-        let (project, _ws) = create_project(&mut conn, "P", "/tmp/slots", None).unwrap();
-        let (other, _ws2) = create_project(&mut conn, "Other", "/tmp/slots-2", None).unwrap();
-
-        // An UNBOUND slot is an empty list, never an error — the answer a blocking gate refuses on.
-        assert!(command_slot_ids(&mut conn, &project.id, "build_check")
-            .unwrap()
-            .is_empty());
-
-        let bound = bind_command_slot(
-            &mut conn,
-            &project.id,
-            "build_check",
-            &["inst-typecheck".to_string(), "inst-test".to_string()],
-        )
-        .unwrap();
-        assert_eq!(bound.project_id, project.id);
-        assert_eq!(bound.slot, "build_check");
-        assert_eq!(
-            command_slot_ids(&mut conn, &project.id, "build_check").unwrap(),
-            vec!["inst-typecheck".to_string(), "inst-test".to_string()],
-            "the ids round-trip IN ORDER — the gate runs them in sequence",
-        );
-
-        // Re-binding REPLACES (the upsert on UNIQUE(project_id, slot)), it does not accumulate.
-        let rebound =
-            bind_command_slot(&mut conn, &project.id, "build_check", &["inst-only".to_string()])
-                .unwrap();
-        assert_eq!(rebound.id, bound.id, "the same row was updated in place");
-        assert_eq!(
-            command_slot_ids(&mut conn, &project.id, "build_check").unwrap(),
-            vec!["inst-only".to_string()],
-        );
-        assert_eq!(
-            list_command_slots(&mut conn, &project.id).unwrap().len(),
-            1,
-            "one row per (project, slot), whatever the number of binds",
-        );
-
-        // A slot is PER PROJECT: another project's answer to the same slot is its own.
-        assert!(command_slot_ids(&mut conn, &other.id, "build_check")
-            .unwrap()
-            .is_empty());
-        bind_command_slot(&mut conn, &other.id, "build_check", &["theirs".to_string()]).unwrap();
-        assert_eq!(
-            command_slot_ids(&mut conn, &project.id, "build_check").unwrap(),
-            vec!["inst-only".to_string()],
-            "binding theirs left ours alone",
-        );
-
-        // An EMPTY binding reads exactly like no binding — the honest way to undo one.
-        bind_command_slot(&mut conn, &project.id, "build_check", &[]).unwrap();
-        assert!(command_slot_ids(&mut conn, &project.id, "build_check")
-            .unwrap()
-            .is_empty());
-
-        // FK CASCADE: the binding is project data and goes with the project.
-        diesel::delete(projects::table.find(&other.id))
-            .execute(&mut conn)
-            .unwrap();
-        assert!(list_command_slots(&mut conn, &other.id).unwrap().is_empty());
-
-        // Peel v47 then v46 → the table is gone, so v46 is the migration that creates it.
-        // A migration stacked ABOVE v49 — any dated prefix sorts to the HEAD of the directory —
-        // is peeled first, so the NAMED chain below still starts where its first link says.
-        peel_migrations_above(&mut conn, "00000000000049");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v49 (human_turns consumed_by) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v48 (human_turns) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v47 (workflows forked_from_revision) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v46 (command_slots) cleanly");
-        let after: QueryResult<usize> =
-            diesel::sql_query("SELECT id FROM command_slots").execute(&mut conn);
-        assert!(
-            after.is_err(),
-            "after reverting v46 the command_slots table must be gone"
-        );
-    }
-
-    /// `list_runs_for_spec` — the runs of ONE Spec, ACROSS workflows, newest-first. This is the read
-    /// the Spec-side runtime view needs: a Spec is driven by its ndev run AND by the child-workflow
-    /// runs ndev spawns, so neither `list_workflow_runs` (one workflow, every Spec) nor
-    /// `find_runs_for_spec` (one workflow + one Spec) answers it. An unknown Spec is EMPTY, never an
-    /// error — the UI shows its "no run yet" empty state.
-    #[test]
-    fn list_runs_for_spec_returns_a_specs_runs_across_workflows_newest_first() {
-        let mut conn = open_in_memory();
-        let (project, _ws) = create_project(&mut conn, "P", "/tmp/runs-for-spec", None).unwrap();
-        let (spec, _rev) = create_spec(&mut conn, &project.id, "S", SpecSections::empty()).unwrap();
-        let (other, _rev2) =
-            create_spec(&mut conn, &project.id, "Other", SpecSections::empty()).unwrap();
-
-        // TWO workflows — the parent flow and the child it delegates to — both running OUR Spec.
-        let parent =
-            create_workflow(&mut conn, Some(&project.id), "ndev", WORKFLOW_SCOPE_NDEV, None)
-                .unwrap();
-        let child =
-            create_workflow(&mut conn, Some(&project.id), "coder", WORKFLOW_SCOPE_CUSTOM, None)
-                .unwrap();
-
-        let older = create_workflow_run(&mut conn, &parent.id, Some(&spec.id), None, "{}").unwrap();
-        let newer = create_workflow_run(&mut conn, &child.id, Some(&spec.id), None, "{}").unwrap();
-        // Another Spec's run + an UNBOUND run on the same workflows must NOT leak into the list.
-        let foreign =
-            create_workflow_run(&mut conn, &parent.id, Some(&other.id), None, "{}").unwrap();
-        create_workflow_run(&mut conn, &parent.id, None, None, "{}").unwrap();
-
-        // Pin the ordering deterministically (the creations share a millisecond).
-        for (id, started) in [(&older.id, 1_000i64), (&newer.id, 2_000i64)] {
-            diesel::update(workflow_runs::table.filter(workflow_runs::id.eq(id)))
-                .set(workflow_runs::started_at.eq(started))
-                .execute(&mut conn)
-                .unwrap();
-        }
-
-        let runs = list_runs_for_spec(&mut conn, &spec.id).unwrap();
-        let ids: Vec<&str> = runs.iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec![newer.id.as_str(), older.id.as_str()],
-            "the Spec's runs come back newest-first, across BOTH workflows"
-        );
-        assert!(
-            !ids.contains(&foreign.id.as_str()),
-            "another Spec's run — and the unbound run — stay out"
-        );
-
-        assert!(
-            list_runs_for_spec(&mut conn, "nope").unwrap().is_empty(),
-            "an unknown Spec is an empty list, not an error"
-        );
-    }
-
-    /// NON-REGRESSION (review 01KYHPVXX623188P1EVT9MNV7D, finding
-    /// 01KYHPXD7FNFTYFKGZSZT8VXFT): the workflow-engine migration must carry a NUMBER that
-    /// does not collide with parallel-branch migrations. It was `00000000000030`, which on a
-    /// real dev DB already at v33 (holding a FOREIGN `0030` in `__diesel_schema_migrations`)
-    /// made diesel consider "0030 already applied" and SKIP `create_workflow_engine`, so
-    /// `workflows`/`nodes`/`workflow_runs` were never created and /engine rendered empty.
-    /// Renumbering it to `00000000000034` fixes the boot: even with a foreign `0030` recorded
-    /// as applied, our engine migration (now `0034`) is still PENDING and applies, creating
-    /// the tables — after which the built-in workflows seed cleanly.
-    ///
-    /// This test reproduces exactly that DB state (a `0030` present in the migration ledger
-    /// WITHOUT the workflow tables, and `0034` NOT yet applied) and asserts the boot path
-    /// (`run_migrations` + `seed_builtin_workflows`) heals it.
-    #[test]
-    fn workflow_engine_migration_applies_over_foreign_0030() {
-        // Start fully migrated (tables present, `0034` recorded), then peel the design migrations
-        // stacked above the engine one (v38 → v35) and `0034` itself — parking the DB with the
-        // design-system `0030` still applied but NO workflow tables.
-        let mut conn = open_in_memory();
-        // A migration stacked ABOVE v49 — any dated prefix sorts to the HEAD of the directory —
-        // is peeled first, so the NAMED chain below still starts where its first link says.
-        peel_migrations_above(&mut conn, "00000000000049");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v49 (human_turns consumed_by) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v48 (human_turns) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v47 (workflows forked_from_revision) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v46 (command_slots) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v45 (workflow_runs pending_consent) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v44 (managed_commands env) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v43 (subworkflow vocabulary + parent_run_id) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v42 (workflow_runs workspace) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v41 (nodes fork_spec type) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v40 (workflows builtin_revision) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v39 (workflow_runs traversal + query node) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v38 (design components css slot) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v37 (proto interaction prefix rename) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v36 (design bundle recipe) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v35 (design components scan state) cleanly");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v34 (workflow engine) cleanly");
-        assert!(
-            !table_exists(&mut conn, "workflows"),
-            "precondition: the engine tables are gone after reverting v34"
-        );
-
-        // The parallel-branch collision, now REAL in the merged tree: the design-system
-        // `00000000000030` is applied in the ledger but created NO workflow table (it created
-        // `design_components`). Under the old number diesel treated our migration as "0030 already
-        // applied" and skipped it; under `0034` it stays pending.
-        assert!(
-            table_exists(&mut conn, "design_components"),
-            "the applied 0030 created design_components, not a workflow table (the bug's DB state)"
-        );
-        assert!(
-            !table_exists(&mut conn, "workflows"),
-            "0030 created no workflow table"
-        );
-
-        // The boot path: run pending migrations. `0034` (create_workflow_engine) is still
-        // pending — the applied `0030` does not shadow it — so it applies and creates the
-        // three tables.
-        run_migrations(&mut conn).expect("re-run migrations with the design 0030 present");
-        assert!(
-            table_exists(&mut conn, "workflows"),
-            "v34 applied over the 0030 → `workflows` created"
-        );
-        assert!(
-            table_exists(&mut conn, "nodes"),
-            "v34 applied over the 0030 → `nodes` created"
-        );
-        assert!(
-            table_exists(&mut conn, "workflow_runs"),
-            "v34 applied over the 0030 → `workflow_runs` created"
-        );
-
-        // And the full boot completes: the built-in workflows seed cleanly onto the freshly
-        // created tables (idempotent — a re-boot leaves them untouched).
-        crate::seed::seed_builtin_workflows(&mut conn).expect("seed built-in workflows");
-        assert!(
-            !list_workflows(&mut conn, None).unwrap().is_empty(),
-            "built-in workflows are present after the boot heals the schema"
-        );
-    }
-
-    // --- HUMAN-TURN ledger: one turn, one commitment (v48 + v49) -----------
-
-    /// A run parked on a consent question posed to `terminal`, whose reference is the turn standing
-    /// NOW. Returns the run id. Built at the DB level — no engine — because what is under test here
-    /// is the ledger's own arithmetic, not the tick that reads it.
-    fn run_parked_on_consent(conn: &mut SqliteConnection, terminal: &str) -> String {
-        let (project, _ws) =
-            create_project(conn, "P", &format!("/tmp/consent-{terminal}"), None).expect("project");
-        let (spec, _rev) =
-            create_spec(conn, &project.id, "S", SpecSections::empty()).expect("spec");
-        let wf = create_workflow(conn, None, "wf", WORKFLOW_SCOPE_CUSTOM, None).expect("workflow");
-        let ask = create_node(conn, &wf.id, None, 0, NODE_TYPE_ASK_HUMAN, "ask", "{}")
-            .expect("ask_human node");
-        let run =
-            create_workflow_run(conn, &wf.id, Some(&spec.id), Some(&ask.id), "{}").expect("run");
-        let at_ask = last_human_turn(conn, terminal)
-            .expect("ledger")
-            .map(|t| t.turn_id);
-        open_run_consent(
-            conn,
-            &run.id,
-            &ask.id,
-            "commit it?",
-            &["yes".to_string()],
-            terminal,
-            at_ask.as_deref(),
-        )
-        .expect("open the consent");
-        run.id
-    }
-
-    /// A11 — THE TURN MUST COME AFTER THE QUESTION, NOT MERELY DIFFER FROM A REFERENCE.
-    ///
-    /// The guard compared the last turn's IDENTITY against the one that stood at the asking. That
-    /// answers "is this a different turn from the reference?", which is not the same question as
-    /// "did a human speak since we asked?" — and when the reference is absent (a receipt opened on a
-    /// session nyx had never seen a prompt from), a prompt ALREADY sitting on the ledger differs from
-    /// it and let an anterior turn pay for the commitment.
-    ///
-    /// What is NOT attempted here, deliberately: judging whether the turn ANSWERS the question. The
-    /// audit's own case — an `abandon` backed by a turn reading "reprend" — stays acceptable, because
-    /// no guard can read intent and one that tried would fail opaquely. What the guard promises is
-    /// now what it verifies, in the code and in its prose.
-    #[test]
-    fn a_human_turn_from_before_the_question_does_not_answer_it() {
-        let mut conn = open_in_memory();
-        let terminal = "term-anterior";
-
-        // A prompt on the ledger BEFORE any question is posed, and older than the asking.
-        record_human_turn(&mut conn, terminal, Some("turn-old"), "reprend").unwrap();
-        diesel::update(human_turns::table.find(terminal))
-            .set(human_turns::submitted_at.eq(now_millis() - 60_000))
-            .execute(&mut conn)
-            .expect("age the turn");
-
-        // The question is opened with NO reference — the shape a re-armed receipt carries, and the
-        // one the identity comparison alone could not tell from a fresh turn.
-        let (project, _ws) =
-            create_project(&mut conn, "P", "/tmp/consent-anterior", None).expect("project");
-        let (spec, _rev) =
-            create_spec(&mut conn, &project.id, "S", SpecSections::empty()).expect("spec");
-        let wf =
-            create_workflow(&mut conn, None, "wf", WORKFLOW_SCOPE_CUSTOM, None).expect("workflow");
-        let ask = create_node(&mut conn, &wf.id, None, 0, NODE_TYPE_ASK_HUMAN, "ask", "{}")
-            .expect("ask_human node");
-        let run = create_workflow_run(&mut conn, &wf.id, Some(&spec.id), Some(&ask.id), "{}")
-            .expect("run");
-        open_run_consent(
-            &mut conn,
-            &run.id,
-            &ask.id,
-            "commit it?",
-            &["yes".to_string()],
-            terminal,
-            None,
-        )
-        .expect("open the consent");
-
-        // THE ANTERIOR TURN DOES NOT PAY.
-        match close_run_consent(&mut conn, &run.id, "yes").unwrap() {
-            ConsentClose::NoTurnSince(Some(turn)) => {
-                assert_eq!(
-                    turn.turn_id, "turn-old",
-                    "the refusal carries the stale turn it refused to count"
-                );
-            }
-            other => panic!("a turn from before the question paid for it: {other:?}"),
-        }
-        assert!(
-            get_workflow_run(&mut conn, &run.id)
-                .unwrap()
-                .unwrap()
-                .pending_consent
-                .is_some(),
-            "the question stays open — nothing was written"
-        );
-        assert_eq!(
-            last_human_turn(&mut conn, terminal)
-                .unwrap()
-                .unwrap()
-                .consumed_by,
-            None,
-            "…and the stale turn was not spent"
-        );
-
-        // A POSTERIOR turn does pay, exactly as before.
-        record_human_turn(&mut conn, terminal, Some("turn-new"), "abandonne").unwrap();
-        let ConsentClose::Accepted(paid) = close_run_consent(&mut conn, &run.id, "yes").unwrap()
-        else {
-            panic!("a turn taken after the question must be accepted");
-        };
-        assert_eq!(paid.turn_id, "turn-new");
-    }
-
-    /// ONE HUMAN TURN AUTHORISES ONE COMMITMENT, at the level the guarantee actually lives: the turn
-    /// that pays for a consent is MARKED as it pays, in the same transaction, so the next question
-    /// reaching the ledger on the same turn finds it spent and is told SO — a distinct verdict, not
-    /// the "nobody typed since" of a turn that never happened.
-    #[test]
-    fn a_human_turn_pays_for_one_consent_and_the_next_is_told_it_is_spent() {
-        let mut conn = open_in_memory();
-        let first = run_parked_on_consent(&mut conn, "term-1t1c");
-        let second = run_parked_on_consent(&mut conn, "term-1t1c");
-
-        // The human types ONCE. Both receipts named the ledger as it stood BEFORE, so both now read
-        // a different last turn — which is exactly what let both accept.
-        record_human_turn(&mut conn, "term-1t1c", Some("turn-A"), "yes, go").unwrap();
-
-        let ConsentClose::Accepted(paid) = close_run_consent(&mut conn, &first, "yes").unwrap()
-        else {
-            panic!("the first answer stands on a real human turn and must be accepted");
-        };
-        assert_eq!(paid.turn_id, "turn-A");
-        assert_eq!(
-            last_human_turn(&mut conn, "term-1t1c")
-                .unwrap()
-                .unwrap()
-                .consumed_by
-                .as_deref(),
-            Some(first.as_str()),
-            "the accepted consent MARKS the turn it spent — that mark is the whole invariant"
-        );
-
-        match close_run_consent(&mut conn, &second, "yes").unwrap() {
-            ConsentClose::TurnAlreadySpent { turn, on_run } => {
-                assert_eq!(turn.turn_id, "turn-A");
-                assert_eq!(
-                    on_run, first,
-                    "…and NAMES the commitment those words paid for"
-                );
-            }
-            other => panic!("one sentence authorised a second commitment: {other:?}"),
-        }
-        assert!(
-            get_workflow_run(&mut conn, &second)
-                .unwrap()
-                .unwrap()
-                .pending_consent
-                .is_some(),
-            "the refused run keeps its question open — nothing was written for it"
-        );
-
-        // The way out is the ordinary one: the human answers THIS question, and that new turn pays.
-        record_human_turn(
-            &mut conn,
-            "term-1t1c",
-            Some("turn-B"),
-            "yes to that one too",
-        )
-        .unwrap();
-        assert!(matches!(
-            close_run_consent(&mut conn, &second, "yes").unwrap(),
-            ConsentClose::Accepted(_)
-        ));
-    }
-
-    /// The consumption mark follows the turn's IDENTITY, not the row. A `UserPromptSubmit` POST that
-    /// lands TWICE rewrites the same row and must leave the mark standing: a duplicate that handed a
-    /// spent turn back unspent would buy a second commitment through the write path, which is the
-    /// forgery the identity check refuses on the read one. A genuinely NEW turn lands unspent.
-    #[test]
-    fn a_redelivered_hook_does_not_un_spend_the_turn_it_re_delivers() {
-        let mut conn = open_in_memory();
-        let run = run_parked_on_consent(&mut conn, "term-dup");
-        record_human_turn(&mut conn, "term-dup", Some("turn-A"), "lance-le").unwrap();
-        close_run_consent(&mut conn, &run, "yes").unwrap();
-
-        // The SAME hook lands again — a retry, a duplicated POST.
-        let redelivered = record_human_turn(&mut conn, "term-dup", Some("turn-A"), "lance-le")
-            .expect("a duplicate delivery is accepted");
-        assert_eq!(
-            redelivered.consumed_by.as_deref(),
-            Some(run.as_str()),
-            "re-delivering a turn does not un-spend it"
-        );
-
-        // A NEW prompt is a NEW turn, and nobody has spent that one.
-        let fresh =
-            record_human_turn(&mut conn, "term-dup", Some("turn-B"), "et maintenant").unwrap();
-        assert_eq!(fresh.consumed_by, None, "a new turn lands unspent");
-    }
-
-    /// A close that finds NOTHING to close is not a success. It used to return `Ok(())` on a run with
-    /// no receipt, which made the loser of the very race above look like a winner — the tick read
-    /// "closed fine" and walked on past a question nobody had answered. It is a VERDICT now, and the
-    /// caller has to say what it means.
-    #[test]
-    fn closing_a_consent_that_was_never_asked_is_not_a_success() {
-        let mut conn = open_in_memory();
-        let wf = create_workflow(&mut conn, None, "wf", WORKFLOW_SCOPE_CUSTOM, None).unwrap();
-        let run = create_workflow_run(&mut conn, &wf.id, None, None, "{}").unwrap();
-        assert_eq!(
-            close_run_consent(&mut conn, &run.id, "yes").unwrap(),
-            ConsentClose::NoReceipt
-        );
-        assert_eq!(
-            close_run_consent(&mut conn, "nope", "yes")
-                .unwrap_err()
-                .to_string(),
-            diesel::result::Error::NotFound.to_string(),
-            "and a run that does not exist at all is an error, not a verdict"
-        );
-    }
-
-    /// MIGRATION v49: the consumption mark is the column the invariant is written in. A DB migrated
-    /// through the head carries it; reverted to v48 it is GONE (a select on it fails) while the
-    /// ledger ITSELF is still there — the chain is pinned at both ends, so one revert too few or one
-    /// too many fails instead of passing on an unexercised `down.sql`. Re-applying restores it.
-    #[test]
-    fn migration_v49_adds_the_human_turn_consumption_mark() {
-        let mut conn = open_in_memory();
-        record_human_turn(&mut conn, "term-v49", Some("turn-A"), "hello").unwrap();
-        assert!(
-            diesel::sql_query("SELECT consumed_by FROM human_turns")
-                .execute(&mut conn)
-                .is_ok(),
-            "the migrated schema carries the mark"
-        );
-
-        // A migration stacked ABOVE v49 — any dated prefix sorts to the HEAD of the directory —
-        // is peeled first, so the NAMED chain below still starts where its first link says.
-        peel_migrations_above(&mut conn, "00000000000049");
-        conn.revert_last_migration(MIGRATIONS)
-            .expect("revert v49 (human_turns consumed_by) cleanly");
-        assert!(
-            diesel::sql_query("SELECT consumed_by FROM human_turns")
-                .execute(&mut conn)
-                .is_err(),
-            "after reverting v49 the column must be gone — one revert too FEW and this passes blind"
-        );
-        assert!(
-            diesel::sql_query("SELECT turn_id FROM human_turns")
-                .execute(&mut conn)
-                .is_ok(),
-            "the chain stops AT v49: v48's ledger table must still be applied"
-        );
-
-        // The up restores it, and the row that lived through the round trip is unspent (the column
-        // was added nullable — an existing turn has authorised nothing).
-        run_migrations(&mut conn).expect("re-apply v49");
-        let turn = last_human_turn(&mut conn, "term-v49").unwrap().unwrap();
-        assert_eq!(turn.turn_id, "turn-A");
-        assert_eq!(turn.consumed_by, None);
-    }
-
     /// MIGRATION app_settings: `app_settings` is the app-level preference store — the first table scoped to
     /// the INSTALLATION rather than to a project/workspace/terminal. A DB migrated through the head
-    /// carries it and accepts a write; reverted ONCE it is GONE (a select on it fails) while v49's
-    /// consumption mark is still there — the chain is pinned at both ends, so one revert too few or
+    /// carries it and accepts a write; reverted ONCE it is GONE (a select on it fails) while v50's
+    /// url unique index is still there — the chain is pinned at both ends, so one revert too few or
     /// one too many fails instead of passing on an unexercised `down.sql`. Re-applying restores an
     /// EMPTY store: `down.sql` drops the table, so nothing written before the revert survives it.
     #[test]
@@ -31721,11 +28753,13 @@ mod tests {
                 .is_err(),
             "after reverting the app_settings migration the table must be gone — one revert too FEW and this passes blind"
         );
+        // LOWER END — the closest neighbour below that can still be OBSERVED. v51's `down.sql` is a
+        // documented no-op, so the first over-peel that shows is v50's partial unique index on
+        // `annexes.url`. It used to be v49's `human_turns.consumed_by`, which the orchestration
+        // engine took with it (PDR-0031).
         assert!(
-            diesel::sql_query("SELECT consumed_by FROM human_turns")
-                .execute(&mut conn)
-                .is_ok(),
-            "the chain stops AT app_settings: v49's consumption mark must still be applied"
+            index_exists(&mut conn, "idx_annexes_url_unique_per_spec"),
+            "the chain stops AT app_settings: v50's url unique index must still be applied"
         );
 
         run_migrations(&mut conn).expect("re-apply the app_settings migration");
@@ -31836,39 +28870,31 @@ mod tests {
         assert_eq!(rows(&mut conn).len(), 1);
     }
 
-    /// MIGRATION 20260818130000: the WHERE of a dev workspace (`projects.worktrees_root`) and the
-    /// `create_workspace` node type ship in ONE migration, so ONE revert must take BOTH away. A DB
-    /// migrated through the head carries the column and accepts the node type; reverted by ONE step
-    /// the column is GONE and the `nodes.type` CHECK REJECTS `create_workspace` again, while the
-    /// migrations BELOW are STILL standing — the chain is pinned at both ends, so one revert too
-    /// few, or one too many past the point where an over-peel becomes observable, fails instead of
-    /// passing on an unexercised `down.sql`. Re-applying restores both halves, and the row carried
-    /// through the two CHECK rebuilds comes back untouched.
+    /// MIGRATION 20260818130000: the WHERE of a dev workspace — `projects.worktrees_root`. A DB
+    /// migrated through the head carries the column and takes a value; reverted by ONE step the
+    /// column is GONE while the migrations BELOW are STILL standing — the chain is pinned at both
+    /// ends, so one revert too few, or one too many past the point where an over-peel becomes
+    /// observable, fails instead of passing on an unexercised `down.sql`. Re-applying restores it,
+    /// empty, and it is writable again through the same setter.
+    ///
+    /// This migration ALSO widened the `nodes.type` CHECK to a sixteenth value, `create_workspace`.
+    /// That half is no longer asserted: `nodes` left the schema with the orchestration engine
+    /// (PDR-0031), and `20260907120000_drop_engine_tables` sits above this one. Its `down.sql`
+    /// rebuilds the table so the chain below still replays — which is exactly what the peel here
+    /// walks through — but there is no longer a Rust door onto it to probe the vocabulary with.
     ///
     /// ON THE TIMESTAMP, AND WHY THE NEIGHBOUR BELOW MOVED. This migration is the only one here not
     /// numbered sequentially: three parallel branches were all claiming `00000000000050` at once,
-    /// and a collision on that number makes diesel consider ours already applied and SKIP it — the
-    /// exact failure `workflow_engine_migration_applies_over_foreign_0030` exists to pin. The
+    /// and a collision on that number makes diesel consider ours already applied and SKIP it. The
     /// timestamp keeps it LAST in diesel's lexicographic order whatever the other branches land, so
     /// it is still the head after v50/v51 merged underneath it — but v49 is no longer what sits
     /// directly below, which is why the lower guard below pins v50's index and not v49's column.
     #[test]
-    fn migration_worktrees_root_adds_the_column_and_the_create_workspace_node() {
-        /// A node of `node_type` on `wf`, so the CHECK is probed on ONE short line per assertion.
-        fn add_node(
-            conn: &mut SqliteConnection,
-            wf: &str,
-            order: i32,
-            node_type: &str,
-        ) -> QueryResult<Node> {
-            create_node(conn, wf, None, order, node_type, "n", "{}")
-        }
-
+    fn migration_worktrees_root_adds_the_where_of_a_dev_workspace() {
         let mut conn = open_in_memory();
         let (project, _ws) = create_project(&mut conn, "Proj", "/tmp/wt-root", None).unwrap();
-        let wf = create_workflow(&mut conn, None, "wt-root", WORKFLOW_SCOPE_CUSTOM, None).unwrap();
 
-        // The migrated schema carries BOTH halves: the column takes a value…
+        // The migrated schema carries the column, and it takes a value.
         set_project_worktrees_root(&mut conn, &project.id, Some("D:/wt")).unwrap();
         assert_eq!(
             get_project(&mut conn, &project.id)
@@ -31879,33 +28905,16 @@ mod tests {
             Some("D:/wt"),
             "the migrated schema carries the column"
         );
-        // …and the widened CHECK accepts the sixteenth type.
-        let carried = add_node(&mut conn, &wf.id, 0, NODE_TYPE_NOTE).expect("a plain note node");
-        add_node(&mut conn, &wf.id, 1, NODE_TYPE_CREATE_WORKSPACE)
-            .expect("the widened CHECK accepts 'create_workspace'");
 
-        // The down NARROWS the vocabulary back, so it is clean only once no row still speaks it —
-        // drop the one node that does, exactly as a real downgrade would have to.
-        diesel::sql_query("DELETE FROM nodes WHERE \"type\" = 'create_workspace'")
-            .execute(&mut conn)
-            .expect("no row may keep a vocabulary the down removes");
         // NAMED, not counted: peel every dated head above `app_settings` — `worktrees_root` itself
-        // and the command groups stacked on it — so the chain lands where the assertions below say
-        // it does however many migrations get added on top.
+        // and everything stacked on it — so the chain lands where the assertions below say it does
+        // however many migrations get added on top.
         revert_down_through(&mut conn, "20260818020000");
         assert!(
             diesel::sql_query("SELECT worktrees_root FROM projects")
                 .execute(&mut conn)
                 .is_err(),
             "after that revert the column must be gone — one revert too FEW and this passes blind"
-        );
-        assert!(
-            add_node(&mut conn, &wf.id, 1, NODE_TYPE_CREATE_WORKSPACE).is_err(),
-            "and the narrowed CHECK refuses 'create_workspace' again"
-        );
-        assert!(
-            add_node(&mut conn, &wf.id, 2, NODE_TYPE_TRANSITION_TASK).is_ok(),
-            "while the fifteen types it inherited are untouched by the rebuild"
         );
         // LOWER END. This migration was authored directly on top of v49, but v50 (the annexes url
         // unique index) and v51 (the annexes url canonical form) landed underneath it before the
@@ -31920,20 +28929,9 @@ mod tests {
              revert too many lands on v51's no-op down and is invisible by construction, one more \
              drops this index and fails"
         );
-        assert!(
-            diesel::sql_query("SELECT consumed_by FROM human_turns")
-                .execute(&mut conn)
-                .is_ok(),
-            "and v49's consumption mark, further down still, is untouched"
-        );
 
-        // The up restores both halves, and the note carried through both rebuilds is identical.
+        // The up restores the column.
         run_migrations(&mut conn).expect("re-apply the worktrees_root migration");
-        assert_eq!(get_node(&mut conn, &carried.id).unwrap().unwrap(), carried);
-        assert!(
-            add_node(&mut conn, &wf.id, 3, NODE_TYPE_CREATE_WORKSPACE).is_ok(),
-            "the re-applied CHECK accepts 'create_workspace' again"
-        );
         assert_eq!(
             get_project(&mut conn, &project.id)
                 .unwrap()
@@ -31951,102 +28949,6 @@ mod tests {
                 .as_deref(),
             Some("D:/wt2"),
             "and it is writable again through the same setter"
-        );
-    }
-
-    /// EXHAUSTIVE — THE VOCABULARY AND THE CHECK ARE ONE THING, WRITTEN TWICE. [`NODE_TYPES`] is what
-    /// the interpreter ([`crate::engine::NodeType`]) and the authoring layer
-    /// ([`crate::mcp_authoring::parse_node_type`]) validate against; the `nodes.type` CHECK is what
-    /// the database enforces. A type that lands in one and not the other is a graph nyx accepts to
-    /// AUTHOR and refuses to STORE — or, worse, a stored row the interpreter cannot read.
-    ///
-    /// So this replays the WHOLE constant against the real migrated schema, one insert per entry, and
-    /// pins the complement: a word that is not in it is refused. An EIGHTEENTH node type declared
-    /// without its migration fails HERE, on the type it forgot, instead of at the first `node_add` a
-    /// user makes.
-    #[test]
-    fn every_declared_node_type_is_accepted_by_the_stored_check() {
-        let mut conn = open_in_memory();
-        let wf =
-            create_workflow(&mut conn, None, "vocabulary", WORKFLOW_SCOPE_CUSTOM, None).unwrap();
-        for (order, node_type) in NODE_TYPES.iter().enumerate() {
-            create_node(&mut conn, &wf.id, None, order as i32, node_type, "n", "{}")
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "the stored `nodes.type` CHECK refuses the declared node type \
-                         '{node_type}' — NODE_TYPES and the migration chain have drifted: {e}"
-                    )
-                });
-        }
-        assert!(
-            create_node(&mut conn, &wf.id, None, 900, "dragon", "n", "{}").is_err(),
-            "and the CHECK is a CLOSED set — a word outside NODE_TYPES is refused, or the constant \
-             describes nothing"
-        );
-    }
-
-    /// MIGRATION 20260828205640: the SEVENTEENTH node type, `set_category` — the classification the
-    /// engine IMPOSES (PDR-0017 / ADR-0006). One migration, one CHECK, both directions exercised: the
-    /// migrated head accepts it, ONE revert refuses it again while every type it inherited still
-    /// stores, and re-applying accepts it once more with the rows carried through both rebuilds
-    /// untouched. The `down.sql` is therefore never an unexercised file.
-    #[test]
-    fn migration_set_category_widens_and_narrows_the_node_type_check() {
-        /// A node of `node_type` on `wf`, so the CHECK is probed on ONE short line per assertion.
-        fn add_node(
-            conn: &mut SqliteConnection,
-            wf: &str,
-            order: i32,
-            node_type: &str,
-        ) -> QueryResult<Node> {
-            create_node(conn, wf, None, order, node_type, "n", "{}")
-        }
-
-        let mut conn = open_in_memory();
-        let wf = create_workflow(&mut conn, None, "set-cat", WORKFLOW_SCOPE_CUSTOM, None).unwrap();
-
-        let carried = add_node(&mut conn, &wf.id, 0, NODE_TYPE_NOTE).expect("a plain note node");
-        let doomed = add_node(&mut conn, &wf.id, 1, NODE_TYPE_SET_CATEGORY)
-            .expect("the widened CHECK accepts 'set_category'");
-
-        // THE DOWN CLEANS UP AFTER ITSELF — unlike its four predecessors, which narrow the same
-        // CHECK and leave the deletion to the operator. It has to: this migration is the HEAD, and
-        // any booted nyx carries a seeded `set_category` node, so a down that refused to touch rows
-        // could never run at all. The node below is left in place ON PURPOSE — the revert must
-        // succeed with it there.
-        revert_down_through(&mut conn, "20260828205640");
-        assert!(
-            get_node(&mut conn, &doomed.id).unwrap().is_none(),
-            "the revert removed what was written in the vocabulary it removed — anything else is \
-             not a revert"
-        );
-        assert!(
-            add_node(&mut conn, &wf.id, 1, NODE_TYPE_SET_CATEGORY).is_err(),
-            "after the revert the narrowed CHECK refuses 'set_category' again — one revert too few \
-             and this passes blind"
-        );
-        assert!(
-            add_node(&mut conn, &wf.id, 2, NODE_TYPE_CREATE_WORKSPACE).is_ok(),
-            "while the sixteen types it inherited are untouched by the rebuild"
-        );
-        // LOWER END — the migration directly below is still standing (the `categories` table of this
-        // same PRD), so one revert too MANY fails here instead of passing on a peeled chain.
-        assert!(
-            diesel::sql_query("SELECT slug FROM categories")
-                .execute(&mut conn)
-                .is_ok(),
-            "the chain stops just under the head: the `categories` table below it is still applied"
-        );
-
-        run_migrations(&mut conn).expect("re-apply the set_category migration");
-        assert_eq!(
-            get_node(&mut conn, &carried.id).unwrap().unwrap(),
-            carried,
-            "the note carried through both CHECK rebuilds comes back untouched"
-        );
-        assert!(
-            add_node(&mut conn, &wf.id, 3, NODE_TYPE_SET_CATEGORY).is_ok(),
-            "the re-applied CHECK accepts 'set_category' again"
         );
     }
 
@@ -35636,347 +32538,6 @@ mod tests {
                     "{slug} folded onto {token}, outside the palette"
                 );
                 assert_eq!(token, category_color_token(slug), "…and it is PURE");
-            }
-        }
-    }
-
-    /// The APPEND-ONLY gate evidence journal: what it keeps, what it never loses, and the output
-    /// policy that bounds and sanitises what a project's command printed.
-    mod gate_evidence_journal {
-        use super::*;
-
-        /// A project + Spec + workflow + run, the correlations an attempt hangs on.
-        fn run_fixture(conn: &mut SqliteConnection) -> (String, String) {
-            let (project, _ws) = create_project(conn, "P", "/tmp/gate-evidence", None).unwrap();
-            let (spec, _rev) = create_spec(conn, &project.id, "S", SpecSections::empty()).unwrap();
-            let wf = create_workflow(conn, Some(&project.id), "wf", WORKFLOW_SCOPE_CUSTOM, None)
-                .unwrap();
-            let run = create_workflow_run(conn, &wf.id, Some(&spec.id), None, "{}").unwrap();
-            (spec.id, run.id)
-        }
-
-        /// One attempt, spelled once so the tests below vary only what they are about.
-        fn attempt(run_id: &str, spec_id: &str, outcome: &str, expect: &str) -> NewGateAttempt {
-            NewGateAttempt {
-                run_id: run_id.to_string(),
-                spec_id: Some(spec_id.to_string()),
-                node_id: "repro-gate".into(),
-                slot: Some("repro_check".into()),
-                expect: expect.to_string(),
-                declared: true,
-                blocking: true,
-                outcome: outcome.to_string(),
-                satisfied: (expect == GATE_EXPECT_RED && outcome == GATE_OUTCOME_FAILED)
-                    || (expect == GATE_EXPECT_GREEN && outcome == GATE_OUTCOME_PASSED),
-                command_line: "cargo test -p nyx-core repro_".into(),
-                cwd: "/tmp/gate-evidence".into(),
-                exit_code: if outcome == GATE_OUTCOME_PASSED {
-                    Some(0)
-                } else {
-                    Some(1)
-                },
-                duration_ms: 1234,
-                output_excerpt: "1 test failed".into(),
-                commands_json: "[]".into(),
-                created_at: 0,
-            }
-        }
-
-        /// THE INVARIANT the whole table exists for: successive attempts ACCUMULATE. A red followed
-        /// by a green is TWO rows, readable in the order they happened — which is exactly what a
-        /// single overwritten blackboard key could not give, and what "the red preceded the fix" is
-        /// read from.
-        #[test]
-        fn successive_attempts_accumulate_and_none_overwrites_another() {
-            let mut conn = open_in_memory();
-            let (spec_id, run_id) = run_fixture(&mut conn);
-
-            let red = append_gate_attempt(
-                &mut conn,
-                attempt(&run_id, &spec_id, GATE_OUTCOME_FAILED, GATE_EXPECT_RED),
-            )
-            .expect("the red is recorded");
-            let green = append_gate_attempt(
-                &mut conn,
-                attempt(&run_id, &spec_id, GATE_OUTCOME_PASSED, GATE_EXPECT_GREEN),
-            )
-            .expect("the green is recorded");
-
-            assert!(
-                green.sequence > red.sequence,
-                "the journal is ordered by append, not by clock"
-            );
-            let sequence = list_gate_attempts_for_spec(&mut conn, &spec_id).unwrap();
-            assert_eq!(sequence.len(), 2, "BOTH survive — nothing was overwritten");
-            assert_eq!(
-                sequence
-                    .iter()
-                    .map(|a| a.outcome.as_str())
-                    .collect::<Vec<_>>(),
-                vec![GATE_OUTCOME_FAILED, GATE_OUTCOME_PASSED],
-                "and they read RED FIRST — the order the proof is made of"
-            );
-            assert!(sequence[0].satisfied && sequence[1].satisfied);
-            // The IDENTITY of the control is comparable between the two, which is what the auditor
-            // is told to check: same slot, same resolved commands, same cwd.
-            assert_eq!(sequence[0].slot, sequence[1].slot);
-            assert_eq!(sequence[0].command_line, sequence[1].command_line);
-            assert_eq!(sequence[0].cwd, sequence[1].cwd);
-            // The run-scoped read answers the same series.
-            assert_eq!(list_gate_attempts_for_run(&mut conn, &run_id).unwrap().len(), 2);
-        }
-
-        /// RETENTION — the journal outlives what it describes. Deleting the RUN (the gesture nyx's
-        /// own refusals tell a caller to make) must not erase the evidence: the correlation ids
-        /// carry no FK precisely so a CASCADE cannot silently truncate an append-only proof.
-        #[test]
-        fn the_evidence_outlives_the_run_and_the_workflow_it_describes() {
-            let mut conn = open_in_memory();
-            let (spec_id, run_id) = run_fixture(&mut conn);
-            append_gate_attempt(
-                &mut conn,
-                attempt(&run_id, &spec_id, GATE_OUTCOME_FAILED, GATE_EXPECT_RED),
-            )
-            .unwrap();
-
-            let run = get_workflow_run(&mut conn, &run_id).unwrap().expect("the run");
-            delete_workflow_run(&mut conn, &run_id).expect("drop the run");
-            assert!(get_workflow_run(&mut conn, &run_id).unwrap().is_none());
-            // Dropping the WORKFLOW cascades its runs; the evidence is still not among them.
-            delete_workflow(&mut conn, &run.workflow_id).expect("drop the workflow");
-
-            let kept = list_gate_attempts_for_spec(&mut conn, &spec_id).unwrap();
-            assert_eq!(
-                kept.len(),
-                1,
-                "the attempt HAPPENED — no later deletion may make it unhappen"
-            );
-            assert_eq!(kept[0].run_id, run_id, "and it still names what it described");
-        }
-
-        /// The run's own journal REFERENCES the evidence: every append files a `run.gate_attempt`
-        /// outbox row carrying the attempt's `sequence`, so a reader of the run's history can get to
-        /// the full record without knowing the evidence table. The reference and not a copy — the
-        /// bounded output stays where it was written.
-        #[test]
-        fn every_append_files_a_run_event_that_points_at_it() {
-            let mut conn = open_in_memory();
-            let (spec_id, run_id) = run_fixture(&mut conn);
-            let row = append_gate_attempt(
-                &mut conn,
-                attempt(&run_id, &spec_id, GATE_OUTCOME_FAILED, GATE_EXPECT_RED),
-            )
-            .unwrap();
-
-            let events: Vec<DomainEvent> = list_domain_events(&mut conn)
-                .unwrap()
-                .into_iter()
-                .filter(|e| e.event_type == EVENT_RUN_GATE_ATTEMPT)
-                .collect();
-            assert_eq!(events.len(), 1, "one attempt, one run event");
-            assert_eq!(events[0].aggregate, AGGREGATE_RUN);
-            let payload: serde_json::Value = serde_json::from_str(&events[0].payload).unwrap();
-            assert_eq!(
-                payload["evidence_sequence"],
-                serde_json::json!(row.sequence),
-                "THE REFERENCE — the evidence row's own key"
-            );
-            assert_eq!(payload["run_id"], serde_json::json!(run_id));
-            assert_eq!(payload["spec_id"], serde_json::json!(spec_id));
-            assert_eq!(payload["outcome"], serde_json::json!(GATE_OUTCOME_FAILED));
-            assert_eq!(payload["expect"], serde_json::json!(GATE_EXPECT_RED));
-            assert_eq!(payload["satisfied"], serde_json::json!(true));
-            assert!(
-                !events[0].payload.contains("1 test failed"),
-                "the outbox row references the evidence, it does not copy its output"
-            );
-        }
-
-        /// THE ERROR PATH — a run that resolves to NO project still gets its evidence recorded. The
-        /// run EVENT cannot be filed (`domain_events.project_id` is not nullable) and is skipped
-        /// without failing, because losing the pointer must not lose the proof.
-        #[test]
-        fn an_attempt_on_a_run_with_no_project_is_still_recorded() {
-            let mut conn = open_in_memory();
-            let wf = create_workflow(&mut conn, None, "global", WORKFLOW_SCOPE_CUSTOM, None).unwrap();
-            let run = create_workflow_run(&mut conn, &wf.id, None, None, "{}").unwrap();
-
-            let mut orphan = attempt(&run.id, "unused", GATE_OUTCOME_INDETERMINATE, GATE_EXPECT_RED);
-            orphan.spec_id = None;
-            orphan.satisfied = false;
-            let row = append_gate_attempt(&mut conn, orphan).expect("the evidence is still written");
-            assert_eq!(
-                list_gate_attempts_for_run(&mut conn, &run.id).unwrap(),
-                vec![row],
-                "the attempt is journaled even with nothing to scope an outbox row to"
-            );
-            assert!(
-                list_domain_events(&mut conn)
-                    .unwrap()
-                    .iter()
-                    .all(|e| e.event_type != EVENT_RUN_GATE_ATTEMPT),
-                "and no un-scopable run event was invented"
-            );
-            // An attempt on a run that is ALREADY gone is recorded too — the journal never depends
-            // on the thing it describes still existing.
-            delete_workflow_run(&mut conn, &run.id).unwrap();
-            append_gate_attempt(
-                &mut conn,
-                attempt(&run.id, "unused", GATE_OUTCOME_FAILED, GATE_EXPECT_RED),
-            )
-            .expect("a vanished run does not fail the journal");
-        }
-
-        /// CONCURRENCY — appends racing from several threads onto ONE database each get their own
-        /// row and their own `sequence`. A gate runs on the `nyx_next` dispatch path, which is
-        /// served by a worker POOL, so two runs can be journaling at the same instant; a journal
-        /// that lost or merged one of them would lose an attempt nobody could tell was missing.
-        #[test]
-        fn concurrent_appends_each_get_their_own_row_and_sequence() {
-            let db = Db::in_memory();
-            let (spec_id, run_id) = db.with_conn(run_fixture);
-
-            const THREADS: usize = 6;
-            const EACH: usize = 4;
-            std::thread::scope(|scope| {
-                for t in 0..THREADS {
-                    let db = &db;
-                    let (spec_id, run_id) = (spec_id.clone(), run_id.clone());
-                    scope.spawn(move || {
-                        for i in 0..EACH {
-                            let mut a =
-                                attempt(&run_id, &spec_id, GATE_OUTCOME_FAILED, GATE_EXPECT_RED);
-                            a.node_id = format!("gate-{t}-{i}");
-                            db.with_conn(|c| append_gate_attempt(c, a)).expect("append");
-                        }
-                    });
-                }
-            });
-
-            let all = db
-                .with_conn(|c| list_gate_attempts_for_spec(c, &spec_id))
-                .unwrap();
-            assert_eq!(all.len(), THREADS * EACH, "every append landed");
-            let sequences: std::collections::BTreeSet<i64> =
-                all.iter().map(|a| a.sequence).collect();
-            assert_eq!(sequences.len(), all.len(), "and each got its OWN sequence");
-            let nodes: std::collections::BTreeSet<&str> =
-                all.iter().map(|a| a.node_id.as_str()).collect();
-            assert_eq!(nodes.len(), THREADS * EACH, "no attempt overwrote another's");
-        }
-
-        /// The vocabularies the migration's CHECKs close are the ones `db.rs` spells — confronted
-        /// with the LIVE constraint, so a re-spelling on either side goes red instead of quietly
-        /// letting an ungradeable value into the journal.
-        #[test]
-        fn the_expect_and_outcome_vocabularies_match_the_live_checks() {
-            let mut conn = open_in_memory();
-            let (spec_id, run_id) = run_fixture(&mut conn);
-
-            for expect in GATE_EXPECTATIONS {
-                for outcome in GATE_OUTCOMES {
-                    append_gate_attempt(&mut conn, attempt(&run_id, &spec_id, outcome, expect))
-                        .unwrap_or_else(|e| panic!("({expect}, {outcome}) must be storable: {e}"));
-                }
-            }
-            let mut bad = attempt(&run_id, &spec_id, GATE_OUTCOME_FAILED, GATE_EXPECT_RED);
-            bad.expect = "orange".into();
-            assert!(
-                append_gate_attempt(&mut conn, bad).is_err(),
-                "an expectation outside the vocabulary is refused by the schema"
-            );
-            let mut bad = attempt(&run_id, &spec_id, GATE_OUTCOME_FAILED, GATE_EXPECT_RED);
-            bad.outcome = "maybe".into();
-            assert!(
-                append_gate_attempt(&mut conn, bad).is_err(),
-                "so is an outcome outside it"
-            );
-        }
-
-        /// THE OUTPUT POLICY, rule by rule — see [`gate_evidence_excerpt`].
-        #[test]
-        fn the_output_policy_bounds_from_the_end_strips_control_bytes_and_redacts_disclosures() {
-            // 1. BOUNDED, from the END, and MARKED when cut.
-            let long = "x".repeat(GATE_EVIDENCE_EXCERPT_CHARS * 2) + "THE-ASSERTION-THAT-FAILED";
-            let cut = gate_evidence_excerpt(&long);
-            assert!(
-                cut.starts_with(GATE_EVIDENCE_TRUNCATED),
-                "a cut excerpt says so, so it never reads as a whole one"
-            );
-            assert!(
-                cut.ends_with("THE-ASSERTION-THAT-FAILED"),
-                "and the END is what is kept — the part that explains a failure"
-            );
-            assert!(
-                cut.chars().count()
-                    <= GATE_EVIDENCE_EXCERPT_CHARS + GATE_EVIDENCE_TRUNCATED.chars().count(),
-                "the bound holds"
-            );
-            // A short one is untouched and unmarked.
-            let short = gate_evidence_excerpt("1 test failed\n");
-            assert_eq!(short, "1 test failed");
-
-            // 2. INERT: escape sequences and control bytes never reach the journal.
-            let painted = gate_evidence_excerpt("\u{1b}[31mFAILED\u{1b}[0m\u{0}\u{7}\nline two\t.");
-            assert_eq!(painted, "FAILED\nline two\t.", "got {painted:?}");
-
-            // 3. REDACTED where a secret is SELF-DISCLOSED by the command's own output.
-            let dumped = gate_evidence_excerpt(
-                "GITHUB_TOKEN=ghp_supersecretvalue\n\
-                 npm_password: hunter2\n\
-                 Authorization: Bearer eyJhbGciOi\n\
-                 EXPECTED=42\n\
-                 assert_eq failed: left = 1, right = 2",
-            );
-            assert!(!dumped.contains("ghp_supersecretvalue"), "got {dumped}");
-            assert!(!dumped.contains("hunter2"), "got {dumped}");
-            assert!(!dumped.contains("eyJhbGciOi"), "got {dumped}");
-            assert!(
-                dumped.matches(GATE_EVIDENCE_REDACTED).count() == 3,
-                "each disclosure is replaced, not the whole line: {dumped}"
-            );
-            assert!(
-                dumped.contains("GITHUB_TOKEN=") && dumped.contains("npm_password:"),
-                "the NAME survives — a reader must see WHAT was disclosed: {dumped}"
-            );
-            assert!(
-                dumped.contains("EXPECTED=42")
-                    && dumped.contains("assert_eq failed: left = 1, right = 2"),
-                "and ordinary test output is NOT mangled — a journal that corrupts the evidence it \
-                 keeps is worse than one that misses a disclosure: {dumped}"
-            );
-
-            // …AND THE SHAPE EVERY `cargo test` LINE HAS. A `::`-qualified path, a panic locator and
-            // a test name are the lines a red-vs-green comparison is actually made of, and the
-            // fragment list matched them as a SUBSTRING of everything before the first `:` — so
-            // `test auth::…` became `test auth:«redacted»` and the auditor never saw which test
-            // failed. The name half must LOOK like a name, and the fragment must be a whole segment
-            // of it.
-            let real_output = "test auth::session::rejects_expired_token ... FAILED\n\
-                               thread 'main' panicked at src/auth.rs:12:5:\n\
-                               test bearer token handling ... ok\n\
-                               test token_parser::parses_bare ... ok\n\
-                               authoritative: the source of truth\n\
-                               note: run with `RUST_BACKTRACE=1`";
-            let kept = gate_evidence_excerpt(real_output);
-            assert_eq!(
-                kept, real_output,
-                "not one byte of ordinary Rust test output is redacted: {kept}"
-            );
-
-            // The disclosures that hide INSIDE that shape are still caught — the anchoring narrows
-            // the rule, it does not switch it off.
-            for (line, disclosed) in [
-                ("x-api-key: sk-live-42", "sk-live-42"),
-                ("AWS.SECRET=abc", "abc"),
-                ("authorization: bearer eyJhbGciOi", "eyJhbGciOi"),
-                ("> Authorization: Bearer eyJhbGciOi", "eyJhbGciOi"),
-            ] {
-                let out = gate_evidence_excerpt(line);
-                assert!(
-                    !out.contains(disclosed) && out.contains(GATE_EVIDENCE_REDACTED),
-                    "'{line}' still discloses: {out}"
-                );
             }
         }
     }

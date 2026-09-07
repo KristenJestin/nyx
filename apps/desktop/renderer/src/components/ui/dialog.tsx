@@ -120,10 +120,10 @@ function DialogRoot(
  * a caller cannot otherwise tell from the DOM position alone — and outside-press
  * logic elsewhere needs exactly that: the terminal↔Spec overlay
  * (`use-overlay-panel`) dismisses its non-modal panel on any mousedown outside
- * itself, and a dialog OPENED FROM that panel (the orchestration run modal) must
- * not read as "outside" and tear the panel — and with it the dialog — down under
- * the user's cursor. The marker is deliberately not `role="dialog"`: that panel
- * carries the role too, so it would discriminate nothing.
+ * itself, and a dialog OPENED FROM that panel must not read as "outside" and
+ * tear the panel — and with it the dialog — down under the user's cursor. The
+ * marker is deliberately not `role="dialog"`: that panel carries the role too,
+ * so it would discriminate nothing.
  */
 function DialogPortal(props: BaseDialog.Portal.Props) {
   return <BaseDialog.Portal data-portal-layer="" {...props} />;
@@ -149,10 +149,10 @@ export const Dialog = {
  * ## Why it is here and not written a third time (human review 01M140VQ4S434P2DMCJSTDR4VM)
  *
  * Verbatim: « le close en bas est quand même très chelou, est-ce qu'on peut virer le footer, et
- * juste avoir une croix dans le header à droite ? ». The motif already existed — the Spec run modal
- * and the engine's inspectors each drew one — but as MARKUP, copied, so a fourth screen would have
- * copied it again and the four would have drifted apart at the first restyle. It is one component
- * now, and `run-modal.tsx` reads it too rather than keeping its own.
+ * juste avoir une croix dans le header à droite ? ». The motif already existed on several screens,
+ * each drawing it as MARKUP, copied, so a fourth screen would have copied it again and the set
+ * would have drifted apart at the first restyle. It is one component now, and every dialog reads
+ * it instead of keeping its own.
  *
  * ## What it must not take away
  *
@@ -179,9 +179,9 @@ export function DialogCloseX({
           aria-label={label}
           data-dialog-close
           className={cn(
-            // The run modal's own values, lifted verbatim rather than re-picked — the point of
-            // extracting a motif is that nothing about it changes on the way. `ml-auto` is what puts
-            // it AT THE END of the header band, whatever else the header holds.
+            // The original screens' own values, lifted verbatim rather than re-picked — the point
+            // of extracting a motif is that nothing about it changes on the way. `ml-auto` is what
+            // puts it AT THE END of the header band, whatever else the header holds.
             "ml-auto shrink-0 rounded-md p-1 text-muted-foreground",
             "outline-none transition-colors hover:text-foreground",
             "focus-visible:ring-2 focus-visible:ring-ring",

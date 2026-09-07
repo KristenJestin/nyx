@@ -100,8 +100,6 @@ function installBackend(spec: SpecDetail) {
         return spec;
       case "spec_activity":
         return { spec_id: "s2", entries: [] };
-      case "engine_spec_runs":
-        return [];
       default:
         return undefined;
     }

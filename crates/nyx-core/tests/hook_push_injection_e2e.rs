@@ -1,58 +1,51 @@
-//! PUSH-channel e2e (v2.5.8 agent harness, PRD 01KXC80E2CDSNN9PPMJFJFE3X7 / PDR-0020,
-//! review 01KXEF1NJ0P2V5NCYV2QRYFSFS finding 01KXEFFTBEC6MC8S892NEFMJMN).
+//! PUSH-channel e2e (v2.5.8 agent harness, PRD 01KXC80E2CDSNN9PPMJFJFE3X7 / PDR-0020, re-pointed
+//! at PDR-0031 — `docs/product/agent-manuals.md` §4 and §5 rows 5b/6/7).
 //!
-//! The gate (`gate_v2_5_8_agent_harness_e2e.rs`) proves the harness STRUCTURALLY (the stub
-//! DECLARES its `NYX-AGENT-CONTEXT role=… scope=…` sentinel) and via the universal PULL channel
-//! (`agent_context` renders the manual). It never exercises the REAL PUSH path — the branch of
-//! the bundled `resources/claude-plugin/hooks/nyx-session-hook.cjs` that, on a `UserPromptSubmit`
-//! invoking `/nspec` `/ndev` `/ndoc`, POSTs an `agent_context` `tools/call` to the sidecar and
-//! relays the rendered manual back to Claude as `additionalContext`.
+//! The gate (`gate_v2_5_8_agent_harness_e2e.rs`) proves the harness STRUCTURALLY (the stub DECLARES
+//! its `NYX-AGENT-CONTEXT role=…` sentinel) and via the universal PULL channel (`agent_context`
+//! renders the manual). It never exercises the REAL PUSH path — the branches of the bundled
+//! `resources/claude-plugin/hooks/nyx-session-hook.cjs` that talk BACK to Claude Code. This file
+//! spawns that `.cjs` under `node` (the hook's own runtime — Claude Code IS node) against an
+//! in-process mock sidecar and pins the contract that now holds.
 //!
-//! THE PAYLOAD IS THE CONTRACT (v2.8 finding F1). A `UserPromptSubmit` hook receives the prompt
-//! the human TYPED, never the expanded command body: Claude Code hands the hook
-//! `{"hook_event_name":"UserPromptSubmit","cwd":…,"prompt":"/nspec feature-42 add backpressure"}`
-//! — captured verbatim from a live run. The first version of this branch keyed on the stub's
-//! sentinel, i.e. on text that NEVER reaches a hook, so the injection was dead from the day it
-//! shipped while this test passed on a fabricated payload. Every prompt fed to the hook below is
-//! now a RAW invocation string, exactly as Claude Code sends it.
+//! WHAT CHANGED, AND WHY THIS FILE WAS REWRITTEN. The orchestration engine is retired: there is no
+//! `run_start`, no `run_id`, no `nyx_next`. The hook used to POST `run_start {scope,cwd}` before
+//! `agent_context`, and inject a `=== NYX RUN ===` block naming the run to tick. This test pinned
+//! all of it — so it was a test of a build that no longer exists, and it asserted on
+//! `nyx_next(run_id="…")`, a literal nyx no longer emits anywhere. What the hook does now:
 //!
-//! THE HOOK OPENS THE RUN (v2.8 G6). The session's first act must be `nyx_next(run_id)`: a live
-//! `/nspec` used to spend two calls before its first tick (`agent_context` to fetch its own manual,
-//! then `run_start` to open its own run), re-resolving anchors the hook already receives and leaving
-//! "who opens the run" to whichever agent got there first. So the hook now POSTs `run_start
-//! {scope,cwd}` ITSELF and injects the resulting `run_id` — together with `run_start`'s `warnings`,
-//! which are written for a human to act on — in the SAME `additionalContext` as the manual.
-//!
-//! This PERSISTENT test spawns the ACTUAL hook `.cjs` under `node` (the hook's own runtime —
-//! Claude Code IS node) against an in-process mock sidecar (a bare `std::net::TcpListener`
-//! speaking just enough HTTP/JSON-RPC) and asserts:
-//!   * a nyx command → the hook POSTs `run_start {scope,cwd}` then `agent_context {role,scope,
-//!     run_id}` carrying the (role, scope) the matching stub DECLARES, and emits the run_id AND the
-//!     returned manual in ONE `additionalContext` — with NOT ONE byte on stderr (cheap and silent
-//!     on the happy path);
-//!   * `run_start`'s `warnings` reach that same block, told to be relayed to the user;
-//!   * a plain prompt → nothing injected, neither tool called, stderr empty;
+//!   * `UserPromptSubmit` on `/nspec` `/ndev` `/ndoc` → ONE call, `agent_context {role, cwd,
+//!     spec_id?}`, where `role` is `spec` / `dev` / `doc` — one per command, the whole of what
+//!     selects a manual (§5 row 6) — and the manual comes back wrapped:
+//!     `{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":…}}`.
+//!   * a Spec reference the human typed rides BESIDE the `cwd`, forwarded VERBATIM in all four
+//!     forms; a REFUSED reference injects nyx's own refusal sentence instead of a manual, and never
+//!     a manual rendered for some other Spec.
+//!   * **`SubagentStart` → the WRAPPED `{"hookSpecificOutput":{"hookEventName":"SubagentStart",
+//!     "additionalContext":…}}`, exactly like the other two.** This leg used to pin the OPPOSITE —
+//!     a bare `{"additionalContext": …}`, on the belief that a wrapped payload was dropped
+//!     silently. MEASURED 2026-09-07 against Claude Code v2.1.246 on Windows, driving the real app:
+//!     it is the BARE shape that is dropped. The observable is the `hook_additional_context`
+//!     attachment in the sub-agent's transcript, written when and only when the text reached the
+//!     model; the bare run left only a `hook_success` (so the hook fired and succeeded) and the
+//!     sub-agent confirmed it had received no nyx context, while the wrapped `SessionStart` and
+//!     `UserPromptSubmit` of that same session left both attachments and were quoted back verbatim.
+//!     The shape stays under test because it is invisible to every other test in the repo —
+//!     `mcp_tools_core` proves the charter is RENDERED, nothing else proves it is SHAPED right on
+//!     the wire.
+//!   * `SessionStart` → the ambient context, wrapped like `UserPromptSubmit`, relayed byte for byte.
 //!   * every non-injecting outcome leaves its OWN one-line trace on stderr — a foreign slash
-//!     command, an unreachable sidecar, a REFUSED `run_start` (which injects NOTHING, never a
-//!     manual with no run), a refused `agent_context`, an answer with no context. That silence is
-//!     what let the dead injection survive a release, so it is itself under test;
-//!   * the OTHER relay, and the only other one the hook has: a `SessionStart` whose
-//!     `agent_session_event` answers with the AMBIENT context — the `You're in nyx — …` orientation
-//!     line plus the workspace's managed-command block — emits it as `additionalContext` BYTE FOR
-//!     BYTE (multi-line, `·` separators, accents, `group_id` included), and an answer carrying no
-//!     context injects nothing and still exits 0. Every other leg here is a `UserPromptSubmit`; this
-//!     branch of the `.cjs` was covered by nothing, which is exactly where a silent corruption of
-//!     the injected block would have lived.
+//!     command, an unreachable sidecar, a refused `agent_context`, an answer with no context — and
+//!     a failed injection is FILED in nyx through `agent_session_event`. That silence is what let a
+//!     dead injection survive a release, so it is itself under test.
 //!
 //! NOTHING REPLAYS THIS FILE AUTOMATICALLY — run it by hand with
 //! `cargo test -p nyx-core --test hook_push_injection_e2e` (review finding
-//! `01M152SCJ8QHK5C2P002GWZAGA`). Neither `bun run test:core` nor the cross-OS gate workflow
-//! covers it: both invoke `cargo test --workspace --lib`, and `--lib` builds only the library
-//! targets, excluding every integration binary under `crates/nyx-core/tests/` — this one included.
-//! Wiring a declared command and a CI job to these binaries is tracked separately; until that
-//! lands, a regression here breaks in silence. If `node` is not on PATH the test SKIPS with a note
-//! (node-agnostic by contract, mirroring how the sidecar gates skip their git legs when git is
-//! absent) — but node is the hook's mandatory runtime.
+//! `01M152SCJ8QHK5C2P002GWZAGA`). Neither `bun run test:core` nor the cross-OS gate workflow covers
+//! it: both invoke `cargo test --workspace --lib`, and `--lib` builds only the library targets,
+//! excluding every integration binary under `crates/nyx-core/tests/` — this one included. If `node`
+//! is not on PATH the test SKIPS with a note (node-agnostic by contract, mirroring how the sidecar
+//! gates skip their git legs when git is absent) — but node is the hook's mandatory runtime.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -71,11 +64,15 @@ fn hook_path() -> PathBuf {
         .join("resources/claude-plugin/hooks/nyx-session-hook.cjs")
 }
 
-/// The (role, scope) a nyx command stub DECLARES in its `<!-- NYX-AGENT-CONTEXT role=… scope=… -->`
-/// sentinel (`resources/claude-commands/<file>`). The hook keys on the command NAME (all a
+/// The ROLE a nyx command stub DECLARES in its `<!-- NYX-AGENT-CONTEXT role=… -->` sentinel
+/// (`resources/claude-commands/<file>`). The hook keys on the command NAME (all a
 /// `UserPromptSubmit` hook ever receives), so the stub's declaration and the hook's table are two
 /// artifacts that must agree: this is what binds them — a drift on either side fails here.
-fn stub_sentinel(file: &str) -> (String, String) {
+///
+/// THERE IS NO `scope=` ANY MORE (§5 row 6). A scope named a node of the retired engine; the role
+/// is the whole of what selects a manual, so this reads one field and asserting on it is asserting
+/// on the whole declaration.
+fn stub_role(file: &str) -> String {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("resources/claude-commands")
         .join(file);
@@ -84,12 +81,14 @@ fn stub_sentinel(file: &str) -> (String, String) {
         .lines()
         .find(|l| l.contains("NYX-AGENT-CONTEXT"))
         .unwrap_or_else(|| panic!("{file} declares a NYX-AGENT-CONTEXT sentinel"));
-    let field = |key: &str| {
-        line.split_whitespace()
-            .find_map(|t| t.strip_prefix(key).map(str::to_string))
-            .unwrap_or_else(|| panic!("{file}'s sentinel declares {key}…"))
-    };
-    (field("role="), field("scope="))
+    assert!(
+        !line.contains("scope="),
+        "{file}'s sentinel must declare no `scope=` — the engine that gave one meaning is retired: \
+         {line}"
+    );
+    line.split_whitespace()
+        .find_map(|t| t.strip_prefix("role=").map(str::to_string))
+        .unwrap_or_else(|| panic!("{file}'s sentinel declares role=…"))
 }
 
 /// `true` when `node` is runnable — otherwise the test SKIPS (node-agnostic by contract).
@@ -103,43 +102,31 @@ fn node_available() -> bool {
         .unwrap_or(false)
 }
 
-/// What the mock answers the hook's two calls with — one variant per outcome the hook must tell
-/// APART in its trace. `run_start` succeeds in every variant but [`Reply::RunStartRefused`], so the
-/// `agent_context` legs below all get past the run opening.
+/// What the mock answers with — one variant per outcome the hook must tell APART in its trace.
 #[derive(Clone, Copy, PartialEq)]
 enum Reply {
-    /// A run opened with no warnings, then the rendered manual (the happy path).
+    /// `agent_context` renders the manual (the happy path).
     Manual,
-    /// A run opened WITH warnings — the human-facing signals `run_start` returns beside the id.
-    RunWarnings,
-    /// `run_start` itself refuses, as the real one does for a `/ndev` on a location anchoring no
-    /// Spec. Nothing is injected AT ALL: `agent_context` is never even called.
-    RunStartRefused,
-    /// A JSON-RPC error, as the real sidecar returns when the tool refuses (no Spec resolves, an
-    /// unknown role, or `agent_context` missing entirely on an older sidecar).
+    /// A JSON-RPC error, as the real sidecar returns when `agent_context` refuses: no Spec
+    /// resolves, the reference designates several, an unknown role, or the tool is missing
+    /// entirely on an older sidecar.
     Refused,
     /// A 200 result whose shape carries no `structuredContent.context` at all.
     NoContext,
     /// `agent_session_event` answers a `SessionStart` with the AMBIENT context — the orientation
-    /// line PLUS the workspace's managed-command block. The other variants answer it with the bare
-    /// `{}` a `UserPromptSubmit` gets, which is also the DEGRADED SessionStart case (nothing to
-    /// inject).
+    /// line PLUS the workspace's managed-command block.
     SessionContext,
+    /// `agent_session_event` answers a `SubagentStart` with the §4 CHARTER, in the very same field
+    /// (`structuredContent.context`) `SessionStart` uses. What differs is the shape the hook writes
+    /// it back out in, which is the whole point of the leg that drives this variant.
+    SubagentCharter,
 }
 
 /// The refusal wording the mock echoes — the REAL `agent_context` message for an unresolved Spec
-/// (`mcp_context::agent_context`), so the test proves the SERVER's reason reaches the trace.
+/// (`mcp_context::agent_context`), so the test proves the SERVER's reason reaches both the trace and
+/// the injected block.
 const REFUSAL: &str =
     "could not resolve a Spec: pass spec_id, or a workspace_id/cwd anchored on one";
-
-/// The refusal wording the mock echoes for `run_start` — the REAL `mcp_engine::run_start` message
-/// for a Spec-scoped flow whose location anchors none, which is EXACTLY what a `/ndev` typed
-/// outside an anchored workspace produces. The hook has one anchor (the `cwd` Claude Code hands
-/// it), so this refusal is a live failure mode, and the server's own sentence is the only text that
-/// names which anchor was missing.
-const RUN_START_REFUSAL: &str =
-    "'ndev' works ON a Spec and none could be resolved — pass an explicit `spec_id` (or a \
-     `cwd`/`workspace_id` anchoring exactly one active Spec)";
 
 /// The AMBIENT session context the mock's `agent_session_event` answers a `SessionStart` with — the
 /// shape `mcp_tools_core::session_context_line` really produces: the `You're in nyx — …` orientation
@@ -169,26 +156,19 @@ const MOCK_SESSION_CONTEXT: &str = "You're in nyx — project \"Café\" (project
      Those System commands are SHARED: machine-wide services, the same ones for every project and \
      every agent on this machine. Stopping one stops it for ALL of them at once.";
 
-/// The run the mock's `run_start` opens. A literal the assertions look for VERBATIM in the injected
-/// text: the `run_id` is the one value every subsequent call takes, and the session now gets it
-/// from nowhere else.
-const MOCK_RUN_ID: &str = "run-01KMOCKRUNSTART0000000000";
-
-/// The warnings the mock's `run_start` returns under [`Reply::RunWarnings`] — the two real codes,
-/// with the real wordings shortened: a run DESTROYED because its graph changed under it, and a gate
-/// that verifies nothing. Both are written for a human to act on, which is why they may not be
-/// swallowed when the hook opens the run in the session's place.
-const MOCK_WARNINGS: [(&str, &str); 2] = [
-    (
-        "run_replaced_graph_changed",
-        "run run-01KDEAD was DROPPED, not resumed: its workflow's graph changed under it, so its \
-         progress could not be picked up",
-    ),
-    (
-        "gate_unconfigured",
-        "gate_check 'Quality gate' has no command_ids — it runs vacuously GREEN and verifies nothing",
-    ),
-];
+/// The SUB-AGENT CHARTER the mock's `agent_session_event` answers a `SubagentStart` with — the head
+/// of the §4 text `mcp_context::render_subagent_charter` really produces, kept multi-line and
+/// accented for the same reason [`MOCK_SESSION_CONTEXT`] is: a charter that arrives joined, trimmed
+/// or mangled is a charter that arrives wrong, and nothing downstream would say so.
+const MOCK_SUBAGENT_CHARTER: &str =
+    "# nyx — you are a sub-agent in workspace \"main\" (/tmp/nyx-push-test-workspace), Spec NYX-3.\n\
+     \n\
+     - Your mission is the prompt above. You do not decide the scope; you do not transition a task\n\
+     \x20 or the Spec; you do not resolve or validate anything human.\n\
+     - Need the why? spec_get(\"01KMOCKSPEC0000000000000000\"). Need the plan? task_list.\n\
+     \n\
+     Managed commands of this workspace:\n\
+     - dev · bun run dev --réglages=élevés · running · instance_id=inst-1 · group_id=grp-1";
 
 /// A minimal in-process mock of the nyx sidecar's `/mcp` JSON-RPC endpoint. It answers every
 /// `agent_context` `tools/call` per its [`Reply`] mode (so the test can prove WHICH manual — or
@@ -245,8 +225,8 @@ impl MockSidecar {
         }
     }
 
-    /// The tool names the hook POSTed, in order (`agent_session_event`, then `run_start` and
-    /// `agent_context` only when the injection branch fires).
+    /// The tool names the hook POSTed, in order (`agent_session_event`, then `agent_context` only
+    /// when the injection branch fires).
     fn tool_names(&self) -> Vec<String> {
         self.calls
             .lock()
@@ -296,9 +276,9 @@ impl Drop for MockSidecar {
     }
 }
 
-/// Read one HTTP request off `stream`, record its JSON-RPC body, and answer the `run_start` /
-/// `agent_context` calls per `reply` (any other tool gets a bare ok). Best-effort: a malformed
-/// request is answered with an empty ok so the hook still resolves.
+/// Read one HTTP request off `stream`, record its JSON-RPC body, and answer the `agent_context` /
+/// `agent_session_event` calls per `reply` (any other tool gets a bare ok). Best-effort: a
+/// malformed request is answered with an empty ok so the hook still resolves.
 fn handle_conn(stream: &mut TcpStream, calls: &Arc<Mutex<Vec<Value>>>, reply: Reply) {
     let Some(body) = read_http_body(stream) else {
         return;
@@ -308,32 +288,17 @@ fn handle_conn(stream: &mut TcpStream, calls: &Arc<Mutex<Vec<Value>>>, reply: Re
         .as_str()
         .unwrap_or_default()
         .to_string();
+    let hook_event = parsed["params"]["arguments"]["hook_event_name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     if parsed.is_object() {
         calls.lock().unwrap().push(parsed.clone());
     }
     let id = parsed["id"].clone();
-    let payload = if name == "run_start" {
+    let payload = if name == "agent_context" {
         match reply {
-            Reply::RunStartRefused => json!({ "jsonrpc": "2.0", "id": id, "error": {
-                "code": -32602, "message": RUN_START_REFUSAL
-            }}),
-            Reply::RunWarnings => json!({ "jsonrpc": "2.0", "id": id, "result": {
-                "structuredContent": {
-                    "run_id": MOCK_RUN_ID,
-                    "warnings": MOCK_WARNINGS
-                        .iter()
-                        .map(|(code, message)| json!({ "code": code, "message": message }))
-                        .collect::<Vec<Value>>(),
-                }
-            }}),
-            _ => json!({ "jsonrpc": "2.0", "id": id, "result": {
-                "structuredContent": { "run_id": MOCK_RUN_ID, "warnings": [] }
-            }}),
-        }
-    } else if name == "agent_context" {
-        match reply {
-            // The run-opening variants all render the manual: what they vary is `run_start`.
-            Reply::Manual | Reply::RunWarnings | Reply::RunStartRefused | Reply::SessionContext => {
+            Reply::Manual | Reply::SessionContext | Reply::SubagentCharter => {
                 let role = parsed["params"]["arguments"]["role"]
                     .as_str()
                     .unwrap_or_default();
@@ -350,13 +315,22 @@ fn handle_conn(stream: &mut TcpStream, calls: &Arc<Mutex<Vec<Value>>>, reply: Re
         }
     } else if name == "agent_session_event" && reply == Reply::SessionContext {
         // The AMBIENT context a `SessionStart` gets back — the orientation line plus the workspace's
-        // managed-command block. This is the ONLY thing the hook's SessionStart branch reads.
+        // managed-command block.
         json!({ "jsonrpc": "2.0", "id": id, "result": {
             "structuredContent": { "context": MOCK_SESSION_CONTEXT }
         }})
+    } else if name == "agent_session_event"
+        && reply == Reply::SubagentCharter
+        && hook_event == "SubagentStart"
+    {
+        // The §4 CHARTER, in the SAME field the ambient context uses — one mechanism, and the
+        // difference lives in the SHAPE the hook writes back, not in the field it reads.
+        json!({ "jsonrpc": "2.0", "id": id, "result": {
+            "structuredContent": { "context": MOCK_SUBAGENT_CHARTER }
+        }})
     } else {
         // agent_session_event (or anything else) — a bare ok; UserPromptSubmit ignores it, and a
-        // SessionStart takes it as "nothing to inject".
+        // SessionStart / SubagentStart takes it as "nothing to inject".
         json!({ "jsonrpc": "2.0", "id": id, "result": { "structuredContent": {} } })
     }
     .to_string();
@@ -443,6 +417,25 @@ impl HookRun {
             .map(str::to_string)
     }
 
+    /// The WRAPPED `additionalContext` of a `SubagentStart`, with the BARE top-level key asserted
+    /// ABSENT. The bare shape is what this file used to demand; the real app drops it (see the
+    /// module note), so its absence is asserted here rather than merely tolerated — a payload
+    /// carrying both keys would pass a wrapper check and still tell the next reader the wrong
+    /// thing.
+    fn injected_charter(&self) -> Option<String> {
+        let trimmed = self.stdout.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let v: Value = serde_json::from_str(trimmed).ok()?;
+        assert!(
+            v.get("additionalContext").is_none(),
+            "a SubagentStart payload must carry NO top-level `additionalContext` — that BARE shape \
+             is the one Claude Code drops SILENTLY, taking the whole charter with it. Got: {trimmed}",
+        );
+        self.injected_for("SubagentStart")
+    }
+
     /// The single trace line the hook left, asserting there is EXACTLY one (a trace is a
     /// diagnosis, not a log stream: one prompt, one reason).
     fn trace(&self) -> String {
@@ -468,12 +461,14 @@ impl HookRun {
 
 /// The hook events these legs drive, each with the payload field Claude Code actually stamps on it:
 /// the human's raw `prompt` for a `UserPromptSubmit`, the `source` (`startup` | `resume` | `clear` |
-/// `compact`) for a `SessionStart`. Modelled as an enum rather than a free-form JSON so a leg cannot
-/// silently fabricate a field a real hook never receives — the F1 mistake this file exists to guard.
+/// `compact`) for a `SessionStart`, the spawned agent's type for a `SubagentStart`. Modelled as an
+/// enum rather than a free-form JSON so a leg cannot silently fabricate a field a real hook never
+/// receives — the F1 mistake this file exists to guard.
 #[derive(Clone, Copy)]
 enum HookEvent<'a> {
     UserPromptSubmit(&'a str),
     SessionStart(&'a str),
+    SubagentStart(&'a str),
 }
 
 impl HookEvent<'_> {
@@ -482,6 +477,7 @@ impl HookEvent<'_> {
         match self {
             HookEvent::UserPromptSubmit(_) => "UserPromptSubmit",
             HookEvent::SessionStart(_) => "SessionStart",
+            HookEvent::SubagentStart(_) => "SubagentStart",
         }
     }
 
@@ -499,6 +495,12 @@ impl HookEvent<'_> {
                 "session_id": "sess-push-test",
                 "cwd": cwd,
                 "source": source,
+            }),
+            HookEvent::SubagentStart(agent_type) => json!({
+                "hook_event_name": "SubagentStart",
+                "session_id": "sess-push-test",
+                "cwd": cwd,
+                "agent_type": agent_type,
             }),
         }
     }
@@ -591,7 +593,7 @@ fn plugin_root_on(port: u16) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// The PUSH contract.
+// The PUSH contract — `UserPromptSubmit`.
 // ---------------------------------------------------------------------------
 
 /// The hook reaches THE nyx that installed it, even with no `NYX_MCP_PORT` in the shell — it reads
@@ -612,7 +614,7 @@ fn push_reaches_the_nyx_that_installed_the_plugin_without_an_env_port() {
     let mock = MockSidecar::start();
     let root = plugin_root_on(mock.port);
     let run = run_hook_env(
-        "/nspec feature-42 add backpressure",
+        "/nspec add backpressure",
         "/tmp/nyx-push-test-workspace",
         None, // no NYX_MCP_PORT: the shell knows nothing…
         Some(&root),
@@ -625,13 +627,10 @@ fn push_reaches_the_nyx_that_installed_the_plugin_without_an_env_port() {
             run.stdout, run.stderr
         )
     });
-    assert!(
-        injected.contains(&mock_manual("dev")),
-        "the manual was relayed"
-    );
-    assert!(
-        injected.contains(MOCK_RUN_ID),
-        "…with the run THIS mock opened: {injected}",
+    assert_eq!(
+        injected,
+        mock_manual("spec"),
+        "the /nspec manual was relayed, whole",
     );
     assert!(
         mock.tool_names().contains(&"agent_context".to_string()),
@@ -639,58 +638,51 @@ fn push_reaches_the_nyx_that_installed_the_plugin_without_an_env_port() {
     );
 }
 
-/// Invoking a nyx command makes the hook OPEN THE RUN (`run_start {scope,cwd}`) and POST
-/// `agent_context {role,scope,run_id}`, then relay the run_id AND the returned manual in ONE
-/// `additionalContext` — driven with the RAW invocation text Claude Code actually sends
-/// (`/nspec feature-42 …`), and asserted against the (role, scope) each shipped stub DECLARES.
+/// EACH COMMAND ASKS FOR ITS OWN MANUAL. Invoking a nyx command makes the hook POST exactly ONE
+/// `agent_context {role, cwd}` — the role that command's stub DECLARES (`/nspec → spec`,
+/// `/ndev → dev`, `/ndoc → doc`, §5 row 6) — and relay what comes back as `additionalContext`
+/// INSIDE the `hookSpecificOutput` wrapper `UserPromptSubmit` requires.
 ///
-/// Two guards in one. The F1 one: it fails the day the hook keys on anything a `UserPromptSubmit`
-/// payload does not carry. The G6 one: the session's FIRST act must be `nyx_next(run_id)`, so the
-/// run has to be open and its id in the injected text before the agent reads a word — and the
-/// `cwd` must reach `run_start`, NOT `agent_context`, because the run is the anchor from there on.
+/// Two guards in one. The F1 one: a `UserPromptSubmit` hook receives the prompt the human TYPED,
+/// never the expanded command body, so every prompt below is a RAW invocation string; this fails
+/// the day the hook keys on anything the payload does not carry. The PDR-0031 one: there is no run
+/// to open any more, so the call list must be exactly the session event plus the manual fetch — an
+/// extra call here would mean a dead `run_start` came back from the grave.
 #[test]
-fn push_opens_the_run_and_injects_its_id_with_the_manual() {
+fn each_command_pushes_the_manual_for_the_role_its_stub_declares() {
     if !node_available() {
         eprintln!("node unavailable: skipped the PUSH-injection e2e (node-agnostic by contract)");
         return;
     }
     let cwd = "/tmp/nyx-push-test-workspace";
-    for (command, file) in [
-        ("nspec", "nspec.md"),
-        ("ndev", "ndev.md"),
-        ("ndoc", "ndoc.md"),
+    for (command, file, expected_role) in [
+        ("nspec", "nspec.md", "spec"),
+        ("ndev", "ndev.md", "dev"),
+        ("ndoc", "ndoc.md", "doc"),
     ] {
-        let (role, scope) = stub_sentinel(file);
+        let role = stub_role(file);
+        assert_eq!(
+            role, expected_role,
+            "{file} declares the role PDR-0031 gives /{command}",
+        );
         let mock = MockSidecar::start();
         // The submitted prompt = what the human typed: the command, then their free text.
-        let run = run_hook(
-            &format!("/{command} feature-42 add backpressure"),
-            cwd,
-            mock.port,
-        );
+        let run = run_hook(&format!("/{command} add backpressure"), cwd, mock.port);
         assert_eq!(run.code, 0, "the hook always exits 0 (/{command})");
 
-        // The injection actually fired: the mock's role-tagged manual reached additionalContext.
+        // The injection actually fired: the mock's role-tagged manual reached additionalContext,
+        // WHOLE — a manual is a document, and a relay that trimmed or truncated it would be a
+        // silent corruption of the only instruction the session gets.
         let injected = run.injected().unwrap_or_else(|| {
             panic!(
                 "/{command}: expected a manual injected, got stdout {:?} stderr {:?}",
                 run.stdout, run.stderr
             )
         });
-        assert!(
-            injected.contains(&mock_manual(&role)),
-            "/{command}: the hook relayed the manual for the declared role: {injected}",
-        );
-        // The run_id LEADS the injection and is spelled inside the call that consumes it: it is the
-        // one value every later call takes, and the session has no other way to learn it.
-        assert!(
-            injected.starts_with("=== NYX RUN"),
-            "/{command}: the injection OPENS on the run block: {injected}",
-        );
-        assert!(
-            injected.contains(&format!("run_id: {MOCK_RUN_ID}"))
-                && injected.contains(&format!(r#"nyx_next(run_id="{MOCK_RUN_ID}")"#)),
-            "/{command}: the injected run block names the run to tick: {injected}",
+        assert_eq!(
+            injected,
+            mock_manual(&role),
+            "/{command}: the hook relayed the manual for the declared role, byte for byte",
         );
         assert!(
             run.stderr.trim().is_empty(),
@@ -698,29 +690,15 @@ fn push_opens_the_run_and_injects_its_id_with_the_manual() {
             run.stderr,
         );
 
-        // It got there by OPENING the run with the stub-declared scope + the cwd, then asking for
-        // the manual OF THAT RUN — in that order, before the session's first tick.
+        // ONE fetch, on the anchor Claude Code handed the hook. No run is opened, and no location
+        // is resolved twice.
         assert_eq!(
             mock.tool_names(),
             vec![
                 "agent_session_event".to_string(),
-                "run_start".to_string(),
                 "agent_context".to_string()
             ],
-            "/{command}: hook posts the session event, opens the run, then pulls its manual",
-        );
-        let started = mock
-            .args_for("run_start")
-            .unwrap_or_else(|| panic!("/{command}: run_start was called"));
-        assert_eq!(
-            started["scope"],
-            json!(scope),
-            "/{command}: the scope {file} declares is the flow the hook opens a run for",
-        );
-        assert_eq!(
-            started["cwd"],
-            json!(cwd),
-            "/{command}: the hook anchors the run on the cwd Claude Code handed it",
+            "/{command}: the hook posts the session event, then pulls its manual — nothing else",
         );
         let args = mock
             .args_for("agent_context")
@@ -731,100 +709,46 @@ fn push_opens_the_run_and_injects_its_id_with_the_manual() {
             "/{command}: the role {file} declares is what the hook asks for",
         );
         assert_eq!(
-            args["scope"],
-            json!(scope),
-            "/{command}: the scope {file} declares is what the hook asks for",
-        );
-        assert_eq!(
-            args["run_id"],
-            json!(MOCK_RUN_ID),
-            "/{command}: the manual is rendered FOR the run just opened",
-        );
-        assert_eq!(
             args["cwd"],
-            Value::Null,
-            "/{command}: the run is the anchor now — no location is resolved a second time",
+            json!(cwd),
+            "/{command}: the hook anchors on the cwd Claude Code handed it",
+        );
+        assert_eq!(
+            args.get("spec_id"),
+            None,
+            "/{command}: no reference was typed, so none is invented: {args}",
+        );
+        assert_eq!(
+            args.get("run_id"),
+            None,
+            "/{command}: there is no run any more — a `run_id` here would be a resurrected engine",
+        );
+        assert_eq!(
+            args.get("scope"),
+            None,
+            "/{command}: and no `scope` — the role is the whole of what selects a manual",
         );
         mock.stop();
     }
 }
 
-/// A FAILED INJECTION IS FILED IN NYX, not only on a stderr nobody reads (H8).
-///
-/// Claude Code hands a hook's stderr to nothing nyx can read, so a failure was visible only to a
-/// human already running in debug mode — which is exactly how a dead injection survived a whole
-/// release (F1). The report rides `agent_session_event`, the channel this hook already POSTs on
-/// every prompt, carrying the SAME sentence it wrote to stderr so the two ends cannot drift.
-///
-/// The happy path files nothing: an audit trail that also records successes is a log, and this one
-/// exists to make a rare failure findable.
-#[test]
-fn a_failed_injection_is_reported_to_nyx_and_a_successful_one_is_not() {
-    if !node_available() {
-        eprintln!("node unavailable: skipped (node-agnostic by contract)");
-        return;
-    }
-    // `run_start` refuses — the live `/ndev`-in-a-multi-Spec-workspace failure.
-    let mock = MockSidecar::start_with(Reply::RunStartRefused);
-    let run = run_hook("/ndev fix the probe", "/tmp/nyx-push-test-workspace", mock.port);
-    assert_eq!(run.code, 0, "the hook always exits 0");
-    assert!(run.injected().is_none(), "nothing was injected");
-
-    // The LAST call is the report, and it carries the reason the trace already gave the human.
-    let names = mock.tool_names();
-    assert_eq!(
-        names.last().map(String::as_str),
-        Some("agent_session_event"),
-        "the failure is filed after the attempt: {names:?}",
-    );
-    let filed = mock
-        .calls_for("agent_session_event")
-        .into_iter()
-        .find_map(|c| c.get("nyx_injection_failed").cloned())
-        .expect("the report names the failure");
-    assert!(
-        filed.as_str().unwrap_or_default().contains(RUN_START_REFUSAL),
-        "…with the server's OWN sentence, the one stderr got: {filed}",
-    );
-    assert_eq!(
-        run.trace().contains(RUN_START_REFUSAL),
-        true,
-        "and the two ends say the same thing",
-    );
-
-    // THE HAPPY PATH FILES NOTHING: one session event (the turn), and no report.
-    let ok = MockSidecar::start();
-    let good = run_hook("/nspec add backpressure", "/tmp/nyx-push-test-workspace", ok.port);
-    assert!(good.injected().is_some(), "the manual was injected");
-    assert!(
-        ok.calls_for("agent_session_event")
-            .iter()
-            .all(|c| c.get("nyx_injection_failed").is_none()),
-        "a success is not an event: {:?}",
-        ok.tool_names(),
-    );
-}
-
-/// THE SPEC REFERENCE THE HUMAN TYPED REACHES `run_start` (H8), IN ALL FOUR FORMS.
+/// THE SPEC REFERENCE THE HUMAN TYPED REACHES `agent_context` VERBATIM, IN ALL FOUR FORMS.
 ///
 /// The three nyx commands advertise a leading Spec reference. The `cwd` alone cannot honour that:
 /// a real project holds several active Specs, so resolving one by location is REFUSED as ambiguous
-/// (`spec_ambiguous_for_workspace`) and, for `/ndev` and `/ndoc`, the run never opens — replayed
-/// live on a workspace with three. The typed reference is the only anchor that disambiguates, and
-/// the hook was not reading it: a session had to work out on its own that "the UUID in your command
-/// IS the spec_id" and open the run itself, which is the two-call sequence G6 exists to remove.
+/// and, for `/ndev` and `/ndoc`, nothing renders. The typed reference is the only anchor that
+/// disambiguates.
 ///
-/// AND THE UUID WAS THE ONLY FORM IT COULD SEE — the one shape a human never encounters, since
-/// every render, warning and list speaks in `#3`. So the fix landed on the form nobody types while
-/// `/nspec 3` still opened an unanchored run. The hook recognises the four SHAPES now and forwards
-/// the token RAW: the byte equality below is the whole contract on this side, because the
-/// TRANSLATION is `spec_ref`'s and the hook must not own a second copy of it (the grammar itself is
-/// pinned token by token against the real hook in `spec_ref`'s own corpus test).
+/// AND THE UUID USED TO BE THE ONLY FORM THE HOOK COULD SEE — the one shape a human never
+/// encounters, since every render, warning and list speaks in `#3`. The hook recognises the four
+/// SHAPES and forwards the token RAW: the byte equality below is the whole contract on this side,
+/// because the TRANSLATION is `spec_ref`'s and the hook must not own a second copy of it (the
+/// grammar itself is pinned token by token against the real hook in `spec_ref`'s own corpus test).
 ///
 /// The reference rides BESIDE the `cwd`, never instead of it — it says WHICH Spec, the cwd still
-/// anchors the run's dev workspace.
+/// anchors the workspace whose commands the manual renders.
 #[test]
-fn the_spec_id_the_human_typed_is_what_the_hook_opens_the_run_on() {
+fn the_spec_reference_the_human_typed_reaches_agent_context_verbatim() {
     if !node_available() {
         eprintln!("node unavailable: skipped (node-agnostic by contract)");
         return;
@@ -851,13 +775,13 @@ fn the_spec_id_the_human_typed_is_what_the_hook_opens_the_run_on() {
 
             assert_eq!(run.code, 0, "the hook always exits 0");
             let args = mock
-                .args_for("run_start")
-                .expect("the hook opens the run itself");
+                .args_for("agent_context")
+                .expect("the hook fetches the manual itself");
             assert_eq!(
                 args["spec_id"],
                 json!(reference),
-                "/{command}: '{reference}' reaches run_start EXACTLY as typed — the hook resolves \
-                 nothing: {args}",
+                "/{command}: '{reference}' reaches agent_context EXACTLY as typed — the hook \
+                 resolves nothing: {args}",
             );
             assert_eq!(
                 args["cwd"],
@@ -874,7 +798,7 @@ fn the_spec_id_the_human_typed_is_what_the_hook_opens_the_run_on() {
     }
 
     // The human's TEXT is never mistaken for an anchor: prose in first position resolves NO
-    // reference, and the run falls back to the `cwd` exactly as before. Widening the grammar did
+    // reference, and the render falls back to the `cwd` exactly as before. Widening the grammar did
     // not widen what is READ — still the first token, still only when it is a whole reference.
     for prose_prompt in [
         "/ndev corrige la sonde de santé",
@@ -882,7 +806,9 @@ fn the_spec_id_the_human_typed_is_what_the_hook_opens_the_run_on() {
     ] {
         let mock2 = MockSidecar::start();
         let prose = run_hook(prose_prompt, cwd, mock2.port);
-        let args2 = mock2.args_for("run_start").expect("the run still opens");
+        let args2 = mock2
+            .args_for("agent_context")
+            .expect("the manual is still fetched");
         assert_eq!(
             args2.get("spec_id"),
             None,
@@ -895,30 +821,31 @@ fn the_spec_id_the_human_typed_is_what_the_hook_opens_the_run_on() {
 /// A REFERENCE THAT DESIGNATES NOTHING IS RELAYED, NOT SWALLOWED — the failure mode widening the
 /// grammar CREATES, and the one that must not cost the human their prompt OR their context.
 ///
-/// Before, an unrecognised first token simply left `spec_id` unset and `run_start` resolved from
-/// the `cwd`. Now `/ndev 999` names a Spec, and a Spec that does not exist earns an `invalid_id`
-/// from the core — by design, since opening an unanchored run on a named Spec is exactly what
-/// ordered a duplicate. What the hook must NOT do is take that on the mute degradation path: the
-/// trace goes to stderr, which Claude Code never feeds to the model, so the session would see nyx
-/// say nothing at all about a command it just refused. Any first token that merely LOOKS like a
-/// reference reaches here — a branch name, a ticket id, `/ndev 3 fois plus rapide` — so this is the
-/// common case, not a corner.
+/// Before, an unrecognised first token simply left `spec_id` unset and the manual rendered off the
+/// `cwd`. Now `/ndev 999` NAMES a Spec, and a Spec that does not exist earns a refusal from the
+/// core — by design, since rendering /ndev's manual for a Spec nobody named is exactly what ordered
+/// a duplicate. What the hook must NOT do is take that on the mute degradation path: the trace goes
+/// to stderr, which Claude Code never feeds to the model, so the session would see nyx say nothing
+/// at all about a command it just refused. Any first token that merely LOOKS like a reference
+/// reaches here — a branch name, a ticket id, `/ndev 3 fois plus rapide` — so this is the common
+/// case, not a corner.
 ///
-/// So: NO run and NO manual (a manual with no `run_id` would send the session hunting for one), but
-/// an injected INSTRUCTION carrying the core's own sentence and the stubs' own rule — stop, ask,
-/// never author a second Spec. Exit 0, and the human's prompt reaches Claude untouched.
+/// So: NO manual for a DIFFERENT Spec and no manual at all, but an injected INSTRUCTION carrying
+/// the core's own sentence and the stubs' own rule — stop, ask, never author a second Spec. Exit 0,
+/// and the human's prompt reaches Claude untouched.
 #[test]
-fn a_reference_the_core_refuses_is_relayed_to_the_session() {
+fn a_refused_reference_injects_nyxs_refusal_and_never_a_manual() {
     if !node_available() {
         eprintln!("node unavailable: skipped (node-agnostic by contract)");
         return;
     }
-    let mock = MockSidecar::start_with(Reply::RunStartRefused);
+    let mock = MockSidecar::start_with(Reply::Refused);
     let run = run_hook("/ndev 999 corrige la sonde", "/tmp/x", mock.port);
 
     assert_eq!(run.code, 0, "a refused reference never breaks the prompt");
+    let args = mock.args_for("agent_context").expect("agent_context was tried");
     assert_eq!(
-        mock.args_for("run_start").expect("run_start was tried")["spec_id"],
+        args["spec_id"],
         json!("999"),
         "the token still travelled raw — the refusal is the CORE's verdict, not the hook's",
     );
@@ -930,121 +857,99 @@ fn a_reference_the_core_refuses_is_relayed_to_the_session() {
         "the block quotes the token as typed, so the human is asked about THEIR word: {injected}",
     );
     assert!(
-        !injected.contains("run_id"),
-        "…and carries NO run_id: there is no run, and an empty one sends the session hunting: \
+        injected.contains(REFUSAL),
+        "…and carries nyx's OWN sentence, the one that names what the project actually holds: \
          {injected}",
+    );
+    // THE DEFECT THIS FORBIDS: a manual for SOME OTHER Spec. A render that fell back to the cwd
+    // after a named reference was refused would hand the session a plan for a Spec the human never
+    // asked about, and nothing in the text would say so.
+    assert!(
+        !injected.contains("=== NYX MOCK MANUAL"),
+        "no manual is injected — least of all one rendered for a different Spec: {injected}",
     );
     assert!(
         injected.contains("STOP and ASK the human which Spec they meant")
-            && injected.contains("never author a new one"),
+            && injected.contains("never author a new one to get past a refusal"),
         "…and gives the SAME instruction the command stubs do: {injected}",
-    );
-    assert!(
-        !mock.tool_names().iter().any(|n| n == "agent_context"),
-        "…and the manual is not even fetched: {:?}",
-        mock.tool_names(),
-    );
-    assert!(
-        run.stderr.contains("run_start refused"),
-        "the degradation SAYS why, on stderr too, as every other one does: {:?}",
-        run.stderr,
-    );
-}
-
-/// `run_start`'s WARNINGS ride into the same injected block, told to be relayed to the user.
-///
-/// They are the price of the hook opening the run in the session's place: `run_start` answers a
-/// dropped run (`run_replaced_graph_changed`), a vacuous gate (`gate_unconfigured`) or a run started
-/// bound to no Spec in a `warnings` array written for a HUMAN to act on. The agent used to read them
-/// off its own call; taking that call away and keeping only the id would delete them silently —
-/// which is exactly what the human needs, gone.
-#[test]
-fn run_start_warnings_reach_the_injection_to_be_relayed() {
-    if !node_available() {
-        eprintln!("node unavailable: skipped (node-agnostic by contract)");
-        return;
-    }
-    let mock = MockSidecar::start_with(Reply::RunWarnings);
-    let run = run_hook("/ndev feature-7", "/tmp/x", mock.port);
-    assert_eq!(run.code, 0, "the hook exits 0");
-    let injected = run
-        .injected()
-        .unwrap_or_else(|| panic!("warnings are not a failure: stderr {:?}", run.stderr));
-    for (code, message) in MOCK_WARNINGS {
-        assert!(
-            injected.contains(code) && injected.contains(message),
-            "the {code} warning reached the injection verbatim: {injected}",
-        );
-    }
-    assert!(
-        injected.contains("RELAY"),
-        "…and the block says to relay them to the user: {injected}",
-    );
-    assert!(
-        injected.contains(&mock_manual("dev")),
-        "the manual is still there beside them: {injected}",
-    );
-    assert!(
-        run.stderr.trim().is_empty(),
-        "a warned run is not a hook failure: {:?}",
-        run.stderr,
-    );
-    mock.stop();
-}
-
-/// `run_start` REFUSES a command that NAMED NO SPEC (the real message for a `/ndev` whose location
-/// anchors no Spec): the hook injects NOTHING and traces the server's own reason.
-///
-/// The refusal is the failure mode the hook GAINED by opening the run, and its handling is the
-/// point: no run means no `agent_context` call at all. Injecting the manual anyway would hand the
-/// session a dispatcher contract whose every step needs a `run_id` it does not have — sending it
-/// back to the pre-tick scramble this whole change removes.
-///
-/// THE PROMPT CARRIES NO REFERENCE, and that is now load-bearing rather than incidental. It used to
-/// read `/ndev feature-7`, chosen when the recogniser knew only the canonical id and any other
-/// first token was inert; `feature-7` is a `KEY-N` under the widened grammar, so that prompt now
-/// exercises the OTHER branch — the one
-/// [`a_reference_the_core_refuses_is_relayed_to_the_session`] owns, where the refusal IS relayed.
-/// The two are complementary and neither may borrow the other's prompt: nothing at all when nyx
-/// was told no Spec, nyx's own sentence when it was told one it could not resolve.
-#[test]
-fn a_refused_run_start_injects_nothing_and_never_falls_back_to_a_run_less_manual() {
-    if !node_available() {
-        eprintln!("node unavailable: skipped (node-agnostic by contract)");
-        return;
-    }
-    let mock = MockSidecar::start_with(Reply::RunStartRefused);
-    let run = run_hook("/ndev corrige la sonde de santé", "/tmp/x", mock.port);
-    assert_eq!(run.code, 0, "a refused run_start → the hook still exits 0");
-    assert_eq!(
-        mock.args_for("run_start").expect("run_start was tried")["spec_id"],
-        json!(null),
-        "the prompt names no Spec — this is the branch where there is nothing to relay",
-    );
-    assert!(
-        run.injected().is_none(),
-        "no run → nothing injected at all (stdout: {:?})",
-        run.stdout,
     );
     let trace = run.trace();
     assert!(
-        trace.contains("run_start refused") && trace.contains(RUN_START_REFUSAL),
-        "the trace names run_start and carries the server's own reason: {trace:?}",
-    );
-    // `agent_context` is NOT called — there is no run to render a manual for. Asserted on the
-    // ABSENCE rather than on the whole sequence: a failed injection also files a report
-    // (`agent_session_event`), and pinning the exact call list would make this test about the
-    // reporting channel instead of about the refusal.
-    assert!(
-        !mock.tool_names().iter().any(|n| n == "agent_context"),
-        "agent_context is NOT called — there is no run to render a manual for: {:?}",
-        mock.tool_names(),
+        trace.contains("agent_context refused") && trace.contains(REFUSAL),
+        "the degradation SAYS why, on stderr too, as every other one does: {trace:?}",
     );
     mock.stop();
 }
 
-/// A plain prompt (not a command) injects NOTHING, never calls `run_start`/`agent_context`, and says
-/// NOTHING: the overwhelmingly common case must cost one regex and leave no noise behind.
+/// A FAILED INJECTION IS FILED IN NYX, not only on a stderr nobody reads (H8).
+///
+/// Claude Code hands a hook's stderr to nothing nyx can read, so a failure was visible only to a
+/// human already running in debug mode — which is exactly how a dead injection survived a whole
+/// release (F1). The report rides `agent_session_event`, the channel this hook already POSTs on
+/// every prompt, carrying the SAME sentence it wrote to stderr so the two ends cannot drift.
+///
+/// The happy path files nothing: an audit trail that also records successes is a log, and this one
+/// exists to make a rare failure findable.
+#[test]
+fn a_failed_injection_is_reported_to_nyx_and_a_successful_one_is_not() {
+    if !node_available() {
+        eprintln!("node unavailable: skipped (node-agnostic by contract)");
+        return;
+    }
+    // `agent_context` refuses — the live `/ndev`-outside-an-anchored-workspace failure.
+    let mock = MockSidecar::start_with(Reply::Refused);
+    let run = run_hook(
+        "/ndev corrige la sonde",
+        "/tmp/nyx-push-test-workspace",
+        mock.port,
+    );
+    assert_eq!(run.code, 0, "the hook always exits 0");
+    assert!(
+        run.injected().is_none(),
+        "no reference was typed, so there is nothing to relay and nothing is injected: {:?}",
+        run.stdout,
+    );
+
+    // The LAST call is the report, and it carries the reason the trace already gave the human.
+    let names = mock.tool_names();
+    assert_eq!(
+        names.last().map(String::as_str),
+        Some("agent_session_event"),
+        "the failure is filed after the attempt: {names:?}",
+    );
+    let filed = mock
+        .calls_for("agent_session_event")
+        .into_iter()
+        .find_map(|c| c.get("nyx_injection_failed").cloned())
+        .expect("the report names the failure");
+    assert!(
+        filed.as_str().unwrap_or_default().contains(REFUSAL),
+        "…with the server's OWN sentence, the one stderr got: {filed}",
+    );
+    assert!(
+        run.trace().contains(REFUSAL),
+        "and the two ends say the same thing",
+    );
+
+    // THE HAPPY PATH FILES NOTHING: one session event (the turn), and no report.
+    let ok = MockSidecar::start();
+    let good = run_hook(
+        "/nspec add backpressure",
+        "/tmp/nyx-push-test-workspace",
+        ok.port,
+    );
+    assert!(good.injected().is_some(), "the manual was injected");
+    assert!(
+        ok.calls_for("agent_session_event")
+            .iter()
+            .all(|c| c.get("nyx_injection_failed").is_none()),
+        "a success is not an event: {:?}",
+        ok.tool_names(),
+    );
+}
+
+/// A plain prompt (not a command) injects NOTHING, never calls `agent_context`, and says NOTHING:
+/// the overwhelmingly common case must cost one regex and leave no noise behind.
 #[test]
 fn plain_prompt_injects_nothing_and_stays_silent() {
     if !node_available() {
@@ -1067,7 +972,7 @@ fn plain_prompt_injects_nothing_and_stays_silent() {
     assert_eq!(
         mock.tool_names(),
         vec!["agent_session_event".to_string()],
-        "no command → the session event is posted, but no run is opened and no manual pulled",
+        "no command → the session event is posted, and no manual pulled",
     );
     mock.stop();
 }
@@ -1089,22 +994,28 @@ fn a_foreign_slash_command_is_traced_not_silently_dropped() {
         "foreign command → no injection (stdout: {:?})",
         run.stdout,
     );
-    let trace = run.trace();
+    let lines: Vec<&str> = run
+        .stderr
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    assert_eq!(lines.len(), 1, "exactly one trace line: {:?}", run.stderr);
     assert!(
-        trace.contains("/clear is not a nyx command") && trace.contains("/nspec"),
-        "the trace names the command it saw and the ones it knows: {trace:?}",
+        lines[0].contains("/clear is not a nyx command") && lines[0].contains("/nspec"),
+        "the trace names the command it saw and the ones it knows: {:?}",
+        lines[0],
     );
     assert_eq!(
         mock.tool_names(),
         vec!["agent_session_event".to_string()],
-        "foreign command → no run is opened and agent_context is NOT called",
+        "foreign command → agent_context is NOT called",
     );
     mock.stop();
 }
 
 /// Sidecar DOWN (nothing listening): the hook still exits 0 and injects nothing — and its trace
-/// says UNREACHABLE with the port, naming the call that could not be made (`run_start`, the first
-/// one now), which is a different diagnosis from "the tool refused".
+/// says UNREACHABLE with the port, naming the call that could not be made, which is a different
+/// diagnosis from "the tool refused".
 #[test]
 fn a_down_sidecar_is_traced_as_unreachable() {
     if !node_available() {
@@ -1112,7 +1023,7 @@ fn a_down_sidecar_is_traced_as_unreachable() {
         return;
     }
     let port = closed_port();
-    let run = run_hook("/nspec feature-7", "/tmp/x", port);
+    let run = run_hook("/nspec add backpressure", "/tmp/x", port);
     assert_eq!(run.code, 0, "sidecar down → the hook still exits 0");
     assert!(
         run.injected().is_none(),
@@ -1121,26 +1032,32 @@ fn a_down_sidecar_is_traced_as_unreachable() {
     );
     let trace = run.trace();
     assert!(
-        trace.contains("run_start unreachable") && trace.contains(&port.to_string()),
+        trace.contains("agent_context unreachable") && trace.contains(&port.to_string()),
         "the trace says which call found the sidecar unreachable, on which port: {trace:?}",
     );
 }
 
-/// The sidecar ANSWERS but `agent_context` refuses (no Spec resolves, unknown role, or the tool
-/// is missing on an older sidecar): the hook injects nothing and relays the SERVER's own reason,
-/// so the trace names the actual problem instead of a generic failure.
+/// The sidecar ANSWERS but `agent_context` refuses on a prompt that named NO reference: the hook
+/// injects nothing at all and relays the SERVER's own reason on stderr.
+///
+/// THE PROMPT CARRIES NO REFERENCE, and that is load-bearing rather than incidental: `feature-7` is
+/// a `KEY-N` under the widened grammar, so a prompt naming one exercises the OTHER branch — the one
+/// [`a_refused_reference_injects_nyxs_refusal_and_never_a_manual`] owns, where the refusal IS
+/// relayed into the session. The two are complementary and neither may borrow the other's prompt:
+/// nothing at all when nyx was told no Spec, nyx's own sentence when it was told one it could not
+/// resolve.
 #[test]
-fn a_refused_agent_context_is_traced_with_the_server_reason() {
+fn a_refused_agent_context_with_no_typed_reference_is_traced_and_injects_nothing() {
     if !node_available() {
         eprintln!("node unavailable: skipped (node-agnostic by contract)");
         return;
     }
     let mock = MockSidecar::start_with(Reply::Refused);
-    let run = run_hook("/ndev feature-7", "/tmp/x", mock.port);
+    let run = run_hook("/ndev corrige la sonde de santé", "/tmp/x", mock.port);
     assert_eq!(run.code, 0, "a refusal → the hook still exits 0");
     assert!(
         run.injected().is_none(),
-        "a refusal → nothing injected (stdout: {:?})",
+        "a refusal with nothing to quote back → nothing injected (stdout: {:?})",
         run.stdout,
     );
     let trace = run.trace();
@@ -1148,13 +1065,13 @@ fn a_refused_agent_context_is_traced_with_the_server_reason() {
         trace.contains("agent_context refused") && trace.contains(REFUSAL),
         "the trace carries the server's own reason: {trace:?}",
     );
-    // The run WAS opened and the call WAS made — the failure is the ANSWER, not the call. Asserted
-    // on the prefix: the failure also files a report after it (see
+    // The call WAS made — the failure is the ANSWER, not the call. Asserted on the prefix: the
+    // failure also files a report after it (see
     // `a_failed_injection_is_reported_to_nyx_and_a_successful_one_is_not`).
     assert_eq!(
-        &mock.tool_names()[..3],
-        ["agent_session_event", "run_start", "agent_context"],
-        "the run WAS opened and the call WAS made — the failure is the answer, not the call",
+        &mock.tool_names()[..2],
+        ["agent_session_event", "agent_context"],
+        "the call WAS made — the failure is the answer, not the call",
     );
     mock.stop();
 }
@@ -1185,6 +1102,157 @@ fn an_answer_without_context_is_traced_as_a_shape_problem() {
 }
 
 // ---------------------------------------------------------------------------
+// The SUB-AGENT CHARTER — `SubagentStart`, and the SHAPE it must take
+// (PDR-0031 / `docs/product/agent-manuals.md` §4, §5 row 5b).
+// ---------------------------------------------------------------------------
+
+/// **A `SubagentStart` answers with the WRAPPED
+/// `{"hookSpecificOutput":{"hookEventName":"SubagentStart","additionalContext":…}}`** — the same
+/// shape as the other two branches. This leg exists for that one key, and nothing else in the repo
+/// covers it.
+///
+/// A sub-agent the orchestrator spawned inherits its MISSION from the orchestrator and nothing
+/// else: not the workspace, not the Spec, not the managed commands. nyx knows all three from the
+/// parent terminal, so the `agent_session_event` the hook POSTs on EVERY hook event carries the §4
+/// charter back in `structuredContent.context` — the very field `SessionStart` uses, because the
+/// shapes are identical on the way IN.
+///
+/// THEY ARE IDENTICAL ON THE WAY OUT TOO, and this test used to say the exact opposite: it demanded
+/// a BARE `{"additionalContext": …}` and FAILED on the wrapper, on the belief that Claude Code
+/// dropped a wrapped `SubagentStart` silently. That was inverted. MEASURED 2026-09-07, Claude Code
+/// v2.1.246 on Windows, driving the real app — a real sub-agent spawned from a real nyx terminal,
+/// plugin installed from this build. The observable is the `hook_additional_context` attachment in
+/// the sub-agent's transcript (`~/.claude/projects/<proj>/<session>/subagents/agent-*.jsonl`),
+/// written when and only when the text reached the model. The BARE run left a `hook_success`
+/// attachment carrying the hook's stdout — it fired, and succeeded — and NO
+/// `hook_additional_context`; the live sub-agent, asked to repeat the first line of its nyx
+/// context, answered that it had received none. In the SAME parent transcript the WRAPPED
+/// `SessionStart` and `UserPromptSubmit` each left both attachments, and the manuals they carried
+/// were quoted back verbatim by the model. So the wrapper is what carries, the bare key is what is
+/// dropped SILENTLY — no error on stderr, no rejection from the sidecar, no missing call for any
+/// other test to notice — and the absence of the bare key is asserted here explicitly, not merely
+/// tolerated.
+#[test]
+fn a_subagent_start_returns_a_wrapped_additional_context_like_the_other_hooks() {
+    if !node_available() {
+        eprintln!("node unavailable: skipped the SubagentStart charter leg (node-agnostic by contract)");
+        return;
+    }
+    let mock = MockSidecar::start_with(Reply::SubagentCharter);
+    let run = run_hook_event(
+        HookEvent::SubagentStart("general-purpose"),
+        "/tmp/nyx-push-test-workspace",
+        Some(mock.port),
+        None,
+    );
+
+    assert_eq!(run.code, 0, "the hook always exits 0");
+
+    // THE SHAPE. `injected_charter` fails if the BARE top-level key is present at all, and asserts
+    // the wrapper is TAGGED `SubagentStart` — a block tagged with the wrong event is dropped just
+    // as silently as an untagged one.
+    let charter = run.injected_charter().unwrap_or_else(|| {
+        panic!(
+            "a SubagentStart carrying a charter must inject it WRAPPED: stdout {:?} stderr {:?}",
+            run.stdout, run.stderr
+        )
+    });
+    // And, stated the other way round, so a stray bare key cannot slip in as an EXTRA beside a
+    // still-correct wrapper.
+    let payload: Value = serde_json::from_str(run.stdout.trim()).expect("the payload is JSON");
+    assert_eq!(
+        payload,
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SubagentStart",
+                "additionalContext": MOCK_SUBAGENT_CHARTER,
+            }
+        }),
+        "the whole payload is the wrapper and nothing else",
+    );
+
+    // THE CONTENT crosses byte for byte — multi-line, accented, separators intact. A charter that
+    // arrives joined or trimmed is a charter that arrives wrong, and nothing downstream says so.
+    assert_eq!(
+        charter, MOCK_SUBAGENT_CHARTER,
+        "the charter crosses the hook byte for byte",
+    );
+    assert!(
+        charter.starts_with("# nyx — you are a sub-agent in workspace"),
+        "…opening on the §4 heading: {charter:?}",
+    );
+    assert!(
+        charter.lines().count() >= 5,
+        "…as MULTI-LINE text, not a single joined line: {charter:?}",
+    );
+    assert!(
+        charter.contains("bun run dev --réglages=élevés")
+            && charter.contains("· instance_id=inst-1 · group_id=grp-1"),
+        "…managed-command lines, separators and non-ASCII included: {charter:?}",
+    );
+    assert!(
+        run.stderr.trim().is_empty(),
+        "the happy path is silent, got stderr {:?}",
+        run.stderr,
+    );
+
+    // It got there through `agent_session_event` ALONE: a SubagentStart pulls no manual — the
+    // charter is not a role manual and `agent_context` has no role for a sub-agent.
+    assert_eq!(
+        mock.tool_names(),
+        vec!["agent_session_event".to_string()],
+        "a SubagentStart POSTs exactly one tool call",
+    );
+    let args = mock
+        .args_for("agent_session_event")
+        .expect("the session event was POSTed");
+    assert_eq!(
+        args["hook_event_name"],
+        json!("SubagentStart"),
+        "…the event nyx resolves the charter for",
+    );
+    assert_eq!(
+        args["NYX_TERMINAL_ID"],
+        json!("term-push-test"),
+        "…on the PARENT terminal, which is the only thing nyx can resolve a workspace from",
+    );
+    mock.stop();
+}
+
+/// THE DEGRADED `SubagentStart`, which must stay harmless: an answer carrying NO `context` (an
+/// older sidecar, a terminal bound to no workspace) injects NOTHING and still exits 0. The
+/// sub-agent runs on its mission alone; anything else would make a nyx-less answer fatal to every
+/// sub-agent spawn, which is a far worse failure than a missing charter.
+#[test]
+fn a_subagent_start_without_a_charter_injects_nothing_and_still_exits_zero() {
+    if !node_available() {
+        eprintln!("node unavailable: skipped the SubagentStart charter leg (node-agnostic by contract)");
+        return;
+    }
+    // Every non-`SubagentCharter` variant answers `agent_session_event` with a bare `{}`.
+    let mock = MockSidecar::start_with(Reply::Manual);
+    let run = run_hook_event(
+        HookEvent::SubagentStart("Explore"),
+        "/tmp/nyx-push-test-workspace",
+        Some(mock.port),
+        None,
+    );
+
+    assert_eq!(run.code, 0, "no charter is not a failure");
+    assert!(
+        run.stdout.trim().is_empty(),
+        "nothing is injected at all (stdout: {:?})",
+        run.stdout,
+    );
+    assert_eq!(
+        mock.tool_names(),
+        vec!["agent_session_event".to_string()],
+        "the session event still reached nyx — only the injection is empty",
+    );
+    mock.stop();
+}
+
+// ---------------------------------------------------------------------------
 // The SessionStart relay — the AMBIENT context (task 01M14TZZJVEG87D1JAZA6NRCR2).
 // ---------------------------------------------------------------------------
 
@@ -1193,12 +1261,9 @@ fn an_answer_without_context_is_traced_as_a_shape_problem() {
 /// workspace's managed-command block — comes back out of the REAL hook as `additionalContext`,
 /// BYTE FOR BYTE: newlines, `·` separators, accented words and the `group_id` included.
 ///
-/// This is the one link between the Rust renderer and a live session that nothing covered: the nine
-/// legs above are all `UserPromptSubmit`, and the SessionStart relay — a dozen lines of `.cjs` — was
-/// asserted nowhere. It is also the link where a corruption would be SILENT: the hook swallows its
-/// own errors by design, so a mangled block would simply arrive mangled.
-///
-/// It does NOT change the hook: `JSON.stringify` already relays any string. This PROVES it.
+/// It is the WRAPPED shape — the same one the `SubagentStart` leg above now pins. Asserting the
+/// three side by side is what makes the UNIFORMITY a fact of the test suite rather than a comment
+/// in the `.cjs`, which is how the inverted claim survived as long as it did.
 #[test]
 fn a_session_start_relays_the_ambient_command_block_verbatim() {
     if !node_available() {
@@ -1253,8 +1318,7 @@ fn a_session_start_relays_the_ambient_command_block_verbatim() {
         run.stderr,
     );
 
-    // It got there through `agent_session_event` ALONE: a SessionStart opens no run and pulls no
-    // manual, so the two run-opening calls must not fire.
+    // It got there through `agent_session_event` ALONE: a SessionStart pulls no manual.
     assert_eq!(
         mock.tool_names(),
         vec!["agent_session_event".to_string()],

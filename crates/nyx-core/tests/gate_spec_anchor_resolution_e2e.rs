@@ -1,27 +1,35 @@
-//! GATE e2e — « Résolution Spec sans id : ancrage workspace-Spec et contrat déterministe 0/1/N »
+//! GATE e2e — « Résoudre une Spec depuis une localisation, et REFUSER quand on ne peut pas »
 //! (PRD `01KYA475AX5JBGSS8WK5J8NM1S`, phase 3, task `01KYA4D9G1VANEEM3F1D175ND4`).
 //!
-//! The *juge de paix* of the whole PRD: it proves the ONE flow the feature exists for — a dev
-//! workspace declared FOR a Spec, then every downstream consumer resolving that Spec **with no id
-//! in hand** — holds bout en bout, over the REAL production bricks:
+//! THE QUESTION THIS GATE ANSWERS is unchanged since the day it was written: a dev workspace is
+//! declared FOR a Spec, and from then on every consumer must find that Spec **with no id in hand** —
+//! 0 anchored Specs, 1, or N; an explicit reference in any of its four forms; and a REFUSAL that
+//! names what to send when none of it works.
+//!
+//! WHAT CHANGED IS THE DOOR, and only the door. The refusal used to be `run_start`'s: the engine's
+//! run would not open on a token that designated no Spec, or on a location that designated several.
+//! The behaviour-tree engine is withdrawn (PDR-0031, `docs/product/decisions/`), so the verdict moved
+//! to the call that actually resolves the anchor — [`nyx_core::mcp_context::agent_context`], the tool
+//! that renders a command's manual. Everything this gate proved about RESOLUTION and REFUSAL survives
+//! that move intact; everything it proved about a RUN (one being opened, bound to a Spec, anchored on
+//! a workspace) is gone with the engine and is not restated here in another form.
+//!
+//! It walks the REAL production bricks, nothing stubbed:
 //!
 //!   * [`nyx_core::mcp_runtime::dispatch_workspace_tool`] — the EXACT entry the sidecar's MCP
-//!     dispatcher calls for `workspace_add` / `create_workspace`, carrying the new `spec_id`;
-//!   * [`nyx_core::mcp_context::agent_context`] — the role-manual render, whose Spec is resolved
-//!     from a `workspace_id` / `cwd` alone;
-//!   * [`nyx_core::mcp_engine::run_start`] — the engine's run-creation verb, whose Spec AND dev
-//!     workspace are resolved from the same anchors;
+//!     dispatcher calls for `workspace_add` / `create_workspace`, carrying the `spec_id` anchor;
+//!   * [`nyx_core::mcp_context::agent_context`] — the manual render, whose Spec is resolved from a
+//!     `spec_id` token, a `workspace_id` or a `cwd` alone, and whose refusals are the ones the
+//!     session hook relays to the model;
 //!   * [`nyx_core::mcp_tools_spec::spec_set_workspace`] — the standalone anchor tool, used here to
 //!     build the ambiguous (N) state a real project reaches;
 //!   * [`nyx_core::usecase::remove_workspace`] — the UI bridge's own workspace removal, used to
 //!     prove the `ON DELETE SET NULL` detach is real and not merely declared in a migration.
 //!
-//! Nothing is stubbed and — with the ONE named exception spelled out below — no DB shortcut stands
-//! in for a verb under test: the Specs are driven through `db::transition_spec` (the lifecycle
-//! authority), and every anchoring/resolution step goes through the tool an agent would call. The
-//! DB is an ON-DISK `Db::open` (integration tests cannot reach the `#[cfg(test)]` in-memory one),
-//! which also SEEDS the built-in ndev/nspec workflows — so `run_start` resolves a real flow the way
-//! a fresh project does.
+//! The Specs are driven through `db::transition_spec` (the lifecycle authority), and every
+//! anchoring / resolution step goes through the tool an agent would call. The DB is an ON-DISK
+//! `Db::open` (integration tests cannot reach the `#[cfg(test)]` in-memory one), i.e. the real boot
+//! path: migrations, drift refusal, Système scope, category backfill.
 //!
 //! ## The one exception: the rollback half of clause 5, driven one level below the tools
 //!
@@ -38,46 +46,48 @@
 //! The block is load-bearing, not decorative: under the mutation "ancrage hors transaction"
 //! (`usecase.rs:596`, anchoring moved out of the shared transaction) it is the ONLY assertion of
 //! this whole gate that turns red. It DELIBERATELY duplicates the unit test
-//! `a_refused_anchor_rolls_the_workspace_insert_back`
-//! (`crates/nyx-core/src/mcp_runtime.rs:2313-2356` — same use case, same draft Spec, same
-//! `RegisterWorkspaceError::Anchor` match): the duplication is the price of the gate ITSELF biting
-//! on transactionality rather than delegating that property to a test the gate never runs. Do not
-//! "deduplicate" either copy without re-running that mutation.
+//! `a_refused_anchor_rolls_the_workspace_insert_back` (`crates/nyx-core/src/mcp_runtime.rs` — same
+//! use case, same draft Spec, same `RegisterWorkspaceError::Anchor` match): the duplication is the
+//! price of the gate ITSELF biting on transactionality rather than delegating that property to a
+//! test the gate never runs. Do not "deduplicate" either copy without re-running that mutation.
 //!
-//! # The five clauses of the done-criterion (verbatim), each proven below
+//! # The clauses, each proven below
 //!
 //!   1. "Les deux chemins de création résolvent ensuite la Spec sans id explicite." —
 //!      [`both_creation_paths_then_resolve_the_spec_with_no_explicit_id`].
 //!   2. "Aucun chemin d'ancrage ne change ready ou in_progress ; draft est refusée." —
 //!      [`no_anchoring_path_moves_the_status_and_an_unanchorable_spec_is_refused`].
-//!   3. "Supprimer le workspace détache la Spec ; le comportement zéro candidate dépend du scope
+//!   3. "Supprimer le workspace détache la Spec ; le comportement zéro candidate dépend du rôle
 //!      sans erreur interne." —
-//!      [`removing_the_workspace_detaches_the_spec_and_zero_candidates_answers_by_scope`].
+//!      [`removing_the_workspace_detaches_the_spec_and_zero_candidates_answers_by_role`].
 //!   4. "Deux Specs actives sur le même workspace produisent l'ambiguïté attendue et aucune n'est
 //!      choisie." — [`two_active_specs_on_one_workspace_refuse_to_pick_either`].
 //!   5. "Les cas mauvais projet, rollback DB et dossier neuf compensé sont couverts." —
 //!      [`a_wrong_project_a_db_rollback_and_a_fresh_folder_all_leave_nothing_behind`], plus the
 //!      no-`spec_id` compatibility clause in
 //!      [`without_spec_id_both_tools_keep_their_pre_anchor_contract`].
+//!   6. THE REFERENCE GRAMMAR, which is the other half of "sans id explicite" now that the token the
+//!      human typed arrives on this tool —
+//!      [`the_four_reference_forms_resolve_and_a_refusal_names_what_to_send`].
 //!
-//! # What this gate deliberately does NOT prove (the PRD's non-goals)
+//! # What this gate deliberately does NOT prove
 //!
-//! Multi-repo provisioning, worktree creation, the `/nspec` oui/oui-avec-workspace choice, implicit
-//! consent, and ANY selection-by-recency policy are out of scope: nothing here creates a worktree,
-//! drives `nspec`'s authoring choice, or asserts that some candidate wins on recency — the N case
-//! is proven to pick NOTHING, which is the opposite property.
+//! Multi-repo provisioning, worktree creation, implicit consent, and ANY selection-by-recency
+//! policy are out of scope: nothing here creates a worktree or asserts that some candidate wins on
+//! recency — the N case is proven to pick NOTHING, which is the opposite property. It renders
+//! manuals but says nothing about their PROSE (that is `mcp_context`'s own sweeps): what it reads out
+//! of a render is the Spec it resolved, the project it echoes, and the diagnosis it carries.
 
 use std::path::{Path, PathBuf};
 
 use nyx_core::db::{self, Db, SpecSections, SpecTransition};
 use nyx_core::mcp::{RpcCode, RpcError};
-use nyx_core::mcp_engine::{run_start, EngineRuntime};
 use nyx_core::mcp_runtime::dispatch_workspace_tool;
 use nyx_core::usecase::{self, DomainEventSource, NullEventSink};
 use serde_json::{json, Value};
 
 // ============================================================================
-// Scaffolding — an on-disk temp nyx.db (Db::open SEEDS the built-ins), RAII-cleaned.
+// Scaffolding — an on-disk temp nyx.db opened through the REAL boot path, RAII-cleaned.
 // ============================================================================
 
 /// RAII temp dir removed on drop (the pattern the crate's other gate e2e tests use). The caller
@@ -112,19 +122,24 @@ fn temp_dir(tag: &str) -> TempDir {
     TempDir(dir)
 }
 
-/// Open an on-disk nyx.db under `tmp` — `Db::open` runs the migrations AND seeds the built-in
-/// ndev / nspec / ndoc workflows, so `run_start` resolves a real flow out of the box.
-fn open_seeded_db(tmp: &TempDir) -> Db {
-    Db::open(&tmp.path().join("nyx.db")).expect("open temp nyx.db (seeds built-ins)")
+/// Open an on-disk nyx.db under `tmp` through `Db::open` — the boot path itself (migrations, drift
+/// refusal, Système scope, category backfill), never the in-memory test fixture.
+fn open_db(tmp: &TempDir) -> Db {
+    Db::open(&tmp.path().join("nyx.db")).expect("open temp nyx.db (the boot path)")
 }
 
 /// A project whose ROOT workspace is `root` (a path that never collides with the dev workspaces
 /// this gate registers). Returns the project id.
 fn project(db: &Db, name: &str, root: &str) -> String {
+    project_row(db, name, root).id
+}
+
+/// The project ROW — used where the human KEY matters (the `KEY-3` reference form), which is minted
+/// by `create_project` and therefore never guessed here.
+fn project_row(db: &Db, name: &str, root: &str) -> db::Project {
     db.with_conn(|c| db::create_project(c, name, root, None))
         .expect("project")
         .0
-        .id
 }
 
 /// A Spec of `project_id` driven to `status` through the LIFECYCLE authority (never a direct
@@ -221,10 +236,15 @@ fn context(db: &Db, args: Value) -> Result<Value, RpcError> {
     nyx_core::mcp_context::agent_context(db, &args).map(|o| o.result)
 }
 
-/// `run_start` through its REAL entry point, raw `Result`.
-fn start_run(db: &Db, args: Value) -> Result<Value, RpcError> {
-    run_start(db, &EngineRuntime::new(), &args).map(|o| o.result)
-}
+/// The three ROLES `agent_context` renders (PDR-0031) — `spec` authors, `dev` builds, `doc`
+/// reconciles. Walked as a set wherever a property is the RESOLVER's and not one role's, so a
+/// fourth role could not be added resolving differently without this gate saying so.
+const ROLES: [&str; 3] = ["spec", "dev", "doc"];
+
+/// The two roles that work ON an existing Spec, and are therefore REFUSED rather than started on a
+/// guess when none is anchored. `spec` is not one of them: a project with zero Specs is exactly
+/// where a new one gets authored.
+const EFFECTOR_ROLES: [&str; 2] = ["dev", "doc"];
 
 /// The `spec_set_workspace` MCP tool — the STANDALONE anchor path (the other writer of
 /// `specs.workspace_id`), raw `Result`.
@@ -234,20 +254,25 @@ fn set_workspace(db: &Db, args: Value) -> Result<Value, RpcError> {
 
 /// The machine handle a caller keys on to tell the AMBIGUOUS-location refusal apart from every
 /// other `invalid_argument` — asserted here as the WIRE contract (`error.data.reason`), not through
-/// the crate-private predicate that reads it.
+/// the crate-private constant that produces it.
 const AMBIGUOUS_REASON: &str = "spec_ambiguous_for_workspace";
 
-/// The `run_start` warning code for a location that anchors SEVERAL active Specs on a flow that
-/// authors its own.
-const AMBIGUOUS_WARNING: &str = "spec_ambiguous_started_unbound";
+/// The two case-0 diagnoses, as WIRE codes: a location that resolved a real workspace carrying no
+/// active Spec, and a location that resolved no workspace at all (an invocation mistake).
+const NONE_ON_LOCATION: &str = "spec_none_on_location";
+const LOCATION_UNRESOLVED: &str = "spec_location_unresolved";
 
 fn is_ambiguous(e: &RpcError) -> bool {
-    e.code == RpcCode::InvalidArgument
-        && e.data
-            .as_ref()
-            .and_then(|d| d.get("reason"))
-            .and_then(Value::as_str)
-            == Some(AMBIGUOUS_REASON)
+    e.code == RpcCode::InvalidArgument && reason_of(e).as_deref() == Some(AMBIGUOUS_REASON)
+}
+
+/// The `data.reason` of a refusal — the machine half a caller branches on.
+fn reason_of(e: &RpcError) -> Option<String> {
+    e.data
+        .as_ref()
+        .and_then(|d| d.get("reason"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// A refusal must never be an `internal`: every case this gate drives is a MODELLED outcome with an
@@ -269,26 +294,23 @@ fn assert_not_internal(label: &str, e: &RpcError) {
 /// `{ready, in_progress}`.
 ///
 /// A Spec is already at least `ready`, its dev folder is declared to nyx WITH the `spec_id`, and
-/// from that moment on NO caller has to carry the Spec id again: `agent_context` and `run_start`
-/// resolve it from the `workspace_id`, from the workspace's own `cwd`, AND from a NESTED cwd (the
-/// realistic case — an agent runs from a subfolder of its workspace, which is what the shared
-/// deepest-ancestor selector is for).
+/// from that moment on NO caller has to carry the Spec id again: `agent_context` resolves it from
+/// the `workspace_id`, from the workspace's own `cwd`, AND from a NESTED cwd (the realistic case —
+/// an agent runs from a subfolder of its workspace, which is what the shared deepest-ancestor
+/// selector is for). The three ROLES are walked at each anchor, because resolution is the
+/// RESOLVER's job and not the role's: `/nspec`, `/ndev` and `/ndoc` standing on the same folder must
+/// land on the same Spec.
 ///
-/// The `run_start` half also proves the engine end of the chain: the run comes back BOUND to the
-/// Spec and ANCHORED on the workspace the cwd named, so the flow the dispatcher then ticks is the
-/// one that Spec's work belongs to.
-///
-/// The status is re-read AFTER every consumer, not just after the anchor: clause 2's "aucun chemin
-/// d'ancrage ne change ready ou in_progress" has to survive the resolution too, since `run_start`
-/// writes (it anchors the run) and a Spec-scoped flow is exactly where an accidental transition
-/// would hide.
+/// The status is re-read AFTER every render, not just after the anchor: clause 2's "aucun chemin
+/// d'ancrage ne change ready ou in_progress" has to survive the resolution too, and `agent_context`
+/// is a pure READ — an accidental transition there would be invisible anywhere else.
 #[test]
 fn both_creation_paths_then_resolve_the_spec_with_no_explicit_id() {
     for tool in ["create_workspace", "workspace_add"] {
         for status in [db::SPEC_STATUS_READY, db::SPEC_STATUS_IN_PROGRESS] {
             let label = format!("{tool}/{status}");
             let tmp = temp_dir("resolve");
-            let db = open_seeded_db(&tmp);
+            let db = open_db(&tmp);
             let project_id = project(&db, "Anchor", &tmp.child("root"));
             let spec_id = spec_at(&db, &project_id, "Dev spec", status);
 
@@ -313,55 +335,41 @@ fn both_creation_paths_then_resolve_the_spec_with_no_explicit_id() {
                 ("nested cwd", json!({ "cwd": nested })),
             ];
             for (kind, anchor) in anchors {
-                let mut args = anchor.clone();
-                let obj = args.as_object_mut().unwrap();
-                obj.insert("role".into(), json!("coder"));
-                let rendered = context(&db, args).unwrap_or_else(|e| {
-                    panic!("{label}/{kind}: agent_context refused: {}", e.message)
-                });
-                assert_eq!(
-                    rendered["spec_id"],
-                    json!(spec_id),
-                    "{label}: agent_context resolved the anchored Spec from the {kind} alone"
-                );
-                assert_eq!(
-                    rendered["project_id"],
-                    json!(project_id),
-                    "{label}/{kind}: …and echoes the Spec's OWN project beside the manual"
-                );
-                assert!(
-                    rendered["context"].as_str().is_some_and(|s| !s.is_empty()),
-                    "{label}/{kind}: a resolved Spec renders a real manual, not an empty one"
-                );
-
-                let opened = start_run(&db, anchor.clone())
-                    .unwrap_or_else(|e| panic!("{label}/{kind}: run_start refused: {}", e.message));
-                assert_eq!(
-                    opened["spec_id"],
-                    json!(spec_id),
-                    "{label}: run_start bound the run to the anchored Spec from the {kind} alone"
-                );
-                assert_eq!(
-                    opened["scope"], json!("ndev"),
-                    "{label}/{kind}: the seeded built-in ndev flow is what a bare run_start resolves"
-                );
-                let run_id = opened["run_id"].as_str().expect("run_id").to_string();
-                let run = db
-                    .with_conn(|c| db::get_workflow_run(c, &run_id))
-                    .expect("read run")
-                    .expect("run exists");
-                assert_eq!(
-                    run.workspace_id.as_deref(),
-                    Some(ws_id.as_str()),
-                    "{label}/{kind}: the run is anchored on the dev workspace the location named"
-                );
+                for role in ROLES {
+                    let mut args = anchor.clone();
+                    let obj = args.as_object_mut().unwrap();
+                    obj.insert("role".into(), json!(role));
+                    let rendered = context(&db, args).unwrap_or_else(|e| {
+                        panic!("{label}/{kind}/{role}: agent_context refused: {}", e.message)
+                    });
+                    assert_eq!(
+                        rendered["spec_id"],
+                        json!(spec_id),
+                        "{label}/{role}: the anchored Spec is resolved from the {kind} alone"
+                    );
+                    assert_eq!(
+                        rendered["project_id"],
+                        json!(project_id),
+                        "{label}/{kind}/{role}: …and the Spec's OWN project rides beside the manual"
+                    );
+                    assert!(
+                        rendered["context"].as_str().is_some_and(|s| !s.is_empty()),
+                        "{label}/{kind}/{role}: a resolved Spec renders a real manual"
+                    );
+                    assert_eq!(
+                        rendered["warnings"],
+                        json!([]),
+                        "{label}/{kind}/{role}: a render that resolved carries NO diagnosis — the \
+                         array is present and empty, never absent"
+                    );
+                }
             }
 
             // --- And nothing along the way moved the lifecycle.
             assert_eq!(
                 spec_row(&db, &spec_id).status,
                 status,
-                "{label}: neither agent_context nor run_start transitioned the Spec"
+                "{label}: rendering a manual transitions nothing"
             );
         }
     }
@@ -390,7 +398,7 @@ fn no_anchoring_path_moves_the_status_and_an_unanchorable_spec_is_refused() {
     // --- (a) The ANCHORABLE statuses: the link lands, the lifecycle does not move.
     for status in [db::SPEC_STATUS_READY, db::SPEC_STATUS_IN_PROGRESS] {
         let tmp = temp_dir("guard-ok");
-        let db = open_seeded_db(&tmp);
+        let db = open_db(&tmp);
         let project_id = project(&db, "Guard", &tmp.child("root"));
         let spec_id = spec_at(&db, &project_id, "Anchorable", status);
         let before = spec_row(&db, &spec_id);
@@ -436,7 +444,7 @@ fn no_anchoring_path_moves_the_status_and_an_unanchorable_spec_is_refused() {
     // --- (b) The REFUSED statuses, on every path an agent can take.
     for status in [db::SPEC_STATUS_DRAFT, db::SPEC_STATUS_CANCELLED] {
         let tmp = temp_dir("guard-ko");
-        let db = open_seeded_db(&tmp);
+        let db = open_db(&tmp);
         let project_id = project(&db, "Guard", &tmp.child("root"));
         let spec_id = spec_at(&db, &project_id, "Unanchorable", status);
         // A real target for the standalone tool, registered with no spec_id at all.
@@ -519,7 +527,7 @@ fn no_anchoring_path_moves_the_status_and_an_unanchorable_spec_is_refused() {
 
 // ============================================================================
 // CLAUSE 3 — "Supprimer le workspace détache la Spec ; le comportement zéro candidate dépend du
-//            scope sans erreur interne."
+//            rôle sans erreur interne."
 // ============================================================================
 
 /// THE DETACH IS REAL, THE ZERO CASE IS AN ANSWER, AND THE LINK CAN BE RE-POSED.
@@ -530,28 +538,26 @@ fn no_anchoring_path_moves_the_status_and_an_unanchorable_spec_is_refused() {
 /// gate is the only place that reads the schema back.
 ///
 /// Then the ZERO case, which is the one a real project hits constantly (a workspace with no active
-/// Spec). It is NOT an error condition — it is an answer, and WHICH answer depends on who is
-/// asking:
+/// Spec). It is NOT an error condition — it is an answer, and WHICH answer depends on WHO is
+/// asking. The axis used to be the run's SCOPE; since PDR-0031 it is the ROLE, and it is the same
+/// distinction:
 ///
-///   * `agent_context(role=coder)` — an effector works ON a Spec ⇒ `invalid_id`, actionable;
-///   * `agent_context(role=spec)`  — the AUTHOR creates one ⇒ a graceful project-scoped authoring
-///     manual, never an error;
-///   * `agent_context(role=dev)`   — the dispatcher owns no flow ⇒ renders standalone, Spec null;
-///   * `run_start(scope=ndev)`     — a Spec-scoped flow refuses to open an orphan run;
-///   * `run_start(scope=nspec)`    — authoring may begin with no Spec ⇒ the run opens UNBOUND.
+///   * `agent_context(role=dev|doc)` — they work ON a Spec ⇒ `invalid_id`, actionable, carrying the
+///     case-0 code as `data.reason`;
+///   * `agent_context(role=spec)`    — the AUTHOR creates one ⇒ a graceful project-scoped authoring
+///     manual, never an error, carrying the same code in `warnings`.
 ///
 /// Every one of those is asserted to be a MODELLED outcome, never an `internal`.
 ///
-/// REVIEW F1 added the missing half of the two renders that answer `ok`: they now also SAY that
-/// nothing is anchored — a `warnings` entry with a stable code, and the same sentence inside the
-/// manual — and the two case-0 sub-cases are told apart by that code (`spec_location_unresolved` for
-/// the folder no workspace claims, `spec_none_on_location` for a live workspace carrying no active
-/// Spec). Silence there was the finding: an agent calling from the wrong folder received a
-/// perfectly normal-looking context.
+/// AND THE TWO SUB-CASES OF ZERO ARE TOLD APART, on both surfaces: `spec_location_unresolved` for a
+/// folder no workspace claims (an invocation mistake — the agent is in the wrong place),
+/// `spec_none_on_location` for a live workspace carrying no active Spec (the normal state of a
+/// project about to author its first). Silence there was the original finding: an agent calling from
+/// the wrong folder received a perfectly normal-looking context.
 #[test]
-fn removing_the_workspace_detaches_the_spec_and_zero_candidates_answers_by_scope() {
+fn removing_the_workspace_detaches_the_spec_and_zero_candidates_answers_by_role() {
     let tmp = temp_dir("detach");
-    let db = open_seeded_db(&tmp);
+    let db = open_db(&tmp);
     let project_id = project(&db, "Detach", &tmp.child("root"));
     let spec_id = spec_at(&db, &project_id, "Detachable", db::SPEC_STATUS_READY);
     let (ws_id, ws_root) = anchor_via(
@@ -583,47 +589,54 @@ fn removing_the_workspace_detaches_the_spec_and_zero_candidates_answers_by_scope
     );
 
     // --- ZERO candidates, by ROLE. The cwd now names a folder no workspace claims.
-    let err = context(&db, json!({ "role": "coder", "cwd": ws_root })).expect_err("no Spec");
-    assert_not_internal("coder/zero", &err);
-    assert_eq!(err.code, RpcCode::InvalidId);
-    assert!(
-        err.message.contains("could not resolve a Spec"),
-        "the effector is told what to pass, got: {}",
-        err.message
-    );
+    for role in EFFECTOR_ROLES {
+        let err = context(&db, json!({ "role": role, "cwd": ws_root })).expect_err("no Spec");
+        assert_not_internal(&format!("{role}/zero"), &err);
+        assert_eq!(err.code, RpcCode::InvalidId, "{role}");
+        assert!(
+            err.message.contains("works ON a Spec"),
+            "{role}: the refusal says WHY a guess is worse than a refusal, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("spec_id"),
+            "{role}: …and names what to send instead, got: {}",
+            err.message
+        );
+        assert_eq!(
+            reason_of(&err).as_deref(),
+            Some(LOCATION_UNRESOLVED),
+            "{role}: a cwd matching NO workspace is the invocation-mistake sub-case, got {:?}",
+            err.data
+        );
+    }
 
     let authoring = context(&db, json!({ "role": "spec", "cwd": ws_root }))
         .expect("the AUTHOR is never refused for lack of a Spec");
     assert_eq!(authoring["spec_id"], Value::Null);
 
-    let dispatcher = context(&db, json!({ "role": "dev", "cwd": ws_root }))
-        .expect("the dispatcher renders standalone");
-    assert_eq!(dispatcher["spec_id"], Value::Null);
-
-    // …AND THE CASE 0 SAYS SO (review F1). Rendering ok with `spec_id: null` and not one word about
-    // it is what let an agent calling from the wrong folder mistake an unscoped manual for a scoped
-    // one. Here the folder no longer belongs to any workspace at all — the INVOCATION-mistake
-    // sub-case — so both roles carry that code, and the sentence is IN the manual too.
-    for (role, rendered) in [("spec", &authoring), ("dev", &dispatcher)] {
-        let warnings = rendered["warnings"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{role}: a warnings array, got {rendered}"));
-        assert_eq!(
-            warnings.len(),
-            1,
-            "{role}: the unscoped render carries exactly one diagnosis, got {warnings:?}"
-        );
-        assert_eq!(
-            warnings[0]["code"], "spec_location_unresolved",
-            "{role}: a cwd matching NO workspace is the invocation-mistake sub-case",
-        );
-        let sentence = warnings[0]["message"].as_str().expect("a human sentence");
-        let text = rendered["context"].as_str().expect("a rendered manual");
-        assert!(
-            text.contains("NO SPEC ANCHORED") && text.contains(sentence),
-            "{role}: the manual itself carries the SAME line as the warning, got: {text}"
-        );
-    }
+    // …AND THE CASE 0 SAYS SO. Rendering ok with `spec_id: null` and not one word about it is what
+    // let an agent calling from the wrong folder mistake an unscoped manual for a scoped one. The
+    // diagnosis rides BOTH surfaces — the `warnings` array a caller reads, and one explicit line
+    // inside the manual an agent reads — and it is the SAME sentence.
+    let warnings = authoring["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a warnings array, got {authoring}"));
+    assert_eq!(
+        warnings.len(),
+        1,
+        "the unscoped render carries exactly one diagnosis, got {warnings:?}"
+    );
+    assert_eq!(
+        warnings[0]["code"], LOCATION_UNRESOLVED,
+        "a cwd matching NO workspace is the invocation-mistake sub-case",
+    );
+    let sentence = warnings[0]["message"].as_str().expect("a human sentence");
+    let text = authoring["context"].as_str().expect("a rendered manual");
+    assert!(
+        text.contains("NO SPEC ANCHORED") && text.contains(sentence),
+        "the manual itself carries the SAME line as the warning, got: {text}"
+    );
 
     // --- ZERO candidates on a LIVE workspace that simply anchors nothing — the shape a real
     // project has, and the one that separates "no workspace here" from "no Spec here".
@@ -637,49 +650,36 @@ fn removing_the_workspace_detaches_the_spec_and_zero_candidates_answers_by_scope
         .as_str()
         .unwrap()
         .to_string();
-    let err = context(&db, json!({ "role": "coder", "workspace_id": bare_ws }))
-        .expect_err("a live workspace with zero active Specs still resolves none");
-    assert_not_internal("coder/bare", &err);
-    assert_eq!(err.code, RpcCode::InvalidId);
-
-    // The OTHER case-0 sub-case, on that same live workspace: the location resolved perfectly, it
-    // simply anchors no active Spec — a legitimate state (a project about to author its first
-    // Spec), and therefore NOT the same diagnosis as the wrong folder above.
-    let on_bare = context(&db, json!({ "role": "dev", "workspace_id": bare_ws }))
-        .expect("the dispatcher renders standalone on a Spec-less workspace");
+    for role in EFFECTOR_ROLES {
+        let err = context(&db, json!({ "role": role, "workspace_id": bare_ws }))
+            .expect_err("a live workspace with zero active Specs still resolves none");
+        assert_not_internal(&format!("{role}/bare"), &err);
+        assert_eq!(err.code, RpcCode::InvalidId, "{role}");
+        assert_eq!(
+            reason_of(&err).as_deref(),
+            Some(NONE_ON_LOCATION),
+            "{role}: a REAL workspace carrying no Spec is told apart from a folder nyx never heard \
+             of, got {:?}",
+            err.data
+        );
+        assert!(
+            err.message.contains(&bare_ws),
+            "{role}: …and the sentence names the workspace it looked at: {}",
+            err.message
+        );
+    }
+    let on_bare = context(&db, json!({ "role": "spec", "workspace_id": bare_ws }))
+        .expect("the author renders on a Spec-less workspace — that is where a first Spec is born");
     assert_eq!(
-        on_bare["warnings"][0]["code"], "spec_none_on_location",
-        "a real workspace carrying no Spec is told apart from a folder nyx never heard of, got: {}",
+        on_bare["warnings"][0]["code"], NONE_ON_LOCATION,
+        "the same distinction on the surface that answers ok, got: {}",
         on_bare["warnings"]
     );
-    assert!(
-        on_bare["warnings"][0]["message"]
-            .as_str()
-            .unwrap()
-            .contains(&bare_ws),
-        "…and the sentence names the workspace it looked at: {}",
-        on_bare["warnings"]
-    );
-
-    // --- ZERO candidates, by SCOPE, on that same live workspace.
-    let err = start_run(&db, json!({ "workspace_id": bare_ws, "scope": "ndev" }))
-        .expect_err("a Spec-scoped flow refuses to open an orphan run");
-    assert_not_internal("ndev/zero", &err);
-    assert_eq!(err.code, RpcCode::InvalidArgument);
-    assert!(
-        err.message.contains("works ON a Spec"),
-        "the refusal says WHY an unbound ndev run is useless, got: {}",
-        err.message
-    );
-
-    let unbound = start_run(&db, json!({ "workspace_id": bare_ws, "scope": "nspec" }))
-        .expect("authoring may begin with no Spec");
     assert_eq!(
-        unbound["spec_id"],
-        Value::Null,
-        "the nspec run opens UNBOUND rather than being handed some Spec"
+        on_bare["project_id"],
+        json!(project_id),
+        "…and the author is still told WHICH project they are authoring in: {on_bare}",
     );
-    assert_eq!(unbound["scope"], json!("nspec"));
 
     // --- RE-ANCHORING: the detached Spec takes a new dev workspace and resolution resumes.
     let (re_ws, re_root) = anchor_via(
@@ -699,7 +699,7 @@ fn removing_the_workspace_detaches_the_spec_and_zero_candidates_answers_by_scope
         db::SPEC_STATUS_READY,
         "…still without a transition"
     );
-    let rendered = context(&db, json!({ "role": "coder", "cwd": re_root }))
+    let rendered = context(&db, json!({ "role": "dev", "cwd": re_root }))
         .expect("the re-anchored Spec resolves by location again");
     assert_eq!(rendered["spec_id"], json!(spec_id));
 }
@@ -717,9 +717,9 @@ fn removing_the_workspace_detaches_the_spec_and_zero_candidates_answers_by_scope
 /// caller can pass an explicit `spec_id`.
 ///
 /// The assertions are built so that a resolver which quietly returned the newest (or the oldest, or
-/// the first row) would FAIL them: both location anchors must refuse, the refusal must NAME BOTH
-/// candidates, and the one path that is allowed to proceed (`nspec`, which authors its own Spec)
-/// must come back bound to NEITHER — not to one of them.
+/// the first row) would FAIL them: both location anchors must refuse, for every role — the ambiguity
+/// is the RESOLVER's verdict and no role is allowed to break the tie for itself — and the refusal
+/// must NAME BOTH candidates.
 ///
 /// A TERMINAL Spec is then added to the same workspace to prove the candidate set is the ACTIVE one:
 /// a shipped Spec does not manufacture ambiguity, and the escape hatch the refusal advertises (an
@@ -727,7 +727,7 @@ fn removing_the_workspace_detaches_the_spec_and_zero_candidates_answers_by_scope
 #[test]
 fn two_active_specs_on_one_workspace_refuse_to_pick_either() {
     let tmp = temp_dir("ambiguous");
-    let db = open_seeded_db(&tmp);
+    let db = open_db(&tmp);
     let project_id = project(&db, "Ambiguous", &tmp.child("root"));
 
     let first = spec_at(&db, &project_id, "First spec", db::SPEC_STATUS_READY);
@@ -754,78 +754,37 @@ fn two_active_specs_on_one_workspace_refuse_to_pick_either() {
         "the workspace really does anchor two active Specs"
     );
 
-    // --- BOTH location anchors refuse, IDENTICALLY.
+    // --- BOTH location anchors refuse, IDENTICALLY, for EVERY role.
     for (kind, anchor) in [
         ("workspace_id", json!({ "workspace_id": ws_id })),
         ("cwd", json!({ "cwd": ws_root })),
     ] {
-        let mut args = anchor.clone();
-        args.as_object_mut()
-            .unwrap()
-            .insert("role".into(), json!("coder"));
-        let err = context(&db, args).expect_err("N candidates cannot resolve one");
-        assert_not_internal(&format!("agent_context/{kind}"), &err);
-        assert!(
-            is_ambiguous(&err),
-            "{kind}: the refusal carries the STRUCTURED reason `{AMBIGUOUS_REASON}`, got {:?} / {:?}",
-            err.code,
-            err.data
-        );
-        assert!(
-            err.message.contains(&first) && err.message.contains(&second),
-            "{kind}: BOTH candidates are listed so the caller can choose, got: {}",
-            err.message
-        );
-        assert!(
-            err.message.contains("pass an explicit spec_id"),
-            "{kind}: the refusal names its own escape hatch, got: {}",
-            err.message
-        );
-
-        // The engine's Spec-scoped flow inherits the very same refusal.
-        let mut run_args = anchor.clone();
-        run_args
-            .as_object_mut()
-            .unwrap()
-            .insert("scope".into(), json!("ndev"));
-        let err = start_run(&db, run_args).expect_err("a Spec-scoped run cannot pick one either");
-        assert_not_internal(&format!("run_start/ndev/{kind}"), &err);
-        assert!(
-            is_ambiguous(&err),
-            "{kind}: run_start propagates the SAME structured ambiguity, got {:?}",
-            err.data
-        );
+        for role in ROLES {
+            let mut args = anchor.clone();
+            args.as_object_mut()
+                .unwrap()
+                .insert("role".into(), json!(role));
+            let err = context(&db, args).expect_err("N candidates cannot resolve one");
+            assert_not_internal(&format!("agent_context/{kind}/{role}"), &err);
+            assert!(
+                is_ambiguous(&err),
+                "{kind}/{role}: the refusal carries the STRUCTURED reason `{AMBIGUOUS_REASON}`, \
+                 got {:?} / {:?}",
+                err.code,
+                err.data
+            );
+            assert!(
+                err.message.contains(&first) && err.message.contains(&second),
+                "{kind}/{role}: BOTH candidates are listed so the caller can choose, got: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("pass an explicit spec_id"),
+                "{kind}/{role}: the refusal names its own escape hatch, got: {}",
+                err.message
+            );
+        }
     }
-
-    // --- The one flow allowed through comes back bound to NEITHER.
-    let unbound = start_run(&db, json!({ "cwd": ws_root, "scope": "nspec" }))
-        .expect("an authoring flow is not made to lose its cwd over an ambiguity it does not need");
-    assert_eq!(
-        unbound["spec_id"],
-        Value::Null,
-        "NEITHER candidate was chosen — an ambiguity resolves NO Spec, never an arbitrary one"
-    );
-    let warnings = unbound["warnings"].as_array().expect("warnings array");
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w["code"] == json!(AMBIGUOUS_WARNING)),
-        "…and the caller is TOLD, through the stable warning code, got: {warnings:?}"
-    );
-    let run_id = unbound["run_id"].as_str().expect("run_id");
-    let run = db
-        .with_conn(|c| db::get_workflow_run(c, run_id))
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        run.spec_id, None,
-        "the persisted run is unbound too, not just the payload"
-    );
-    assert_eq!(
-        run.workspace_id.as_deref(),
-        Some(ws_id.as_str()),
-        "the cwd still anchored the WORKSPACE — the ambiguity cost the run nothing else"
-    );
 
     // --- Neither Spec was touched by any of the refusals.
     assert_eq!(spec_row(&db, &first).status, db::SPEC_STATUS_READY);
@@ -842,7 +801,7 @@ fn two_active_specs_on_one_workspace_refuse_to_pick_either() {
     // --- THE ESCAPE HATCH the refusal advertises actually works.
     let rendered = context(
         &db,
-        json!({ "role": "coder", "cwd": ws_root, "spec_id": first }),
+        json!({ "role": "dev", "cwd": ws_root, "spec_id": first }),
     )
     .expect("an explicit spec_id resolves through an ambiguous location");
     assert_eq!(rendered["spec_id"], json!(first));
@@ -850,7 +809,7 @@ fn two_active_specs_on_one_workspace_refuse_to_pick_either() {
     // --- And a TERMINAL Spec is NOT a candidate: shipping one un-ambiguates the workspace.
     db.with_conn(|c| db::transition_spec(c, &second, SpecTransition::Cancel, true))
         .expect("ship the second Spec out of the active set");
-    let rendered = context(&db, json!({ "role": "coder", "cwd": ws_root }))
+    let rendered = context(&db, json!({ "role": "dev", "cwd": ws_root }))
         .expect("one active Spec remains, so the location resolves again");
     assert_eq!(
         rendered["spec_id"],
@@ -867,8 +826,8 @@ fn two_active_specs_on_one_workspace_refuse_to_pick_either() {
 ///
 /// (a) WRONG PROJECT — a Spec of project A cannot be anchored on a workspace being registered in
 ///     project B. Refused by the PREVALIDATION, so on the `create_workspace` path not even the
-///     folder is created. The resolver's own cross-project guard is checked on the same data: a
-///     `spec_id` of A passed beside a `cwd` in B is CONFRONTED rather than silently preferring one.
+///     folder is created. The RENDER's own cross-project guard is checked on the same data: a
+///     `project_id` of B passed beside a Spec of A is CONFRONTED rather than silently dropped.
 ///
 /// (b) DB ROLLBACK + (c) FRESH-FOLDER COMPENSATION, in ONE reachable production scenario. A
 ///     workspace row OUTLIVES its folder by design (PDR-0008: a worktree cleaned up at merge keeps
@@ -884,7 +843,7 @@ fn two_active_specs_on_one_workspace_refuse_to_pick_either() {
 #[test]
 fn a_wrong_project_a_db_rollback_and_a_fresh_folder_all_leave_nothing_behind() {
     let tmp = temp_dir("failures");
-    let db = open_seeded_db(&tmp);
+    let db = open_db(&tmp);
     let alpha = project(&db, "Alpha", &tmp.child("alpha-root"));
     let beta = project(&db, "Beta", &tmp.child("beta-root"));
     let spec_id = spec_at(&db, &alpha, "Alpha spec", db::SPEC_STATUS_READY);
@@ -935,22 +894,19 @@ fn a_wrong_project_a_db_rollback_and_a_fresh_folder_all_leave_nothing_behind() {
         "Beta gained no workspace from the refused declaration (root only)"
     );
 
-    // The RESOLVER's twin guard: a Spec of Alpha named beside a location in Beta is confronted.
-    let beta_ws = ws_ok(
+    // The RENDER's twin guard: a Spec of Alpha named beside a `project_id` of Beta is CONFRONTED
+    // and not silently dropped. Dropping it left a byte-identical manual behind, and the caller
+    // believed it had scoped the render.
+    let err = context(
         &db,
-        "workspace_add",
-        json!({ "project_id": beta, "path": beta_dir }),
-    )["workspace"]["path"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let err = start_run(&db, json!({ "spec_id": spec_id, "cwd": beta_ws }))
-        .expect_err("a spec_id and a cwd that disagree on the project are refused");
-    assert_not_internal("run_start/cross-project", &err);
+        json!({ "role": "dev", "spec_id": spec_id, "project_id": beta }),
+    )
+    .expect_err("a spec_id and a project_id that disagree are refused");
+    assert_not_internal("agent_context/cross-project", &err);
     assert_eq!(err.code, RpcCode::InvalidArgument);
     assert!(
-        err.message.contains("they disagree"),
-        "the disagreement is NAMED, never silently resolved either way, got: {}",
+        err.message.contains(&alpha) && err.message.contains(&beta),
+        "the disagreement NAMES both projects, never silently resolves either way, got: {}",
         err.message
     );
 
@@ -1033,9 +989,9 @@ fn a_wrong_project_a_db_rollback_and_a_fresh_folder_all_leave_nothing_behind() {
     // PROOF THAT IT BITES: in the PRD's mutation campaign, mutation M4 ("ancrage hors transaction",
     // `usecase.rs:596`) turns THIS block red and NOTHING ELSE in the gate. It knowingly duplicates
     // the unit test `a_refused_anchor_rolls_the_workspace_insert_back`
-    // (`crates/nyx-core/src/mcp_runtime.rs:2313-2356`); the duplication is deliberate and is what
-    // keeps the gate itself — not a test the gate never runs — mordant on transactionality. See the
-    // module header's "one exception" section before touching either copy.
+    // (`crates/nyx-core/src/mcp_runtime.rs`); the duplication is deliberate and is what keeps the
+    // gate itself — not a test the gate never runs — mordant on transactionality. See the module
+    // header's "one exception" section before touching either copy.
     let draft = spec_at(&db, &alpha, "Still authoring", db::SPEC_STATUS_DRAFT);
     let orphan_path = tmp.child("alpha-orphan");
     std::fs::create_dir_all(&orphan_path).unwrap();
@@ -1082,7 +1038,7 @@ fn a_wrong_project_a_db_rollback_and_a_fresh_folder_all_leave_nothing_behind() {
 #[test]
 fn without_spec_id_both_tools_keep_their_pre_anchor_contract() {
     let tmp = temp_dir("compat");
-    let db = open_seeded_db(&tmp);
+    let db = open_db(&tmp);
     let project_id = project(&db, "Compat", &tmp.child("root"));
     // A ready Spec EXISTS in the project and is anchored nowhere: a tool that helpfully guessed
     // would attach it, and this clause is what forbids guessing.
@@ -1175,4 +1131,149 @@ fn without_spec_id_both_tools_keep_their_pre_anchor_contract() {
         None,
         "and nothing in that campaign touched the Spec's anchor"
     );
+}
+
+// ============================================================================
+// CLAUSE 6 — THE REFERENCE THE HUMAN TYPED
+// ============================================================================
+
+/// THE OTHER HALF OF "SANS ID EXPLICITE": the human DOES type something, and it is almost never a
+/// canonical id. `#3`, `KEY-3`, the bare `3` — the forms every nyx surface displays — reach
+/// `agent_context` as the RAW token the hook forwarded, and nyx translates them
+/// ([`nyx_core::spec_ref`] owns the grammar; the tool owns the refusal).
+///
+/// THE REFUSALS ARE THE POINT, and they are why this clause moved here with the rest (PDR-0031).
+/// The session hook relays the sentence into the model in the manual's place, so it has to carry
+/// three things: the token AS TYPED, the accepted forms, and what the project actually holds. That
+/// is what lets an agent stop and ASK which Spec was meant instead of authoring a duplicate of the
+/// very one that was named.
+///
+/// Two refusals, and they are deliberately DIFFERENT:
+///
+///   * a reference that designates no Spec ⇒ `invalid_id` — for EVERY role, `/nspec` included: they
+///     named an existing Spec, and authoring a second is exactly how the duplicate gets ordered;
+///   * a PROJECT-RELATIVE form (`#N`, bare `N`) on a call that resolves NO project ⇒
+///     `invalid_argument` naming [`nyx_core::spec_ref::ANCHORLESS_FORMS`] — the Spec is not
+///     unknown, the FORM is unusable here, and the two must not read alike.
+#[test]
+fn the_four_reference_forms_resolve_and_a_refusal_names_what_to_send() {
+    let tmp = temp_dir("grammar");
+    let db = open_db(&tmp);
+    let project = project_row(&db, "Grammar", &tmp.child("root"));
+    let key = project.key.clone();
+    // Three Specs, so `3` is a real per-project number and not the only row in the table.
+    spec_at(&db, &project.id, "First", db::SPEC_STATUS_DRAFT);
+    spec_at(&db, &project.id, "Second", db::SPEC_STATUS_DRAFT);
+    let third = spec_at(&db, &project.id, "Third", db::SPEC_STATUS_READY);
+    assert_eq!(
+        spec_row(&db, &third).number,
+        3,
+        "the subject Spec is the project's #3 — the reference a human types"
+    );
+    // Its dev workspace: the anchor a `#N` is counted in when no project_id is passed, which is the
+    // shape the hook actually sends (`{ role, cwd, spec_id }`).
+    let (_ws, ws_root) = anchor_via(
+        &db,
+        "create_workspace",
+        &project.id,
+        &tmp.child("dev"),
+        &third,
+    );
+
+    // --- THE FOUR FORMS, each resolving to the same Spec, on every role.
+    let forms: [(&str, String, Value); 4] = [
+        (
+            "canonical id",
+            third.clone(),
+            json!({ "project_id": project.id }),
+        ),
+        ("human key", format!("{key}-3"), json!({})),
+        (
+            "#N, counted in the project the cwd resolves",
+            "#3".to_string(),
+            json!({ "cwd": ws_root }),
+        ),
+        (
+            "bare N, counted in an explicit project",
+            "3".to_string(),
+            json!({ "project_id": project.id }),
+        ),
+    ];
+    for (label, token, anchor) in forms {
+        for role in ROLES {
+            let mut args = anchor.clone();
+            let obj = args.as_object_mut().unwrap();
+            obj.insert("role".into(), json!(role));
+            obj.insert("spec_id".into(), json!(token));
+            let rendered = context(&db, args)
+                .unwrap_or_else(|e| panic!("{label}/{role}: '{token}' was refused: {}", e.message));
+            assert_eq!(
+                rendered["spec_id"],
+                json!(third),
+                "{label}/{role}: '{token}' designates Spec #3 and nyx resolved it to its \
+                 canonical id — the caller never translates"
+            );
+        }
+    }
+
+    // --- A REFERENCE THAT DESIGNATES NOTHING — refused for EVERY role, `spec` included.
+    for role in ROLES {
+        let err = context(
+            &db,
+            json!({ "role": role, "project_id": project.id, "spec_id": "99" }),
+        )
+        .expect_err("'99' designates no Spec of this project");
+        assert_not_internal(&format!("{role}/unknown"), &err);
+        assert_eq!(
+            err.code,
+            RpcCode::InvalidId,
+            "{role}: the REFERENCE is unknown, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("'99'"),
+            "{role}: the refusal names the token AS TYPED, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains(nyx_core::spec_ref::ACCEPTED_FORMS),
+            "{role}: …the forms nyx accepts, read from the grammar's own constant, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains(&third),
+            "{role}: …and what the project actually HOLDS, by id, so the next call can be formed \
+             from the answer: {}",
+            err.message
+        );
+    }
+
+    // --- A PROJECT-RELATIVE FORM ON A CALL THAT RESOLVES NO PROJECT — a different refusal, on
+    // purpose: nothing is unknown, the FORM cannot be counted here.
+    for token in ["#3", "3"] {
+        let err = context(&db, json!({ "role": "dev", "spec_id": token }))
+            .expect_err("a number cannot be counted with no project in scope");
+        assert_not_internal(&format!("anchorless/{token}"), &err);
+        assert_eq!(
+            err.code,
+            RpcCode::InvalidArgument,
+            "{token}: the FORM is unusable here — the Spec is not unknown, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains(nyx_core::spec_ref::ANCHORLESS_FORMS),
+            "{token}: the refusal names what to send instead, got: {}",
+            err.message
+        );
+    }
+
+    // --- Nothing in that campaign wrote anything: a resolution is a READ.
+    assert_eq!(
+        db.with_conn(|c| db::list_specs(c, Some(&project.id)))
+            .expect("list")
+            .len(),
+        3,
+        "the project still holds its three Specs — no reference minted one"
+    );
+    assert_eq!(spec_row(&db, &third).status, db::SPEC_STATUS_READY);
 }

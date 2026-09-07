@@ -38,7 +38,8 @@ pub const SPEC_CREATE_TOOL: &str = "spec_create";
 pub const SPEC_UPDATE_SECTION_TOOL: &str = "spec_update_section";
 /// `spec_fork` — fork a Spec into a NEW revision (the prior one superseded).
 pub const SPEC_FORK_TOOL: &str = "spec_fork";
-/// `spec_transition` — a GUARDED Spec lifecycle transition (ready/start/review/done/cancel).
+/// `spec_transition` — a GUARDED Spec lifecycle transition, nommée par sa CIBLE `to`
+/// (`ready` / `in_progress` / `in_review` / `completed` / `cancelled` / `draft`).
 pub const SPEC_TRANSITION_TOOL: &str = "spec_transition";
 /// `spec_set_workspace` — anchor (or detach) a Spec on a dev workspace.
 pub const SPEC_SET_WORKSPACE_TOOL: &str = "spec_set_workspace";
@@ -80,15 +81,12 @@ pub const SPEC_LIST_TOOL: &str = "spec_list";
 pub const TASK_LIST_TOOL: &str = "task_list";
 
 /// The Spec authoring tool names — advertised in `tools/list` and routed by [`dispatch_spec_tool`].
-/// A closed slice so a new tool is added in exactly one place. `spec_transition` is DELIBERATELY
-/// ABSENT from the agent surface (v2.8 review N17(b)): the four Spec lifecycle transitions are now
-/// imposed by NYX at the graph node built for each (ndev/nspec cover start/review/done/cancel and
-/// ready), so the effector never transitions a Spec — it only authors the draft. (`task_transition`
-/// STAYS: no graph covers task-level granularity — N17(d).)
-pub const SPEC_TOOLS: [&str; 15] = [
+/// A closed slice so a new tool is added in exactly one place.
+pub const SPEC_TOOLS: [&str; 16] = [
     SPEC_CREATE_TOOL,
     SPEC_UPDATE_SECTION_TOOL,
     SPEC_FORK_TOOL,
+    SPEC_TRANSITION_TOOL,
     SPEC_SET_WORKSPACE_TOOL,
     SPEC_SET_CATEGORY_TOOL,
     TASK_ADD_TOOL,
@@ -360,22 +358,41 @@ fn sections_from_args(args: &Value) -> Result<db::SpecSections, RpcError> {
     })
 }
 
-/// Resolve the `transition` string arg to the typed [`db::SpecTransition`]. Accepts the
-/// conceptual verbs (`ready`/`start`/`review`/`done`/`cancel`) — the SAME vocabulary
-/// depot's `spec` lifecycle used. An unknown verb → `invalid_argument`.
-fn parse_spec_transition(name: &str) -> Result<db::SpecTransition, RpcError> {
+/// Resolve the `to` string arg to the typed [`db::SpecTransition`].
+///
+/// LA CIBLE EST LE NOM, ET LE VERBE RESTE ACCEPTÉ. Les manuels d'agent écrivent la transition par
+/// le STATUT VISÉ — `to="ready"`, `to="in_progress"`, `to="in_review"`, `to="completed"`,
+/// `to="cancelled"`, `to="draft"` (`docs/product/agent-manuals.md`) — et c'est ce vocabulaire-là
+/// qui fait foi. Les verbes conceptuels d'origine (`start`, `review`, `done`, `complete`,
+/// `cancel`, `revise`) restent acceptés à côté : l'arm `"start" | "in_progress"` en était déjà le
+/// précédent, et un agent qui a lu un ancien texte n'a pas à échouer sur un synonyme. Un mot hors
+/// des deux jeux → `invalid_argument`, avec l'ensemble accepté dans le message.
+/// `pub` parce que le SIDECAR l'appelle : le db-command `spec_transition` (les boutons de l'écran
+/// Spec) doit accepter exactement le vocabulaire que l'outil MCP accepte, et un second parseur
+/// serait la façon dont les deux surfaces divergent.
+pub fn parse_spec_transition(name: &str) -> Result<db::SpecTransition, RpcError> {
     match name {
         "ready" => Ok(db::SpecTransition::Ready),
         "start" | "in_progress" => Ok(db::SpecTransition::Start),
-        "review" => Ok(db::SpecTransition::Review),
-        "done" | "complete" => Ok(db::SpecTransition::Done),
-        "cancel" => Ok(db::SpecTransition::Cancel),
+        "review" | "in_review" => Ok(db::SpecTransition::Review),
+        "done" | "complete" | "completed" => Ok(db::SpecTransition::Done),
+        "cancel" | "cancelled" => Ok(db::SpecTransition::Cancel),
+        "draft" | "revise" => Ok(db::SpecTransition::Revise),
         other => Err(RpcError::new(
             RpcCode::InvalidArgument,
-            format!("unknown transition '{other}' (accepted: ready, start, review, done, cancel)"),
+            format!(
+                "unknown target '{other}' (accepted: {SPEC_TRANSITION_TARGETS} — the conceptual \
+                 verbs start, review, done, cancel and revise are accepted too)"
+            ),
         )),
     }
 }
+
+/// Les CIBLES de `spec_transition`, telles que les manuels les écrivent — une seule source pour le
+/// message de refus ci-dessus et pour le schéma annoncé dans `tools/list`, afin que ce qui est
+/// promis et ce qui est accepté restent un seul fait.
+pub const SPEC_TRANSITION_TARGETS: &str =
+    "ready | in_progress | in_review | completed | cancelled | draft";
 
 /// Resolve the `transition` string arg to the typed [`db::TaskTransition`]. `verify` is
 /// handled separately (the human-verified path), so it is NOT parsed here.
@@ -396,9 +413,10 @@ fn parse_task_transition(name: &str) -> Result<db::TaskTransition, RpcError> {
 
 /// Map a [`db::SpecTransitionError`] onto the D8 RPC vocabulary. The lifecycle rules live
 /// in `db.rs`; this only translates the typed refusal into the agent-facing code/message.
-/// `pub(crate)` so the `nyx_next` handler ([`crate::mcp_engine`]) — which imposes a graph
-/// `transition` through the SAME guarded authority — surfaces the SAME refusal vocabulary.
-pub(crate) fn map_spec_transition_err(e: db::SpecTransitionError) -> RpcError {
+/// `pub` so every caller of the guarded transition authority — the MCP verb and the UI bridge
+/// alike — surfaces the SAME refusal vocabulary. The bridge lives in the sidecar crate, so
+/// `pub(crate)` would have left it to write a second, drifting set of sentences.
+pub fn map_spec_transition_err(e: db::SpecTransitionError) -> RpcError {
     match e {
         db::SpecTransitionError::NotFound => RpcError::new(RpcCode::InvalidId, "unknown spec"),
         db::SpecTransitionError::InvalidSource { from, to } => RpcError::new(
@@ -423,8 +441,9 @@ pub(crate) fn map_spec_transition_err(e: db::SpecTransitionError) -> RpcError {
         }
         db::SpecTransitionError::ConfirmationRequired => RpcError::new(
             RpcCode::InvalidState,
-            "this is a sensitive transition (ready/start/done/cancel): pass user_confirmed=true \
-             once the human has confirmed",
+            "this is a sensitive transition (ready, completed, cancelled): the human \
+             must say so in the chat first, in their own words — then pass user_confirmed=true. \
+             Asking yourself is not a confirmation",
         ),
         db::SpecTransitionError::WorkspaceNotFound => {
             RpcError::new(RpcCode::InvalidId, "unknown workspace")
@@ -707,22 +726,10 @@ pub fn spec_create(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
             )
         })
         .map_err(map_category_err)?;
-    // BIND the run that authored it (F5): a `/nspec` run starts with no Spec and CREATES one here, so
-    // this is the moment — and the only one — where the run and its Spec can be tied together. Left
-    // untied, the run stays inert (every Spec query answers null/0, every transition applies to
-    // nothing) and the flow ends `done` on a Spec still `draft`, silently. Best-effort and strictly
-    // guarded (see [`crate::mcp_engine::bind_session_run_to_spec`]): with no in-flight run to bind —
-    // an author working outside any run — nothing happens and the created Spec is unaffected.
-    let bound_run_id = crate::mcp_engine::bind_session_run_to_spec(
-        db,
-        crate::mcp_engine::shared_runtime(),
-        &spec.id,
-    );
     Ok(ToolOutcome::changed(
         json!({
             "spec": spec_json(&spec),
             "revision": revision,
-            "bound_run_id": bound_run_id,
             "category": category.as_ref().map(category_payload),
         }),
         ChangedTopic::Specs,
@@ -812,23 +819,15 @@ pub fn spec_set_category(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError>
     ))
 }
 
-/// `spec_update_section` — `{ spec_id, section, value, run_id? }` → `{ updated: true }`. Edits ONE
+/// `spec_update_section` — `{ spec_id, section, value }` → `{ updated: true }`. Edits ONE
 /// structured section of the Spec's ACTIVE revision in place (NOT a fork) via the SHARED
-/// `db::update_active_revision_section`. An unknown Spec → `invalid_id`.
-///
-/// `run_id` is the HUMAN-GATED exception to the freeze (H12), and nothing else: a Spec that has left
-/// its writable state refuses every section write, EXCEPT for the run named here when that run carries
-/// the authorization nyx's engine wrote from a human's answer at the coder escalation gate ("the
-/// contradiction is in the Spec's TEXT — fix the Spec"). The caller does not claim the right; it names
-/// the run, and nyx reads whether the human granted it
-/// ([`crate::mcp_engine::spec_section_write_is_authorized`]). A `run_id` on a WRITABLE Spec changes
-/// nothing — that write needed no exception.
+/// `db::update_active_revision_section`. An unknown Spec → `invalid_id`; a Spec that has left its
+/// writable state refuses the write (the freeze).
 pub fn spec_update_section(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let spec_id =
         crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "spec_id")?;
     let spec_id = spec_id.as_str();
     let section = parse_section(require_str(args, "section")?)?;
-    let run_id = optional_str(args, "run_id")?;
     // `value` is REQUIRED but may legitimately be an empty string (clearing a section);
     // read it directly so an explicit "" is honored rather than rejected by `require_str`.
     let value =
@@ -845,15 +844,9 @@ pub fn spec_update_section(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErro
                 ))
             }
         };
-    let human_gated = run_id
-        .map(|run_id| crate::mcp_engine::spec_section_write_is_authorized(db, run_id, spec_id))
-        .unwrap_or(false);
-    let updated = if human_gated {
-        db.with_conn(|c| db::update_active_revision_section_human_gated(c, spec_id, section, value))
-    } else {
-        db.with_conn(|c| db::update_active_revision_section(c, spec_id, section, value))
-    }
-    .map_err(map_content_write_err)?;
+    let updated = db
+        .with_conn(|c| db::update_active_revision_section(c, spec_id, section, value))
+        .map_err(map_content_write_err)?;
     if !updated {
         return Err(RpcError::new(
             RpcCode::InvalidId,
@@ -888,13 +881,20 @@ pub fn spec_fork(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     ))
 }
 
-/// `spec_transition` — `{ spec_id, transition, user_confirmed?, workspace_id?, cwd? }` →
+/// `spec_transition` — `{ spec_id, to, user_confirmed?, workspace_id?, cwd? }` →
 /// `{ spec }`. Performs a GUARDED + VALIDATED lifecycle transition via the SHARED
-/// `db::transition_spec_with_workspace`. The SENSITIVE transitions (ready/start/done/cancel)
-/// are refused unless `user_confirmed=true` — the guard-rail is enforced in `db.rs`, so it
-/// holds through the tool exactly as through the UI (à la depot `--user-confirmed`).
+/// `db::transition_spec_with_workspace`. The SENSITIVE transitions — `ready`, `done`
+/// (→ `completed`) and `cancel` (→ `cancelled`), and those three alone — are refused unless
+/// `user_confirmed=true` — the guard-rail is enforced in `db.rs`, so it holds through the tool
+/// exactly as through the UI (à la depot `--user-confirmed`), et RIEN n'est re-jugé ici : ce
+/// module est un adaptateur, la règle vit dans l'autorité unique.
 ///
-/// On `start` (ready→in_progress) the transition ALSO POSES the Spec's workspace anchor in
+/// L'ARGUMENT EST LA CIBLE, pas le verbe : `to="ready"` et non `transition="ready"`. Le manuel
+/// d'agent (`docs/product/agent-manuals.md`) est le contrat, et il écrit la cible ;
+/// [`parse_spec_transition`] accepte les deux orthographes pour que rien ne casse au passage.
+///
+/// On `start` (ready→in_progress) — which is NOT sensitive, and which the `/ndev` manual calls
+/// with no `user_confirmed` — the transition ALSO POSES the Spec's workspace anchor in
 /// the SAME operation: the dev workspace is resolved from an explicit `workspace_id`, else
 /// from `cwd` (the same cwd→workspace matcher `resolve_spec_id` uses). For every other
 /// transition no anchor is posed (`workspace_id`/`cwd` are ignored).
@@ -907,7 +907,7 @@ pub fn spec_fork(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
 pub fn spec_transition(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let spec_id = crate::mcp_context::require_spec_arg(db, args, "spec_id")?;
     let spec_id = spec_id.as_str();
-    let transition = parse_spec_transition(require_str(args, "transition")?)?;
+    let transition = parse_spec_transition(require_str(args, "to")?)?;
     let user_confirmed = optional_bool(args, "user_confirmed")?.unwrap_or(false);
     // Resolve the anchor ONLY for `start` — the one transition that binds the Spec to a dev
     // workspace. Reuses the shared cwd→workspace resolution (no duplicated matcher).
@@ -1486,8 +1486,8 @@ pub fn task_list(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
 /// round-trip. The ACCUMULATION is CIBLÉE: only the MUTATING Spec authoring/transition tools
 /// (`spec_create`, `spec_update_section`, `spec_fork`, `spec_transition`, `spec_set_workspace`,
 /// `task_add`, `task_transition`) are work signals — exactly the PRD's `spec_create /
-/// spec_update_section / task_add / task_transition / dev` set (a `spec_transition
-/// transition=start` is the "dev" launch). `task_add_dependency` / `task_delete` and the v2.6
+/// spec_update_section / task_add / task_transition / dev` set (a `spec_transition` onto
+/// `in_progress` is the "dev" launch). `task_add_dependency` / `task_delete` and the v2.6
 /// Spec-dependency tools (`spec_link` / `spec_unlink` / `spec_deps`) are deliberately NOT work
 /// signals (a structural edge tweak / a badge read / a draft cleanup is not "working the Spec",
 /// and a deleted task's Spec is gone from the result) — they fall through to `None`.
@@ -1500,9 +1500,10 @@ pub fn worked_spec_id(name: &str, result: &Value) -> Option<String> {
         cur.as_str().map(str::to_string)
     };
     match name {
-        // The Spec is returned directly as `result.spec`. (`spec_transition` is no longer an agent
-        // verb — N17(b); nyx transitions at the node, and `run_start` below is the map signal.)
-        SPEC_CREATE_TOOL | SPEC_SET_WORKSPACE_TOOL => str_at(result, &["spec", "id"]),
+        // The Spec is returned directly as `result.spec`.
+        SPEC_CREATE_TOOL | SPEC_TRANSITION_TOOL | SPEC_SET_WORKSPACE_TOOL => {
+            str_at(result, &["spec", "id"])
+        }
         // `spec_update_section` echoes the edited `result.spec_id`.
         SPEC_UPDATE_SECTION_TOOL => str_at(result, &["spec_id"]),
         // A fork returns the new `result.revision`, which carries its `spec_id`.
@@ -1514,18 +1515,6 @@ pub fn worked_spec_id(name: &str, result: &Value) -> Option<String> {
         // a work signal. It returns `result.finding`; its `spec_id` is the worked Spec. (This is the
         // "extend the auto-map when a finding promotion verb is added" the PRD calls for.)
         crate::mcp::REVIEW_SUBMIT_FEEDBACK_TOOL => str_at(result, &["finding", "spec_id"]),
-        // ENGINE cutover (v2.8 review N15): with the thin dispatcher the agent no longer calls the
-        // mutating `spec_*` verbs — nyx runs them INSIDE the `nyx_next` tick — so those signals never
-        // reach this auto-map, and the session ↔ Spec link (the terminal overlay's substrate) went
-        // unwritten. `run_start` RESOLVES + returns the bound `spec_id` (null for an unbound run), so
-        // OPENING a run on a Spec is the work signal that re-establishes the link EXPLICITLY, from the
-        // run, at the moment it opens — not inferred from a mutation that no longer happens agent-side.
-        crate::mcp_engine::RUN_START_TOOL => str_at(result, &["spec_id"]),
-        // …and its RECOVERY twin, for the same reason: a run that opened UNBOUND wrote no link at
-        // all, so the session ↔ Spec link is established exactly when the run finally learns which
-        // Spec it drives. Leaving it out would make the repaired session the ONE case where the
-        // overlay stays empty — the very session that already went wrong once.
-        crate::mcp_engine::RUN_BIND_SPEC_TOOL => str_at(result, &["spec_id"]),
         // Reads, non-Spec tools, and the non-work Spec tools never map.
         _ => None,
     }
@@ -1545,8 +1534,7 @@ pub fn dispatch_spec_tool(
         SPEC_CREATE_TOOL => Some(spec_create(db, args)),
         SPEC_UPDATE_SECTION_TOOL => Some(spec_update_section(db, args)),
         SPEC_FORK_TOOL => Some(spec_fork(db, args)),
-        // `spec_transition` is intentionally NOT routed to the agent (N17(b)) — nyx transitions the
-        // Spec at the graph node; the effector never does. The function stays for the UI/tests.
+        SPEC_TRANSITION_TOOL => Some(spec_transition(db, args)),
         SPEC_SET_WORKSPACE_TOOL => Some(spec_set_workspace(db, args)),
         SPEC_SET_CATEGORY_TOOL => Some(spec_set_category(db, args)),
         TASK_ADD_TOOL => Some(task_add(db, args)),
@@ -1634,24 +1622,6 @@ mod tests {
             .as_deref(),
             Some("S7")
         );
-        // N15 — OPENING a run on a Spec is the work signal under the thin dispatcher (the agent no
-        // longer calls the mutating spec_* verbs): `run_start` echoes the bound `spec_id`.
-        assert_eq!(
-            worked_spec_id(
-                crate::mcp_engine::RUN_START_TOOL,
-                &json!({ "run_id": "R1", "spec_id": "S8" })
-            )
-            .as_deref(),
-            Some("S8")
-        );
-        // An UNBOUND run (spec_id null) maps nothing.
-        assert_eq!(
-            worked_spec_id(
-                crate::mcp_engine::RUN_START_TOOL,
-                &json!({ "run_id": "R2", "spec_id": null })
-            ),
-            None
-        );
         // Reads + non-Spec tools never map.
         assert_eq!(
             worked_spec_id("list_projects", &json!({ "projects": [] })),
@@ -1686,39 +1656,11 @@ mod tests {
             worked_spec_id(SPEC_DEPS_TOOL, &json!({ "blocked_by": [] })),
             None
         );
-        // THE TWO RUN-LIFECYCLE SIGNALS. `run_start` maps the Spec it opened on; `run_bind_spec`
-        // maps the Spec a run that opened UNBOUND was finally attached to — the repaired session is
-        // exactly the one whose link was never written, so leaving it out would keep the terminal's
-        // Spec overlay empty for the session that already went wrong once.
-        assert_eq!(
-            worked_spec_id(
-                crate::mcp_engine::RUN_START_TOOL,
-                &json!({ "run_id": "R1", "spec_id": "S8" })
-            )
-            .as_deref(),
-            Some("S8")
-        );
-        assert_eq!(
-            worked_spec_id(
-                crate::mcp_engine::RUN_BIND_SPEC_TOOL,
-                &json!({ "run_id": "R2", "spec_id": "S9" })
-            )
-            .as_deref(),
-            Some("S9")
-        );
-        // An UNBOUND `run_start` (a /nspec with no Spec yet) maps nothing — null is not a Spec.
-        assert_eq!(
-            worked_spec_id(
-                crate::mcp_engine::RUN_START_TOOL,
-                &json!({ "run_id": "R3", "spec_id": null })
-            ),
-            None
-        );
     }
 
     /// THE `spec_*` TOOLS INHERIT THE SHORT-REFERENCE GRAMMAR, and not one of them implements it:
     /// each reads its argument through [`crate::mcp_context::require_spec_arg`], the SAME entry
-    /// point `agent_context` and `run_start` go through. Driven on the HUMAN KEY (which names its
+    /// point `agent_context` goes through. Driven on the HUMAN KEY (which names its
     /// own project, so it resolves on a call carrying no anchor at all) in either case, and on the
     /// `#N` / bare `N` where the call carries a project — the discipline the module states: a
     /// number counts in a project, so it needs one to count in.
@@ -1856,63 +1798,29 @@ mod tests {
         spec_deps(&db, &json!({ "spec_id": spec_id })).expect("the canonical id is untouched");
     }
 
-    /// THE CONDITIONAL THIRTEENTH FIELD. `spec_update_section`'s only project anchor is its
-    /// OPTIONAL `run_id`, so `#N` resolves with one and cannot without — and its description now
-    /// says exactly that (`mcp::tests::spec_update_section_states_the_condition_its_short_forms_
-    /// depend_on`). Both branches are pinned here, because a form that works or not depending on an
-    /// unrelated argument is the kind of thing a test must fix in place (finding
-    /// `01M0ZGHD137MDXFGS2PBG6GS68`): silence on the nominal path was what made it undiagnosable.
+    /// `spec_update_section` CARRIES NO PROJECT ANCHOR, so a `#N` or a bare `N` has nothing to
+    /// count in and is refused, naming the forms that DO work without one. (The engine's `run_id`
+    /// anchor is gone with the engine — PDR-0031.)
     #[test]
-    fn spec_update_section_honours_a_short_reference_only_with_the_run_id_it_advertises() {
+    fn spec_update_section_refuses_a_number_it_has_no_project_to_count_in() {
         let _g = db_guard();
         let (db, project_id, _ws) = seeded_db();
-        let (spec_id, number) = db.with_conn(|c| {
-            let spec = db::create_spec(c, &project_id, "Edited", db::SpecSections::empty())
+        let number = db.with_conn(|c| {
+            db::create_spec(c, &project_id, "Edited", db::SpecSections::empty())
                 .expect("spec")
-                .0;
-            (spec.id, spec.number)
+                .0
+                .number
         });
-        let edit = |token: &str, run_id: Option<&str>| {
-            let mut args = json!({
-                "spec_id": token,
-                "section": "problem",
-                "value": "rewritten",
-            });
-            if let Some(run_id) = run_id {
-                args["run_id"] = json!(run_id);
-            }
-            spec_update_section(&db, &args)
-        };
-
-        // NOMINAL PATH — editing a draft, no run_id: there is no project, and the refusal says so.
-        let err = edit(&format!("#{number}"), None).expect_err("no project to count #N in");
+        let err = spec_update_section(
+            &db,
+            &json!({ "spec_id": format!("#{number}"), "section": "problem", "value": "rewritten" }),
+        )
+        .expect_err("no project to count #N in");
         assert_eq!(err.code, RpcCode::InvalidArgument);
         assert!(
             err.message.contains(crate::spec_ref::ANCHORLESS_FORMS),
-            "the refusal names the forms that work without a run_id: {}",
+            "the refusal names the forms that work without an anchor: {}",
             err.message
-        );
-
-        // WITH THE RUN THE DESCRIPTION NAMES, the same reference resolves — the run carries the
-        // Spec, the Spec carries the project, and the number finally has something to count in.
-        let run_id = db.with_conn(|c| {
-            let wf = db::create_workflow(
-                c,
-                Some(&project_id),
-                "nspec",
-                db::WORKFLOW_SCOPE_NSPEC,
-                None,
-            )
-            .expect("workflow");
-            db::create_workflow_run(c, &wf.id, Some(&spec_id), None, "{}")
-                .expect("run")
-                .id
-        });
-        let out = edit(&format!("#{number}"), Some(&run_id)).expect("a run_id anchors the project");
-        assert_eq!(
-            out.result["spec_id"],
-            json!(spec_id),
-            "the short reference must have resolved to the Spec it names"
         );
     }
 
@@ -1988,7 +1896,7 @@ mod tests {
         // ready → NOW ALLOWED, and the status does not move.
         spec_transition(
             &db,
-            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+            &json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
         )
         .unwrap();
         let ok = spec_set_workspace(&db, &json!({ "spec_id": sid, "workspace_id": ws })).unwrap();
@@ -2001,7 +1909,7 @@ mod tests {
         // in_progress (via start, which itself anchors) → the standalone re-anchor is allowed.
         spec_transition(
             &db,
-            &json!({ "spec_id": sid, "transition": "start", "user_confirmed": true, "workspace_id": ws }),
+            &json!({ "spec_id": sid, "to": "start", "user_confirmed": true, "workspace_id": ws }),
         )
         .unwrap();
         let ok = spec_set_workspace(&db, &json!({ "spec_id": sid, "workspace_id": ws })).unwrap();
@@ -2034,7 +1942,7 @@ mod tests {
             .number;
         spec_transition(
             &db,
-            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+            &json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
         )
         .unwrap();
 
@@ -2089,7 +1997,7 @@ mod tests {
         let sid = spec_id_of(&created);
         spec_transition(
             &db,
-            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+            &json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
         )
         .unwrap();
         let anchor = || {
@@ -2174,7 +2082,7 @@ mod tests {
             let sid = spec_id_of(&created);
             spec_transition(
                 &db,
-                &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+                &json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
             )
             .unwrap();
             sid
@@ -2189,7 +2097,7 @@ mod tests {
         let err = spec_transition(
             &db,
             &json!({
-                "spec_id": sid, "transition": "start", "user_confirmed": true, "workspace_id": ""
+                "spec_id": sid, "to": "start", "user_confirmed": true, "workspace_id": ""
             }),
         )
         .expect_err("an empty anchor is a caller bug, not an order to start unanchored");
@@ -2211,7 +2119,7 @@ mod tests {
         //     unanchored. The guard refuses a spelling, not the behaviour behind it.
         let started = spec_transition(
             &db,
-            &json!({ "spec_id": sid, "transition": "start", "user_confirmed": true }),
+            &json!({ "spec_id": sid, "to": "start", "user_confirmed": true }),
         )
         .expect("omitting workspace_id is the documented unanchored start");
         assert_eq!(started.result["spec"]["status"], "in_progress");
@@ -2228,7 +2136,7 @@ mod tests {
         let anchored = spec_transition(
             &db,
             &json!({
-                "spec_id": other, "transition": "start", "user_confirmed": true, "cwd": nested
+                "spec_id": other, "to": "start", "user_confirmed": true, "cwd": nested
             }),
         )
         .expect("the cwd road is untouched");
@@ -2260,7 +2168,7 @@ mod tests {
         let sid = spec_id_of(&created);
         spec_transition(
             &db,
-            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+            &json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
         )
         .unwrap();
 
@@ -2277,12 +2185,13 @@ mod tests {
         );
     }
 
-    /// `spec_transition` start is SENSITIVE and POSES the anchor in one op (review finding #25):
-    /// without user_confirmed it is refused; with confirmation + a workspace_id it moves the Spec
-    /// to in_progress AND anchors it. The anchor also resolves from `cwd` when workspace_id is
-    /// absent (the same cwd→workspace matcher the context render uses).
+    /// `spec_transition` start POSES the anchor in one op (review finding #25) and asks the human
+    /// NOTHING (PDR-0031 : l'ensemble sensible est `ready`/`completed`/`cancelled`). Un `start`
+    /// SANS `user_confirmed` — la ligne exacte du manuel `/ndev` — passe et ancre la Spec. L'ancre
+    /// se résout aussi depuis `cwd` quand `workspace_id` est absent (le même matcher
+    /// cwd→workspace que le rendu de contexte).
     #[test]
-    fn spec_transition_start_requires_confirmation_and_poses_the_anchor() {
+    fn spec_transition_start_needs_no_confirmation_and_poses_the_anchor() {
         let _g = db_guard();
         let (db, project_id, ws) = seeded_db();
         let created = spec_create(
@@ -2293,25 +2202,17 @@ mod tests {
         let sid = spec_id_of(&created);
         spec_transition(
             &db,
-            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+            &json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
         )
         .unwrap();
 
-        // Unconfirmed start → refused (sensitive), nothing anchored.
-        let err = spec_transition(
-            &db,
-            &json!({ "spec_id": sid, "transition": "start", "workspace_id": ws }),
-        )
-        .unwrap_err();
-        assert_eq!(err.code, RpcCode::InvalidState);
-        assert!(err.message.contains("sensitive"));
-
-        // Confirmed start with an explicit workspace_id → in_progress + anchored.
+        // UNCONFIRMED start with an explicit workspace_id → in_progress + anchored. C'est
+        // littéralement l'appel du manuel `/ndev` §2 étape 0, qui ne porte pas `user_confirmed`.
         let started = spec_transition(
             &db,
-            &json!({ "spec_id": sid, "transition": "start", "user_confirmed": true, "workspace_id": ws }),
+            &json!({ "spec_id": sid, "to": "start", "workspace_id": ws }),
         )
-        .unwrap();
+        .expect("start ne demande aucune confirmation — le manuel l'appelle nu");
         assert_eq!(started.result["spec"]["status"], "in_progress");
         assert_eq!(
             started.result["spec"]["workspace_id"], ws,
@@ -2338,14 +2239,14 @@ mod tests {
         let sid = spec_id_of(&created);
         spec_transition(
             &db,
-            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+            &json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
         )
         .unwrap();
         // No workspace_id — resolve it from the cwd (nested under the workspace root).
         let nested = format!("{cwd}/crates/api");
         let started = spec_transition(
             &db,
-            &json!({ "spec_id": sid, "transition": "start", "user_confirmed": true, "cwd": nested }),
+            &json!({ "spec_id": sid, "to": "start", "user_confirmed": true, "cwd": nested }),
         )
         .unwrap();
         assert_eq!(
@@ -2434,17 +2335,149 @@ mod tests {
 
         // Without confirmation → refused by the guard-rail.
         let err =
-            spec_transition(&db, &json!({ "spec_id": sid, "transition": "ready" })).unwrap_err();
+            spec_transition(&db, &json!({ "spec_id": sid, "to": "ready" })).unwrap_err();
         assert_eq!(err.code, RpcCode::InvalidState);
         assert!(err.message.contains("sensitive"));
 
         // With confirmation + a substantive draft (problem + solution present) → ready.
         let out = spec_transition(
             &db,
-            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+            &json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
         )
         .unwrap();
         assert_eq!(out.result["spec"]["status"], "ready");
+    }
+
+    /// DONE-CRITERION (PDR-0031, `agent-manuals.md`) : **l'argument est la CIBLE, et le verbe
+    /// historique reste accepté.** Les manuels écrivent `to="in_review"` ; le code d'origine
+    /// n'acceptait que `transition="review"`. Les deux orthographes doivent désigner le même
+    /// mouvement, sinon un agent qui a lu le manuel et un agent qui a lu un ancien texte ne
+    /// pilotent pas la même machine.
+    #[test]
+    fn spec_transition_accepts_both_the_target_and_the_verb_spellings() {
+        for (target, verb) in [
+            ("ready", "ready"),
+            ("in_progress", "start"),
+            ("in_review", "review"),
+            ("completed", "done"),
+            ("cancelled", "cancel"),
+            ("draft", "revise"),
+        ] {
+            let by_target = parse_spec_transition(target).expect("the manual's target spelling");
+            let by_verb = parse_spec_transition(verb).expect("the conceptual verb");
+            assert_eq!(
+                by_target, by_verb,
+                "`to={target}` and `to={verb}` must name the SAME move"
+            );
+            assert_eq!(
+                by_target.target_status(),
+                if target == "in_progress" {
+                    "in_progress"
+                } else {
+                    target
+                },
+                "the target spelling IS the status it lands on"
+            );
+        }
+        // `complete` reste accepté (l'alias d'origine), et un mot hors des deux jeux est refusé en
+        // nommant l'ensemble.
+        assert_eq!(
+            parse_spec_transition("complete").unwrap(),
+            db::SpecTransition::Done
+        );
+        let err = parse_spec_transition("finish").unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidArgument);
+        assert!(
+            err.message.contains(SPEC_TRANSITION_TARGETS),
+            "the refusal names the accepted set: {}",
+            err.message
+        );
+    }
+
+    /// DONE-CRITERION : **les trois cibles sensibles sont refusées sans `user_confirmed`, et le
+    /// refus dit que l'humain doit l'avoir dit dans le chat.** Le garde-fou vit dans `db.rs` — ce
+    /// test prouve qu'il tient À TRAVERS l'outil, cible par cible, sans qu'aucune ne se glisse.
+    #[test]
+    fn spec_transition_refuses_every_sensitive_target_without_user_confirmed() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        for target in ["ready", "completed", "cancelled"] {
+            let created = spec_create(
+                &db,
+                &json!({ "project_id": project_id, "title": target, "problem": "p", "solution": "s" }),
+            )
+            .unwrap();
+            let sid = spec_id_of(&created);
+            let err = spec_transition(&db, &json!({ "spec_id": sid, "to": target })).unwrap_err();
+            assert_eq!(err.code, RpcCode::InvalidState, "`to={target}` must refuse");
+            assert!(
+                err.message.contains("in the chat"),
+                "the refusal must send the agent back to the human, not to a flag: {}",
+                err.message
+            );
+            // …et le refus n'a RIEN écrit : la Spec est toujours au statut d'avant.
+            let out = spec_get(&db, &json!({ "spec_id": sid })).unwrap();
+            assert_eq!(out.result["spec"]["status"], "draft");
+        }
+    }
+
+    /// DONE-CRITERION (`agent-manuals.md` §1 étape 5 / §5 ligne 2) : **`to="draft"` rouvre une Spec
+    /// déjà `ready`.** C'est la seconde moitié du geste de rework — `spec_fork` ouvre la révision,
+    /// celle-ci rend les sections éditables — et elle n'est PAS sensible : l'auteur reprend son
+    /// propre travail, il n'engage personne.
+    #[test]
+    fn spec_transition_to_draft_reopens_a_spec_for_rework() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let created = spec_create(
+            &db,
+            &json!({ "project_id": project_id, "title": "Rework", "problem": "p", "solution": "s" }),
+        )
+        .unwrap();
+        let sid = spec_id_of(&created);
+        spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
+        )
+        .unwrap();
+
+        // Le geste du manuel, dans l'ordre du manuel : fork, puis retour en draft.
+        spec_fork(&db, &json!({ "spec_id": sid, "change_reason": "rework" })).unwrap();
+        let reopened = spec_transition(&db, &json!({ "spec_id": sid, "to": "draft" })).unwrap();
+        assert_eq!(reopened.result["spec"]["status"], "draft");
+
+        // Une Spec DÉJÀ draft n'a rien à rouvrir : la garde de source la refuse.
+        let err = spec_transition(&db, &json!({ "spec_id": sid, "to": "draft" })).unwrap_err();
+        assert_eq!(err.code, RpcCode::InvalidState);
+    }
+
+    /// DONE-CRITERION (le trou #1 des manuels) : **`spec_transition` est ROUTÉ.** Déclaré,
+    /// dispatché nulle part, il ne pouvait être appelé par aucune surface ; le dispatcher partagé
+    /// doit désormais répondre `Some(..)` pour lui comme pour les autres entrées de `SPEC_TOOLS`.
+    #[test]
+    fn spec_transition_is_a_spec_tool_and_it_is_routed() {
+        let _g = db_guard();
+        assert!(SPEC_TOOLS.contains(&SPEC_TRANSITION_TOOL));
+        let (db, project_id, _ws) = seeded_db();
+        let created = spec_create(
+            &db,
+            &json!({ "project_id": project_id, "title": "Routed", "problem": "p", "solution": "s" }),
+        )
+        .unwrap();
+        let sid = spec_id_of(&created);
+        let routed = dispatch_spec_tool(
+            &db,
+            SPEC_TRANSITION_TOOL,
+            &json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
+        )
+        .expect("the shared dispatcher answers for spec_transition")
+        .expect("the transition succeeds");
+        assert_eq!(routed.result["spec"]["status"], "ready");
+        assert_eq!(
+            routed.effects,
+            vec![ChangedTopic::Specs],
+            "a Spec mutation re-pulls the Specs surfaces"
+        );
     }
 
     #[test]
@@ -2457,7 +2490,7 @@ mod tests {
         let sid = spec_id_of(&created);
         let err = spec_transition(
             &db,
-            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+            &json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
         )
         .unwrap_err();
         assert_eq!(err.code, RpcCode::InvalidState);
@@ -2501,12 +2534,12 @@ mod tests {
         // ready (confirmed) → start (confirmed, anchoring on the dev workspace in one op).
         spec_transition(
             &db,
-            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+            &json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
         )
         .unwrap();
         let started = spec_transition(
             &db,
-            &json!({ "spec_id": sid, "transition": "start", "user_confirmed": true, "workspace_id": ws }),
+            &json!({ "spec_id": sid, "to": "start", "user_confirmed": true, "workspace_id": ws }),
         )
         .unwrap();
         assert_eq!(started.result["spec"]["status"], "in_progress");
@@ -2667,12 +2700,12 @@ mod tests {
         // Move the Spec to in_progress (ready → start) → a delete is now REFUSED.
         spec_transition(
             &db,
-            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+            &json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
         )
         .unwrap();
         spec_transition(
             &db,
-            &json!({ "spec_id": sid, "transition": "start", "user_confirmed": true, "workspace_id": ws }),
+            &json!({ "spec_id": sid, "to": "start", "user_confirmed": true, "workspace_id": ws }),
         )
         .unwrap();
         let err = task_delete(&db, &json!({ "task_id": bid })).unwrap_err();
@@ -3490,7 +3523,7 @@ mod tests {
     #[test]
     fn the_category_verb_is_a_spec_tool_and_it_is_routed() {
         let _g = db_guard();
-        assert_eq!(SPEC_TOOLS.len(), 15);
+        assert_eq!(SPEC_TOOLS.len(), 16);
         assert!(SPEC_TOOLS.contains(&SPEC_SET_CATEGORY_TOOL));
         let (db, project_id, _ws) = seeded_db();
         let sid = spec_id_of(
@@ -4024,7 +4057,7 @@ mod tests {
         // The ANCHOR path returns a Spec too — through the same projection.
         spec_transition(
             &db,
-            &json!({ "spec_id": sid, "transition": "ready", "user_confirmed": true }),
+            &json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
         )
         .unwrap();
         results.push((

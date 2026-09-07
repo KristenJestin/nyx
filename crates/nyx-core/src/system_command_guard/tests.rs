@@ -1352,11 +1352,11 @@ fn the_human_path_reuses_the_same_transitions_and_is_not_reachable_from_mcp() {
         .any(|t| t["name"] == json!(crate::mcp::SYSTEM_APPROVAL_STATUS_TOOL)));
 }
 
-/// A `command_slots` GATE can start a stopped Système command, but carries no implicit protected
-/// mutation: binding a slot on the singleton is refused by the DOMAIN boundary, so a gate can never
-/// become a back door onto the scope.
+/// STARTING a stopped Système command is free, and it carries no implicit protected mutation:
+/// whatever reaches the singleton gets START and nothing else, so a check that needs to run can
+/// never become a back door onto the scope.
 #[test]
-fn a_gate_may_start_a_stopped_command_but_binds_no_slot_on_the_singleton() {
+fn starting_a_stopped_command_is_free_and_grants_nothing_else() {
     let f = fixture();
     assert_eq!(
         f.classify(
@@ -1365,28 +1365,11 @@ fn a_gate_may_start_a_stopped_command_but_binds_no_slot_on_the_singleton() {
             &json!({ "instance_id": f.instances[0] })
         ),
         Verdict::Free,
-        "a gate-like caller starting a stopped command is free"
+        "starting a stopped command is free"
     );
-    // Binding a slot ON the singleton is refused by the DOMAIN boundary, one layer below this
-    // matrix: `slot_bind` is not on the Système allow-list, so the dispatcher's `guard_payload`
-    // stops it before any authoring code runs. Driven through the REAL dispatcher, because that
-    // guard lives at the dispatcher and calling the authoring tool directly would walk around the
-    // very boundary being asserted.
-    let refused = f
-        .call(
-            "slot_bind",
-            json!({
-                "project_id": f.project,
-                "slot": crate::seed::BUILD_CHECK_SLOT,
-                "command_ids": [f.instances[0]],
-            }),
-        )
-        .expect_err("a gate slot is not a capability of the Système scope");
-    assert_eq!(refused.code, RpcCode::SystemScopeForbidden, "{refused:?}");
 
-    // And the bounded-risk statement the criterion actually makes: whatever a gate reaches, the
-    // matrix gives it START and nothing else. Every protected verb stays protected for a caller
-    // holding a Système instance id, gate or not.
+    // The bounded-risk statement the criterion actually makes: every protected verb stays
+    // protected for a caller holding a Système instance id.
     for (tool, args) in [
         ("clear_command_output", json!({ "instance_id": f.instances[0] })),
         ("relaunch_command", json!({ "instance_id": f.instances[0] })),
@@ -1397,7 +1380,7 @@ fn a_gate_may_start_a_stopped_command_but_binds_no_slot_on_the_singleton() {
                 f.classify(&FakeProbe::default(), tool, &args),
                 Verdict::Protected(_)
             ),
-            "`{tool}` stays protected — a gate inherits no implicit mutation"
+            "`{tool}` stays protected — a start grants no implicit mutation"
         );
     }
 }

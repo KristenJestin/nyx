@@ -72,12 +72,14 @@ Identical, to the test. That is the point: a suite that no longer asks the
 environment for `sh` cannot answer differently depending on which terminal
 launched it.
 
-The suite still compiles ONE test **out** on Windows
-(`mcp_engine::tests::two_concurrent_ticks_on_one_run_do_not_both_advance_it`,
-whose gate command is a small state machine rather than "a command that does
-X"). It is neither a pass nor a failure here, and it is green on the
-Linux/macOS legs of the cross-OS gate
-(`.github/workflows/gate-v2.2.5-terminal-persistence.yml`).
+Le relevé ci-dessus datait du moteur d'orchestration. Il mentionnait un test
+compilé **hors** de la suite sous Windows,
+`mcp_engine::tests::two_concurrent_ticks_on_one_run_do_not_both_advance_it`,
+dont la commande de gate était une petite machine à états plutôt qu'« une
+commande qui fait X ». Le moteur a été retiré (PDR-0031) : ce test, comme tout
+`mcp_engine::tests` et `seed::tests`, n'existe plus. Il ne reste donc **aucune**
+cible exclue par plateforme, et la suite compile en entier des trois côtés du
+gate cross-OS (`.github/workflows/gate-v2.2.5-terminal-persistence.yml`).
 
 ## The frozen reds (by fully-qualified test name)
 
