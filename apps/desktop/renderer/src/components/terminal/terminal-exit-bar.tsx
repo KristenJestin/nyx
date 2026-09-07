@@ -61,7 +61,7 @@ export function TerminalExitBar({
         {exit.relaunchFailed ? (
           // The relaunch is best-effort (a sidecar that is busy / down answers nothing), and a
           // button that silently does nothing twice is worse than one that says it did not work.
-          <span className="text-destructive"> · relance impossible</span>
+          <span className="text-destructive"> · relaunch failed</span>
         ) : null}
       </span>
       <Button size="xs" variant="outline" onClick={onRelaunch}>

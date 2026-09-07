@@ -102,8 +102,21 @@ export function useHomeFocus(): (target: HomeFocusTarget) => void {
         // `setScopeKind("project")` is a no-op in the project scope, so this is one expression for
         // both homes rather than a branch on which page we are on.
         setScopeKind("project");
+        void navigate({ to: "/", search: target.search });
+        return;
       }
-      void navigate({ to: "/", search: target.search });
+      // A ROW WITH NO PROJECT — a terminal detached from its workspace (deleting a project sets
+      // `terminals.workspace_id` to NULL) that the home still lists, unmarked. The SCOPE is left
+      // alone, which is this case's decided answer: there is no project to enter, so there is
+      // nothing to leave the transverse view for.
+      //
+      // THE DEEP-LINK IS DROPPED, though, because `/` cannot honour it: v2.5.6 finding #26 removed
+      // the loose-terminal band, so no terminal is surfaced there unattached to a workspace. A
+      // `?terminal=` at an id that will never appear is exactly the trap `search-target.ts` names
+      // for a dead terminal — `<TerminalsPage>` waits for it forever AND suppresses its own
+      // last-terminal restore, so the click would land on an EMPTY deck. Dropping the search is
+      // what makes it a landing instead.
+      void navigate({ to: "/", search: {} });
     },
     [activeProjectId, navigate, setActiveProjectId, setScopeKind],
   );

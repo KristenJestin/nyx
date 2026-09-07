@@ -24,7 +24,7 @@ describe("<TerminalExitBar>", () => {
 
   it("says so when a relaunch already failed, instead of offering the same silent button", () => {
     render(<TerminalExitBar exit={{ code: 1, relaunchFailed: true }} onRelaunch={() => {}} />);
-    expect(screen.getByRole("status").textContent).toContain("relance impossible");
+    expect(screen.getByRole("status").textContent).toContain("relaunch failed");
   });
 
   it("relaunches on click", () => {

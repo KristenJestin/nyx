@@ -287,6 +287,16 @@ export class XtermInstance {
   /** Whether a {@link respawn} is in flight — the re-entrancy guard on the relaunch. */
   private respawning = false;
   /**
+   * Whether a SPAWN is in flight — the window in which our pty id is not known yet and output
+   * must be buffered ({@link pendingOutput}).
+   *
+   * It is a flag and not `ptyId === null` because those two stopped meaning the same thing the
+   * day a pane could SIT in an exit: `pty://output` is one topic for every terminal in the app,
+   * each instance filtering by id, so a pane waiting on its Relaunch button would otherwise
+   * buffer every chunk every OTHER shell prints, for as long as the user leaves it there.
+   */
+  private spawnInFlight = false;
+  /**
    * The link the mouse is currently OVER, or `null`. Maintained by both link paths (the regex
    * scanner and the OSC 8 handler) and read by the right-click menu, which has coordinates and no
    * way to ask xterm "what link is at this point".
@@ -416,7 +426,10 @@ export class XtermInstance {
     this.unlistenOutput = await nyxBridge.subscribe<PtyOutputPayload>("pty://output", (p) => {
       if (this.disposed) return;
       if (this.ptyId === null) {
-        this.pendingOutput.push(p);
+        // Only while OUR spawn is in flight: outside that window an id-less instance is a pane
+        // sitting in an exit, and buffering there accumulates every other terminal's output for
+        // ever (see `spawnInFlight`).
+        if (this.spawnInFlight) this.pendingOutput.push(p);
         return;
       }
       if (p.id !== this.ptyId) return;
@@ -491,6 +504,18 @@ export class XtermInstance {
    * listeners are armed once, by {@link startPty}, and outlive every shell this pane hosts.
    */
   private async spawnShell({ rehydrate }: { rehydrate: boolean }): Promise<void> {
+    // OPEN the buffering window and close it whatever happens below: a spawn that throws must not
+    // leave the instance hoarding every terminal's output (see `spawnInFlight`).
+    this.spawnInFlight = true;
+    try {
+      await this.spawnShellInner({ rehydrate });
+    } finally {
+      this.spawnInFlight = false;
+    }
+  }
+
+  /** The body of {@link spawnShell}, wrapped by it so the buffering window is always closed. */
+  private async spawnShellInner({ rehydrate }: { rehydrate: boolean }): Promise<void> {
     // Give a pane that is being laid out RIGHT NOW its few macrotasks before judging its box: a leaf
     // born from a split is mounted in the same commit as its rectangle, so the box is 0×0 at this
     // instant and would send the shell to the 80×24 fallback in a pane that is nothing like it

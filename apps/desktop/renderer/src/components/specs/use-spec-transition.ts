@@ -63,7 +63,7 @@ export interface SpecTransitionActions {
  * lands in `bridge/contract.ts`, which this change must not touch. The cast is the documented
  * escape hatch until it does — and it keeps compiling unchanged once the name is in the union.
  */
-const SPEC_TRANSITION = "spec_transition" as unknown as BackendCommand;
+const SPEC_TRANSITION: BackendCommand = "spec_transition";
 
 /**
  * `useSpecTransition` — the ONE human gesture that moves a Spec through its lifecycle

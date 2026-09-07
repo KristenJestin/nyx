@@ -221,7 +221,10 @@ describe("Cross-project focus from the global home", () => {
     fireEvent.click(await screen.findByTestId("home-session-s1"));
 
     await waitFor(() => expect(router.state.location.pathname).toBe("/"));
-    expect(router.state.location.search).toEqual({ terminal: "p2-term" });
+    // NO deep-link: `/` cannot show a terminal attached to no workspace (finding #26 removed the
+    // loose band), so a `?terminal=` at it would be waited for for ever AND would suppress the
+    // page's last-terminal restore — an empty deck. The landing is the page itself.
+    expect(router.state.location.search).toEqual({});
     // Alpha is still the entered project: a row with no project asks for no switch.
     expect(screen.getByRole("button", { name: "Project Alpha" }).getAttribute("aria-current")).toBe(
       "true",
