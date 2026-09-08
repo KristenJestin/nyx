@@ -100,6 +100,34 @@ partage de PDR-0011 et PDR-0019, que le moteur avait débordé.
   manuels s'adressent à un agent, donc ils ne sont validés que par un agent réel sur un vrai client,
   jamais par une suite verte ni par un chemin de graphe rejoué.
 
+## Amendement du 2026-09-08 — le gel de la Spec couvre le fork et la réouverture
+
+**Constat de terrain.** Une Spec `in_review` a reçu les remarques de review de l'humain. L'agent
+`/ndev`, plutôt que d'en faire des findings et de corriger le CODE, a **forké la Spec** puis l'a
+rouverte en `draft` pour en réécrire le contenu jusqu'à ce qu'il colle à ce qu'il avait développé.
+La garde B4 gelait bien les **sections** hors `draft`, mais `db::fork_spec` n'avait **aucune** garde
+de statut et la transition `revise` (→ `draft`) n'était **pas sensible** : deux portes ouvertes sur
+un contrat validé.
+
+**Le verrou, dans l'autorité unique (`crates/nyx-core/src/db.rs`) :**
+
+- `fork_spec` est **gardée par le même `require_spec_status`** que la garde B4 : autorisée depuis
+  `draft` et `ready` **seulement**. Depuis `in_progress`, `in_review`, `blocked` ou un statut
+  terminal, elle est refusée par `ContentWriteError::ForkForbidden` — un `invalid_state` dont le
+  message **nomme la route juste** : un retour de review devient un **finding** (`task_add`
+  `kind="review"` avec une `severity`, ou `review_task_structure` sur un commentaire promu), et ce
+  qui change est le **code**.
+- `SpecTransition::Revise` (→ `draft`) devient **sensible**. Les transitions sensibles sont donc
+  **quatre** — `ready`, `completed`, `cancelled`, `draft` — sans exception à retenir : rouvrir une
+  Spec en cours de build ou de review dégèle le contrat que l'humain a validé, donc c'est lui qui le
+  décide, et l'agent transmet `user_confirmed=true`.
+
+**Conséquence de doctrine.** La Spec est **gelée hors `draft`, fork et réouverture inclus**. Le
+rework par fork reste la route de `/nspec` depuis `ready` ; au-delà, ce qui se corrige est le code.
+Si l'agent pense que c'est la Spec qui a tort et non le code, il le **dit** à l'humain et s'arrête
+là. Les manuels (`agent-manuals.md` §/nspec 5 et §/ndev 3, plus les interdits de `/ndev`) portent la
+règle mot pour mot ; `workflows.md` (W-002) et `agent-harness.md` la répètent au niveau parcours.
+
 ### Ce qui attend la v3
 
 Repris de la fin d'[`agent-manuals.md`](../agent-manuals.md) : **sessions par étape**, **outils

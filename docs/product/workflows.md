@@ -21,7 +21,8 @@ sous-agent. Ce document-ci décrit le **parcours** tel que l'humain le vit ; `ag
 la **source** de ce que nyx injecte, et c'est elle qui fait foi sur ce que l'agent lit. Les gestes
 qui ponctuent un parcours — `spec_transition`, `task_transition`, les commandes managées — sont des
 verbes nyx : l'agent les demande, nyx tranche, et les transitions sensibles (`ready`, `completed`,
-`cancelled`) n'avancent qu'avec `user_confirmed=true`, donc après une phrase claire de l'humain.
+`cancelled`, `draft`) n'avancent qu'avec `user_confirmed=true`, donc après une phrase claire de
+l'humain.
 
 ## W-001 - Travail libre sans Spec
 
@@ -43,7 +44,8 @@ Ce workflow protège le caractère terminal-first : un Spec ne doit jamais être
 6. Les tâches progressent et l'UI se met à jour en temps réel.
 7. L'agent demande une review.
 8. L'utilisateur review puis renvoie les commentaires à l'agent.
-9. L'utilisateur seul résout et valide.
+9. Chaque remarque devient un **finding** (tâche `kind=review` avec une `severity`) et se répond par du **code** : la Spec est gelée hors `draft`, `spec_fork` compris, donc l'agent ne la réécrit pas pour la faire coller à ce qu'il a livré. S'il pense que c'est la Spec qui a tort, il le dit et s'arrête : rouvrir est une décision humaine, confirmée (`spec_transition to="draft"`, `user_confirmed=true`).
+10. L'utilisateur seul résout et valide.
 
 ## W-003 - Review locale générique
 

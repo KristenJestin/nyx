@@ -42,7 +42,8 @@ export const LEGAL_TRANSITIONS: Record<SpecStatus, readonly SpecTransitionTarget
  * pre-ready validations and opens it to work, `completed` closes it, `cancelled` abandons it.
  * `in_progress` and `in_review` are ordinary steps forward and fire straight off their button.
  *
- * These three ARE the backend's sensitive set (`db::SpecTransition::is_sensitive`, mirrored by
+ * These three ARE the backend's sensitive set MINUS `draft` (`db::SpecTransition::is_sensitive`
+ * lists four; reopening a Spec in `draft` is sensitive too, and no button here offers it — see
  * `SERVER_SENSITIVE` in `use-spec-transition.ts`): the dialog is what makes `userConfirmed` true,
  * so the flag is never sent on a gesture nobody was asked about.
  */

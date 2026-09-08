@@ -32,7 +32,7 @@ Un **manuel par commande** (`/nspec`, `/ndev`, `/ndoc`), injecté au `UserPrompt
 
 Rôles rendus : **spec**, **dev** (orchestrateur), **doc** — trois, un par commande. Coder, auditeur et prototypeur ne sont plus des rôles nyx : ce sont des **sous-agents** que l'orchestrateur brieffe lui-même via le Task du provider, encadrés par la charte et **observés** par nyx (hooks `SubagentStart` / `SubagentStop`) — pas d'angle mort, même quand ils tournent dans le Task du provider.
 
-La seule machine à états qui subsiste est celle du **Spec** (`draft → ready → in_progress → in_review → completed`, plus `blocked`, `cancelled`, `archived`), avancée par `spec_transition` ; les transitions sensibles (`ready`, `completed`, `cancelled`) exigent `user_confirmed=true`, donc une phrase claire de l'humain dans le chat.
+La seule machine à états qui subsiste est celle du **Spec** (`draft → ready → in_progress → in_review → completed`, plus `blocked`, `cancelled`, `archived`), avancée par `spec_transition` ; les transitions sensibles (`ready`, `completed`, `cancelled`, `draft`) exigent `user_confirmed=true`, donc une phrase claire de l'humain dans le chat. Le contenu du Spec est **gelé hors `draft`** : sections non éditables et `spec_fork` refusé dès `in_progress`, de sorte qu'un retour de review se réponde par du code — un **finding** — et jamais par une réécriture du contrat.
 
 ## Contexte injecté, par agent
 

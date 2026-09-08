@@ -2501,7 +2501,16 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                         marked superseded, and a fresh active revision (with the same sections) \
                         becomes the editable one. Use this to keep history when the design \
                         diverges. Pass the spec_id and an optional change_reason (why you forked). \
-                        Returns the new active revision.",
+                        Returns the new active revision.\n\
+                        \n\
+                        ALLOWED FROM draft AND ready ONLY. Once the Spec is in_progress or \
+                        in_review it is the contract the human validated, and nyx refuses the fork: \
+                        what corrects it then is the CODE. Every review remark becomes a FINDING — \
+                        task_add with kind=\"review\" and a severity, or review_task_structure on a \
+                        promoted comment — a coder fixes it, and the human alone validates it. If \
+                        you believe the Spec itself is wrong, say so to the human and stop; \
+                        reopening it is their decision, and it costs a confirmed transition to \
+                        draft.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2525,17 +2534,20 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
              the pre-done checks and refuses while blocking work is still open). A refusal writes \
              nothing and lists what failed in data.failures.\n\
              \n\
-             `ready`, `completed` and `cancelled` are SENSITIVE, and they are the ONLY three: they \
-             REQUIRE user_confirmed=true, and that flag means the HUMAN said so in the chat, in \
-             their own words, just before you sent the call. Your own reading of the situation is \
-             not a confirmation, and neither is a question you asked yourself. `in_progress`, \
-             `in_review` and `draft` need nothing — starting work only records that it began.\n\
+             `ready`, `completed`, `cancelled` and `draft` are SENSITIVE, and they are the ONLY \
+             four: they REQUIRE user_confirmed=true, and that flag means the HUMAN said so in the \
+             chat, in their own words, just before you sent the call. Your own reading of the \
+             situation is not a confirmation, and neither is a question you asked yourself. \
+             `in_progress` and `in_review` need nothing — they only record that the work moved.\n\
              \n\
              `in_progress` is the ONE target that ANCHORS: the workspace comes from workspace_id, \
              else from cwd; on every other target both are ignored. `draft` REOPENS a Spec that is \
              ready, in_progress or in_review so its sections become editable again — the rework \
              move, which you make right after spec_fork when the current design is worth keeping \
-             as a revision. Returns the updated spec.",
+             as a revision. From ready that is the normal rework. From in_progress or in_review it \
+             UNFREEZES the contract the human validated, so it is theirs to decide: a review \
+             return is answered with CODE, filed as a finding, never by rewriting the Spec. \
+             Returns the updated spec.",
             targets = crate::mcp_tools_spec::SPEC_TRANSITION_TARGETS,
         ),
         "inputSchema": {
@@ -2554,7 +2566,7 @@ pub(crate) fn tool_descriptors() -> Vec<Value> {
                      revise) are accepted as synonyms. Any other value is refused, naming this set",
                     crate::mcp_tools_spec::SPEC_TRANSITION_TARGETS
                 )),
-                "user_confirmed": bool_prop("set true ONLY after the human has said so in the chat, in their own words. REQUIRED for ready, completed and cancelled, and for those three alone; ignored on in_progress, in_review and draft. Defaults to false, which refuses a sensitive move rather than guessing"),
+                "user_confirmed": bool_prop("set true ONLY after the human has said so in the chat, in their own words. REQUIRED for ready, completed, cancelled and draft, and for those four alone; ignored on in_progress and in_review. Defaults to false, which refuses a sensitive move rather than guessing"),
                 "workspace_id": str_prop("the dev workspace to ANCHOR the Spec on, read on the in_progress target only (from list_workspaces). An EMPTY string is refused rather than read as 'no anchor' — omit the argument to fall through to cwd"),
                 "cwd": str_prop("optional directory the anchor is resolved from when no workspace_id is given (the workspace whose root best matches this path), on the in_progress target only. Resolving nothing starts the Spec unanchored"),
             },

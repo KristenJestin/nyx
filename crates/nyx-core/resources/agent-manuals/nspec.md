@@ -107,10 +107,16 @@ Run through the checklist out loud: problem and solution validated, seams agreed
 written, category set, tasks and edges in place, human tasks explicit. Then ASK: "Ready to hand
 to /ndev?". Only on an explicit yes: spec_transition(spec_id, to="ready", user_confirmed=true).
 
-## 5. Reworking a Spec that is already ready or beyond
+## 5. Reworking a Spec that is already ready
 
-Never edit it in place. spec_fork opens a new revision, then spec_transition to "draft", then
-you are back in step 1 with the delta only. Tasks already done stay done.
+Never edit it in place. From ready: spec_fork opens a new revision, then spec_transition to
+"draft" — the human says so first, and you pass user_confirmed=true. You are then back in step 1
+with the delta only. Tasks already done stay done.
+
+BEYOND ready, nyx refuses the fork. A Spec that is in_progress or in_review is being realised, and
+what gets corrected at that point is the CODE, through findings: task_add(kind="review",
+severity=...), or review_task_structure on a comment the human promoted. Reopening it anyway is the
+human's decision, said in the chat, and the transition to "draft" requires user_confirmed=true.
 
 {{spec}}
 {{project}}

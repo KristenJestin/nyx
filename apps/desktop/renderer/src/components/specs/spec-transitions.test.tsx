@@ -218,8 +218,9 @@ describe("<SpecTransitions> — the ordinary moves fire directly", () => {
 
     await waitFor(() => expect(transitions(calls)).toHaveLength(1));
     // `start` POSES the anchor in the same write, but it is NOT sensitive
-    // (`db::SpecTransition::is_sensitive` — PDR-0031 names `ready`/`completed`/`cancelled` and
-    // those alone), so no confirmation flag is sent on a gesture nobody was asked about.
+    // (`db::SpecTransition::is_sensitive` names `ready`/`completed`/`cancelled`/`draft`, and
+    // `start` is not among them), so no confirmation flag is sent on a gesture nobody was asked
+    // about.
     expect(transitions(calls)[0].args).toEqual({
       specId: "s1",
       to: "in_progress",

@@ -23,12 +23,17 @@ export type SpecTransitionTarget =
 /**
  * The targets the BACKEND treats as SENSITIVE and therefore refuses without an explicit
  * `userConfirmed` — `crates/nyx-core/src/db.rs`, `SpecTransition::is_sensitive`: `ready`, `done`
- * (→ `completed`) and `cancel` (→ `cancelled`), the moves that are irreversible or contractual.
- * `in_progress` and `in_review` only record that the work moved along, and carry no flag.
+ * (→ `completed`), `cancel` (→ `cancelled`) and `revise` (→ `draft`), the moves that are
+ * irreversible or contractual. `in_progress` and `in_review` only record that the work moved
+ * along, and carry no flag.
  *
- * It is the SAME set as the one that opens a confirmation DIALOG (`spec-transitions.tsx`,
- * `NEEDS_DIALOG`), which is the point: the flag asserts that a human decided, so it is only ever
- * sent on a gesture the human was actually asked about.
+ * `draft` is in the backend's set and NOT in this one, because it is not in
+ * {@link SpecTransitionTarget} at all: no button of this UI reopens a Spec, so the target is not
+ * spellable here. The day one does, it belongs in both lists — the backend refuses it otherwise.
+ *
+ * It is otherwise the SAME set as the one that opens a confirmation DIALOG
+ * (`spec-transitions.tsx`, `NEEDS_DIALOG`), which is the point: the flag asserts that a human
+ * decided, so it is only ever sent on a gesture the human was actually asked about.
  */
 const SERVER_SENSITIVE: readonly SpecTransitionTarget[] = ["ready", "completed", "cancelled"];
 
@@ -59,9 +64,9 @@ export interface SpecTransitionActions {
 }
 
 /**
- * `spec_transition` is not (yet) spelled in the typed {@link BackendCommand} union: the binding
- * lands in `bridge/contract.ts`, which this change must not touch. The cast is the documented
- * escape hatch until it does — and it keeps compiling unchanged once the name is in the union.
+ * The command name, ANNOTATED rather than cast: `spec_transition` is a member of the typed
+ * {@link BackendCommand} union (`bridge/contract.ts`), so the annotation is what makes a rename on
+ * the backend side fail HERE, at compile time, instead of at the first click.
  */
 const SPEC_TRANSITION: BackendCommand = "spec_transition";
 

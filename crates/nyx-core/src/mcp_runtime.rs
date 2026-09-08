@@ -272,6 +272,16 @@ fn db_error_class(e: &diesel::result::Error) -> &'static str {
     }
 }
 
+/// The ROUTE a refused write must name: what a Spec past `draft` is corrected BY. Written once and
+/// quoted by both freeze refusals (the section write and the fork), because a refusal that only says
+/// "frozen" leaves the caller looking for another door — and the agent that found one rewrote the
+/// Spec to match its code.
+const FINDING_ROUTE: &str = "a review return is answered with CODE, never by editing the Spec: file \
+                             each remark as a finding — task_add with kind=\"review\" and a \
+                             severity, or review_task_structure on a promoted comment — fix the \
+                             code, and let the human validate. If you believe the SPEC is wrong and \
+                             not the code, say so to the human and stop: reopening is their call";
+
 /// Map a [`crate::db::ContentWriteError`] onto the RPC vocabulary: a status refusal is a clean
 /// `invalid_state` (the Spec's lifecycle froze this content), an unrecognised phase name is an
 /// `invalid_argument` (the caller passed a name, and it is the wrong one), a DB error stays
@@ -282,10 +292,24 @@ pub fn map_content_write_err(e: crate::db::ContentWriteError) -> RpcError {
             RpcCode::InvalidState,
             format!(
                 "cannot write {what} while the Spec is '{status}': {what} are frozen once the Spec \
-                 leaves its writable state (sections/tasks in draft, comments before it closes)"
+                 leaves its writable state (sections/tasks in draft, comments before it closes). \
+                 {FINDING_ROUTE}"
             ),
         )
         .with_data(json!({ "reason": "spec_state_forbids_write", "status": status })),
+        // THE SECOND DOOR into a frozen Spec, shut 2026-09-08: forking a Spec under build or under
+        // review re-opened a writable revision, and the `revise` that followed made the contract
+        // match the code. The refusal does not merely say no — it names where the review return
+        // actually goes, because the agent that forked was trying to answer one.
+        crate::db::ContentWriteError::ForkForbidden { status } => RpcError::new(
+            RpcCode::InvalidState,
+            format!(
+                "cannot fork the Spec while it is '{status}': a fork opens a writable revision, and \
+                 it is allowed from 'draft' and 'ready' only — past that the Spec is the contract \
+                 the human validated. {FINDING_ROUTE}"
+            ),
+        )
+        .with_data(json!({ "reason": "spec_state_forbids_fork", "status": status })),
         // K2 — a phase name the plan does not hold, on a Spec past `draft`. It used to MATERIALIZE
         // one, so a single mistyped free-text argument grew the plan of a Spec under build. The
         // refusal QUOTES the plan, because the mistake is always a near-miss (a rendered heading, a

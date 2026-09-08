@@ -2601,6 +2601,15 @@ fn write_active_revision_section(
 /// is retained (superseded) as history. Runs in ONE transaction so the supersede + insert
 /// + pointer bump are atomic — there is never zero or two active revisions.
 ///
+/// STATE-GUARDED, like the section write ([`update_active_revision_section`], guard B4) and
+/// through the SAME [`require_spec_status`] mechanism: a fork is allowed from `draft` and `ready`
+/// ONLY. Past `ready` the Spec is being BUILT (`in_progress`), REVIEWED (`in_review`), parked
+/// (`blocked`) or closed (`completed` / `cancelled` / `archived`), and a fork there was the hole
+/// the freeze left open: forking re-opened a writable revision, a `revise` back to `draft`
+/// followed, and the contract the human validated got rewritten to match the code. What corrects
+/// a Spec under build is the CODE, filed as a finding. The refusal is
+/// [`ContentWriteError::ForkForbidden`], which names that route.
+///
 /// Returns the new active [`SpecRevision`]. Errors if the Spec is unknown (no active
 /// revision to fork from) — a Spec always has an active revision by the [`create_spec`]
 /// invariant, so a missing one means the id is wrong.
@@ -2609,9 +2618,25 @@ pub fn fork_spec(
     conn: &mut SqliteConnection,
     spec_id: &str,
     change_reason: Option<&str>,
-) -> QueryResult<SpecRevision> {
+) -> Result<SpecRevision, ContentWriteError> {
     let now = now_millis();
     conn.transaction(|conn| {
+        // STATE GUARD: the same authority the section freeze uses, on the fork this time — the
+        // second door into a frozen Spec's content. `Forbidden` is re-labelled `ForkForbidden` so
+        // the tool layer can say WHERE a review return goes instead of repeating "frozen".
+        require_spec_status(
+            conn,
+            Some(spec_id),
+            "fork",
+            &[SPEC_STATUS_DRAFT, SPEC_STATUS_READY],
+        )
+        .map_err(|e| match e {
+            ContentWriteError::Forbidden { status, .. } => {
+                ContentWriteError::ForkForbidden { status }
+            }
+            other => other,
+        })?;
+
         // The current active revision is the base of the fork.
         let current: SpecRevision = spec_revisions::table
             .filter(spec_revisions::spec_id.eq(spec_id))
@@ -2687,11 +2712,12 @@ pub fn fork_spec(
 /// REVISE a Spec: [`fork_spec`] it (a new active revision snapshotting the current one, the prior
 /// superseded) AND reopen it as a `draft` so the new revision is EDITABLE again — the atomic "rework a
 /// ready Spec" operation the `fork_spec` node performs (v2.8 review N13). Unlike a lifecycle
-/// transition, this is NOT status-guarded (fork is allowed from any state, PDR-0014): reopening to
-/// `draft` is the point — the ready Spec's design becomes editable for the next authoring pass, and
-/// the caller re-commits it to `ready` afterwards. Returns the reopened [`Spec`]. Errors if unknown.
+/// transition, this poses no confirmation of its own — but it INHERITS [`fork_spec`]'s state guard,
+/// so it only ever reworks a `draft` or a `ready` Spec. Reopening one that is `in_progress` or
+/// `in_review` is a HUMAN decision, taken through the sensitive [`SpecTransition::Revise`] and its
+/// `user_confirmed`, never through this atom. Returns the reopened [`Spec`]. Errors if unknown.
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn revise_spec(conn: &mut SqliteConnection, spec_id: &str) -> QueryResult<Spec> {
+pub fn revise_spec(conn: &mut SqliteConnection, spec_id: &str) -> Result<Spec, ContentWriteError> {
     conn.transaction(|conn| {
         fork_spec(conn, spec_id, Some("revised via /nspec"))?;
         diesel::update(specs::table.find(spec_id))
@@ -2700,7 +2726,7 @@ pub fn revise_spec(conn: &mut SqliteConnection, spec_id: &str) -> QueryResult<Sp
                 specs::updated_at.eq(now_millis()),
             ))
             .execute(conn)?;
-        get_spec(conn, spec_id)?.ok_or(diesel::result::Error::NotFound)
+        Ok(get_spec(conn, spec_id)?.ok_or(diesel::result::Error::NotFound)?)
     })
 }
 
@@ -2728,12 +2754,13 @@ pub fn revise_spec(conn: &mut SqliteConnection, spec_id: &str) -> QueryResult<Sp
 // GARDE-FOUS (guard-rails), in the spirit of depot's `--user-confirmed`: the SENSITIVE
 // transitions (`ready`, `done`, `cancel`) require an explicit user confirmation. The set is
 // PDR-0031's, and the line it draws is the IRREVERSIBLE-or-CONTRACTUAL one: handing a Spec to
-// /ndev (`ready`), declaring it done, abandoning it. The three other moves merely RECORD what
-// happened — `start` that work began, `review` that it is ready for an eye, `revise` that the
-// author took the design back — and none of them asks the human twice.
+// /ndev (`ready`), declaring it done, abandoning it, and — since the Spec freeze — REOPENING one
+// (`revise`): a Spec past `ready` is the contract the human validated, and taking it back into
+// `draft` unfreezes its sections. Only `start` and `review` merely RECORD what happened — that
+// work began, that it is ready for an eye — and those two alone never ask the human twice.
 // The backend refuses the sensitive ones with [`SpecTransitionError::ConfirmationRequired`]
 // unless the caller passes `user_confirmed = true`, so a UI/MCP mutation cannot silently mark a
-// Spec ready/done/cancelled without the human's go-ahead.
+// Spec ready/done/cancelled, nor reopen it, without the human's go-ahead.
 
 /// A Spec lifecycle transition (the conceptual move, independent of the stored status
 /// string). Each maps to a canonical target `spec_status`, declares its legal source
@@ -2760,8 +2787,11 @@ pub enum SpecTransition {
     /// distincts est ce qui permet de rouvrir une Spec sans forcément la forker. [`revise_spec`]
     /// reste l'atome qui enchaîne les deux pour un appelant interne.
     ///
-    /// NON SENSIBLE : rouvrir en édition ne détruit rien, n'engage aucun humain et ne pose aucune
-    /// ancre — c'est le geste par lequel l'auteur reprend son propre travail.
+    /// SENSIBLE : rouvrir une Spec `in_progress` ou `in_review`, c'est DÉGELER le contrat que
+    /// l'humain a validé, et c'est exactement le geste par lequel un agent réécrivait la Spec pour
+    /// qu'elle colle au code qu'il venait d'écrire. Un retour de review se répond par du code, via
+    /// un finding ; rouvrir malgré tout est une décision humaine, transmise avec
+    /// `user_confirmed=true`.
     Revise,
 }
 
@@ -2824,21 +2854,31 @@ impl SpecTransition {
 
     /// Whether this transition is SENSITIVE and therefore requires an explicit user
     /// confirmation (the guard-rail, à la depot `--user-confirmed`): `ready`, `done`, `cancel`
-    /// — exactly the set PDR-0031 names, the same three `agent-manuals.md` asks the agent to
-    /// relay with `user_confirmed=true`.
+    /// and `revise` — the four `agent-manuals.md` asks the agent to relay with
+    /// `user_confirmed=true`.
     ///
     /// The rule behind the set: the human's sentence is demanded where the move is
     /// IRREVERSIBLE or CONTRACTUAL — `ready` hands the Spec to /ndev, `done` declares it
-    /// finished, `cancel` abandons it. It is NOT demanded where the move merely records that
-    /// work happened: `start` (work began), `review` (it is ready for an eye), `revise` (the
-    /// author took the design back). `start` used to sit in this set because it POSES the
-    /// workspace anchor in the same operation — it still does, but posing an anchor is a
-    /// consequence of starting, not a second decision to ask about, and requiring a
-    /// confirmation there made the `/ndev` manual's own opening call unusable.
+    /// finished, `cancel` abandons it, and `revise` TAKES BACK a Spec the human already
+    /// validated, unfreezing its sections. It is NOT demanded where the move merely records
+    /// that work happened: `start` (work began), `review` (it is ready for an eye). `start`
+    /// used to sit in this set because it POSES the workspace anchor in the same operation —
+    /// it still does, but posing an anchor is a consequence of starting, not a second decision
+    /// to ask about, and requiring a confirmation there made the `/ndev` manual's own opening
+    /// call unusable.
+    ///
+    /// `revise` JOINED the set the day a `/ndev` run answered a human's review remarks by
+    /// forking the Spec and reopening it in `draft` to make the contract match the code it had
+    /// written. The fork is now guarded ([`fork_spec`]) and the reopening asks the human — one
+    /// rule, no exception to remember: a review return is answered with CODE, filed as a
+    /// finding.
     pub fn is_sensitive(self) -> bool {
         matches!(
             self,
-            SpecTransition::Ready | SpecTransition::Done | SpecTransition::Cancel
+            SpecTransition::Ready
+                | SpecTransition::Done
+                | SpecTransition::Cancel
+                | SpecTransition::Revise
         )
     }
 }
@@ -3577,6 +3617,12 @@ pub fn check_spec_anchorable(
 pub enum ContentWriteError {
     /// The Spec's `status` forbids this write. `what` names the content kind (sections/tasks/comment).
     Forbidden { status: String, what: &'static str },
+    /// The FORK was refused because the Spec has left the statuses a rework may open a revision
+    /// from (`draft` / `ready`). Named apart from [`ContentWriteError::Forbidden`] because the
+    /// refusal has to say what the generic one cannot: past `ready` the Spec is BEING BUILT, and
+    /// what corrects it then is the CODE, through a finding — never a rewrite of the contract the
+    /// human validated. Carries the current status so the sentence can quote it.
+    ForkForbidden { status: String },
     /// A phase NAME that matches no phase of a Spec whose PLAN is frozen ([`resolve_or_create_phase`]).
     /// Carries the plan as it stands, so the refusal can name what the caller may actually pick from.
     UnknownPhase {
@@ -3602,9 +3648,9 @@ impl From<diesel::result::Error> for ContentWriteError {
 fn content_write_to_query_err(e: ContentWriteError) -> diesel::result::Error {
     match e {
         ContentWriteError::Db(d) => d,
-        ContentWriteError::Forbidden { .. } | ContentWriteError::UnknownPhase { .. } => {
-            diesel::result::Error::RollbackTransaction
-        }
+        ContentWriteError::Forbidden { .. }
+        | ContentWriteError::ForkForbidden { .. }
+        | ContentWriteError::UnknownPhase { .. } => diesel::result::Error::RollbackTransaction,
     }
 }
 
@@ -19913,11 +19959,11 @@ mod tests {
         assert!(matches!(err, SpecTransitionError::InvalidSource { .. }));
     }
 
-    /// DONE-CRITERION (PDR-0031, `agent-manuals.md` « Principes communs ») : les transitions
-    /// SENSIBLES sont EXACTEMENT `ready`, `done` et `cancel`. Sans confirmation elles sont
-    /// refusées avec `ConfirmationRequired` et n'écrivent rien ; avec, elles passent. `start`,
-    /// `review` et `revise` ne demandent RIEN — le manuel `/ndev` ouvre sur un
-    /// `to="in_progress"` sans `user_confirmed`, et il doit passer.
+    /// DONE-CRITERION (PDR-0031 + gel de la Spec) : les transitions SENSIBLES sont EXACTEMENT
+    /// `ready`, `done`, `cancel` et `revise`. Sans confirmation elles sont refusées avec
+    /// `ConfirmationRequired` et n'écrivent rien ; avec, elles passent. `start` et `review` ne
+    /// demandent RIEN — le manuel `/ndev` ouvre sur un `to="in_progress"` sans `user_confirmed`,
+    /// et il doit passer.
     #[test]
     fn sensitive_transitions_require_user_confirmation() {
         let mut conn = open_in_memory();
@@ -19933,7 +19979,10 @@ mod tests {
             "start ne fait qu'acter que le travail commence — le manuel /ndev l'appelle sans confirmation"
         );
         assert!(!SpecTransition::Review.is_sensitive());
-        assert!(!SpecTransition::Revise.is_sensitive());
+        assert!(
+            SpecTransition::Revise.is_sensitive(),
+            "rouvrir en draft dégèle la Spec validée — l'humain décide, pas l'agent"
+        );
 
         // ready is sensitive: unconfirmed → refused, nothing written.
         let err = transition_spec(&mut conn, &spec.id, SpecTransition::Ready, false).unwrap_err();
@@ -22704,8 +22753,12 @@ mod tests {
     /// `ready` ou au-delà REDEVIENT éditable — `spec_fork` ouvre la révision, `revise` rouvre le
     /// statut. Le geste est celui du manuel, en deux appels, et pas un fork déguisé : la
     /// transition seule ne touche pas aux révisions.
+    ///
+    /// Depuis le gel de la Spec (2026-09-08), `revise` est SENSIBLE : la réouverture est la
+    /// décision de l'humain, pas celle de l'agent. Le test le vérifie ici même — refusée sans
+    /// `user_confirmed`, acceptée avec.
     #[test]
-    fn revise_reopens_a_frozen_spec_as_draft_without_confirmation() {
+    fn revise_reopens_a_frozen_spec_as_draft_with_confirmation() {
         let mut conn = open_in_memory();
         let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
         let sections = SpecSections {
@@ -22716,9 +22769,18 @@ mod tests {
         let (spec, revision) = create_spec(&mut conn, &project.id, "Spec", sections).unwrap();
         transition_spec(&mut conn, &spec.id, SpecTransition::Ready, true).unwrap();
 
-        // NON SENSIBLE : aucun `user_confirmed` n'est demandé pour rendre la main à l'auteur.
+        // SENSIBLE : sans la phrase de l'humain, la réouverture est refusée et rien n'est écrit.
+        let refused = transition_spec(&mut conn, &spec.id, SpecTransition::Revise, false)
+            .expect_err("revise sans confirmation");
+        assert!(matches!(refused, SpecTransitionError::ConfirmationRequired));
+        assert_eq!(
+            get_spec(&mut conn, &spec.id).unwrap().unwrap().status,
+            SPEC_STATUS_READY,
+            "un refus n'écrit rien"
+        );
+
         let reopened =
-            transition_spec(&mut conn, &spec.id, SpecTransition::Revise, false).expect("revise");
+            transition_spec(&mut conn, &spec.id, SpecTransition::Revise, true).expect("revise");
         assert_eq!(reopened.status, SPEC_STATUS_DRAFT);
         assert_eq!(
             get_active_revision(&mut conn, &spec.id).unwrap().unwrap().id,
@@ -22740,8 +22802,72 @@ mod tests {
                 "{terminal} est terminal : on repart d'une nouvelle Spec, pas d'une réédition"
             );
         }
-        assert!(!SpecTransition::Revise.is_sensitive());
+        assert!(
+            SpecTransition::Revise.is_sensitive(),
+            "rouvrir une Spec figée dégèle le contrat validé — c'est une décision humaine"
+        );
         assert_eq!(SpecTransition::Revise.verb(), "revise");
+    }
+
+    /// DONE-CRITERION (gel de la Spec, 2026-09-08) : **le FORK est gelé lui aussi.** La garde B4
+    /// figeait les SECTIONS hors `draft`, mais `fork_spec` n'avait aucune garde de statut : un
+    /// agent en review forkait la Spec, la rouvrait en `draft`, et réécrivait le contrat pour
+    /// qu'il colle au code qu'il venait d'écrire. Le fork n'est donc plus légal que depuis `draft`
+    /// et `ready` — la route de rework de `/nspec`. Depuis `in_progress` et `in_review`, ce qui se
+    /// corrige est le CODE, et le refus le dit.
+    #[test]
+    fn fork_is_refused_once_the_spec_is_being_built_or_reviewed() {
+        let mut conn = open_in_memory();
+        let (project, _root) = create_project(&mut conn, "Nyx", "/work", None).unwrap();
+        let (spec, _) = create_spec(&mut conn, &project.id, "Spec", complete_sections()).unwrap();
+
+        // ACCEPTÉ depuis `draft` : la Spec s'écrit encore.
+        fork_spec(&mut conn, &spec.id, Some("draft rework")).expect("fork depuis draft");
+
+        // ACCEPTÉ depuis `ready` : c'est LA route de rework du manuel /nspec §5.
+        transition_spec(&mut conn, &spec.id, SpecTransition::Ready, true).unwrap();
+        fork_spec(&mut conn, &spec.id, Some("ready rework")).expect("fork depuis ready");
+        // Le fork n'a pas bougé le statut : la Spec est toujours `ready`.
+        assert_eq!(
+            get_spec(&mut conn, &spec.id).unwrap().unwrap().status,
+            SPEC_STATUS_READY
+        );
+        let revision_before = get_active_revision(&mut conn, &spec.id).unwrap().unwrap();
+
+        // REFUSÉ depuis `in_progress` : la Spec est en cours de réalisation.
+        transition_spec(&mut conn, &spec.id, SpecTransition::Start, false).unwrap();
+        let err = fork_spec(&mut conn, &spec.id, None).expect_err("fork depuis in_progress");
+        match err {
+            ContentWriteError::ForkForbidden { status } => {
+                assert_eq!(status, SPEC_STATUS_IN_PROGRESS)
+            }
+            other => panic!("expected ForkForbidden, got {other:?}"),
+        }
+
+        // REFUSÉ depuis `in_review` : c'est le cas qui a produit le défaut.
+        transition_spec(&mut conn, &spec.id, SpecTransition::Review, false).unwrap();
+        let err = fork_spec(&mut conn, &spec.id, None).expect_err("fork depuis in_review");
+        match err {
+            ContentWriteError::ForkForbidden { status } => {
+                assert_eq!(status, SPEC_STATUS_IN_REVIEW)
+            }
+            other => panic!("expected ForkForbidden, got {other:?}"),
+        }
+
+        // Un refus n'écrit RIEN : la révision active est celle d'avant, toujours active.
+        let revision_after = get_active_revision(&mut conn, &spec.id).unwrap().unwrap();
+        assert_eq!(revision_after.id, revision_before.id);
+        assert_eq!(
+            revision_after.revision_number,
+            revision_before.revision_number
+        );
+
+        // REFUSÉ depuis les statuts terminaux, par la même garde.
+        transition_spec(&mut conn, &spec.id, SpecTransition::Done, true).unwrap();
+        assert!(matches!(
+            fork_spec(&mut conn, &spec.id, None),
+            Err(ContentWriteError::ForkForbidden { .. })
+        ));
     }
 
     /// DONE-CRITERION (v2.5.11 Phase 2, task 01KXR1CZPJY42PD91VRMPYSJJE "Statut in-place"): the Spec

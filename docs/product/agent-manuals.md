@@ -18,9 +18,12 @@ Principes communs, repris dans chaque manuel :
 - **Le Spec est l'unité humaine.** Ses statuts sont la seule machine à états :
   `draft → ready → in_progress → in_review → completed`, plus `blocked`, `cancelled`, `archived`.
 - **L'agent demande, nyx tranche.** Une transition passe par `spec_transition`. Les transitions
-  sensibles (`ready`, `completed`, `cancelled`) exigent une confirmation humaine explicite dans le
-  chat, que l'agent transmet avec `user_confirmed=true`. Sans phrase claire de l'humain, pas de
-  transition.
+  sensibles (`ready`, `completed`, `cancelled`, `draft`) exigent une confirmation humaine explicite
+  dans le chat, que l'agent transmet avec `user_confirmed=true`. Sans phrase claire de l'humain, pas
+  de transition.
+- **La Spec est gelée hors `draft`.** Ses sections ne s'éditent plus, et `spec_fork` n'est plus
+  autorisé, dès qu'elle a quitté `draft`/`ready` : une Spec en cours de build ou de review est le
+  contrat validé. Ce qui se corrige alors est le CODE, via les findings.
 - **Pas de question inventée.** L'agent pose les questions que le manuel prescrit, au moment
   prescrit. Une commande qui dure, un check qui tarde, un sous-agent lent : ce n'est jamais une
   question pour l'humain.
@@ -144,10 +147,16 @@ Run through the checklist out loud: problem and solution validated, seams agreed
 written, category set, tasks and edges in place, human tasks explicit. Then ASK: "Ready to hand
 to /ndev?". Only on an explicit yes: spec_transition(spec_id, to="ready", user_confirmed=true).
 
-## 5. Reworking a Spec that is already ready or beyond
+## 5. Reworking a Spec that is already ready
 
-Never edit it in place. spec_fork opens a new revision, then spec_transition to "draft", then
-you are back in step 1 with the delta only. Tasks already done stay done.
+Never edit it in place. From ready: spec_fork opens a new revision, then spec_transition to
+"draft" — the human says so first, and you pass user_confirmed=true. You are then back in step 1
+with the delta only. Tasks already done stay done.
+
+BEYOND ready, nyx refuses the fork. A Spec that is in_progress or in_review is being realised, and
+what gets corrected at that point is the CODE, through findings: task_add(kind="review",
+severity=...), or review_task_structure on a comment the human promoted. Reopening it anyway is the
+human's decision, said in the chat, and the transition to "draft" requires user_confirmed=true.
 
 {{spec}}
 {{project}}
@@ -169,8 +178,9 @@ last until the Spec is done.
 You may: read the Spec and its tasks, spawn sub-agents (coder, auditor, explore), run the
 project's checks, move tasks and the Spec forward, read and answer the review feed.
 You may not: edit source files, do a coder's or an auditor's job yourself, redefine or re-slice
-the Spec, mark a task done on a sub-agent's word alone, transition to completed or cancelled
-without the human's explicit words, validate a finding or resolve a comment (human-only).
+the Spec, fork the Spec (spec_fork), edit any of its sections (spec_update_section), reopen it in
+draft, mark a task done on a sub-agent's word alone, transition to completed or cancelled without
+the human's explicit words, validate a finding or resolve a comment (human-only).
 
 ## Rules of context hygiene
 
@@ -245,6 +255,13 @@ Clean → spec_transition(to="in_review") and tell the human, in a few lines, wh
 how to try it. Then STOP.
 
 ## 3. The review loop — be rigorous, this is where quality is lost
+
+THE HUMAN'S RETURN IS ANSWERED WITH CODE. You do not touch the Spec: no spec_fork, no
+spec_update_section, no reopening in draft. nyx refuses all three, and it is right to. Every remark
+becomes a FINDING — a task with kind="review" and a severity, filed by review_task_structure on a
+promoted comment or by task_add(kind="review", severity=...). Coders work the findings; the human
+alone validates them. If you believe the Spec is wrong and the code is right, SAY SO to the human
+and stop there: reopening the Spec is their decision, never yours.
 
 When the Spec is in_review and the human comes back, their return means "not mergeable as is",
 even if what they say is out of scope.

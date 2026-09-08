@@ -400,13 +400,19 @@ impl Ctx<'_> {
     }
 
     /// Surface a state-guarded content-write refusal (v2.8 review B4): a `Forbidden` becomes a clear
-    /// message (the Spec's lifecycle froze this write), an `UnknownPhase` names the plan the caller
-    /// missed (K2), a raw DB error stays as [`Self::db_err`].
+    /// message (the Spec's lifecycle froze this write), a `ForkForbidden` says the fork is a
+    /// draft/ready gesture and names the route a review return really takes, an `UnknownPhase` names
+    /// the plan the caller missed (K2), a raw DB error stays as [`Self::db_err`].
     fn content_write_err(e: nyx_core::db::ContentWriteError) -> String {
         match e {
             nyx_core::db::ContentWriteError::Forbidden { status, what } => {
                 format!("cannot write {what} while the Spec is '{status}' — frozen by its lifecycle")
             }
+            nyx_core::db::ContentWriteError::ForkForbidden { status } => format!(
+                "cannot fork the Spec while it is '{status}' — a fork opens a writable revision, \
+                 and it is allowed from 'draft' and 'ready' only. Past that the Spec is the \
+                 validated contract: what corrects it is the code, filed as a finding"
+            ),
             nyx_core::db::ContentWriteError::UnknownPhase {
                 name,
                 status,
@@ -7535,11 +7541,22 @@ mod tests {
         assert_eq!(moved["spec"]["status"].as_str().unwrap(), "ready");
         assert_eq!(specs_changed(&h), pushes_before + 1);
 
-        // `to="draft"` rouvre la Spec pour rework — non sensible, aucune confirmation demandée.
+        // `to="draft"` rouvre la Spec pour rework — SENSIBLE depuis le gel : sans la confirmation
+        // de l'humain, la réouverture est refusée comme `ready` l'était.
+        let refused_reopen = h
+            .run(
+                "spec_transition",
+                serde_json::json!({ "specId": spec_id, "to": "draft" }),
+            )
+            .unwrap_err();
+        assert!(
+            refused_reopen.contains("in the chat"),
+            "rouvrir dégèle le contrat validé : l'humain le dit. {refused_reopen}"
+        );
         let reopened: serde_json::Value = serde_json::from_str(
             &h.run(
                 "spec_transition",
-                serde_json::json!({ "specId": spec_id, "to": "draft" }),
+                serde_json::json!({ "specId": spec_id, "to": "draft", "userConfirmed": true }),
             )
             .unwrap(),
         )

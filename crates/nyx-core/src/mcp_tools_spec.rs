@@ -441,9 +441,11 @@ pub fn map_spec_transition_err(e: db::SpecTransitionError) -> RpcError {
         }
         db::SpecTransitionError::ConfirmationRequired => RpcError::new(
             RpcCode::InvalidState,
-            "this is a sensitive transition (ready, completed, cancelled): the human \
+            "this is a sensitive transition (ready, completed, cancelled, draft): the human \
              must say so in the chat first, in their own words — then pass user_confirmed=true. \
-             Asking yourself is not a confirmation",
+             Asking yourself is not a confirmation. Reopening a Spec in draft is one of the four \
+             because it unfreezes the contract the human validated: a review return is answered \
+             with CODE, filed as a finding, not by rewriting the Spec",
         ),
         db::SpecTransitionError::WorkspaceNotFound => {
             RpcError::new(RpcCode::InvalidId, "unknown workspace")
@@ -862,6 +864,11 @@ pub fn spec_update_section(db: &Db, args: &Value) -> Result<ToolOutcome, RpcErro
 /// `spec_fork` — `{ spec_id, change_reason? }` → `{ revision }`. Forks the Spec into a NEW
 /// active revision (the prior one superseded), snapshotting the current sections, via the
 /// SHARED `db::fork_spec`. An unknown Spec → `invalid_id`.
+///
+/// STATE-GUARDED in the authority, not here: `draft` and `ready` only. A fork on a Spec that is
+/// `in_progress` / `in_review` / blocked / closed comes back as `invalid_state` through
+/// [`map_content_write_err`], with the sentence that names the route a review return really takes
+/// (a finding). Rien n'est re-jugé dans cet adaptateur.
 pub fn spec_fork(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let spec_id =
         crate::mcp_context::require_spec_arg_project_relative_refused(db, args, "spec_id")?;
@@ -870,10 +877,10 @@ pub fn spec_fork(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
     let revision = db
         .with_conn(|c| db::fork_spec(c, spec_id, change_reason))
         .map_err(|e| match e {
-            diesel::result::Error::NotFound => {
+            db::ContentWriteError::Db(diesel::result::Error::NotFound) => {
                 RpcError::new(RpcCode::InvalidId, format!("unknown spec {spec_id}"))
             }
-            other => internal_db(other),
+            other => map_content_write_err(other),
         })?;
     Ok(ToolOutcome::changed(
         json!({ "revision": revision }),
@@ -884,7 +891,7 @@ pub fn spec_fork(db: &Db, args: &Value) -> Result<ToolOutcome, RpcError> {
 /// `spec_transition` — `{ spec_id, to, user_confirmed?, workspace_id?, cwd? }` →
 /// `{ spec }`. Performs a GUARDED + VALIDATED lifecycle transition via the SHARED
 /// `db::transition_spec_with_workspace`. The SENSITIVE transitions — `ready`, `done`
-/// (→ `completed`) and `cancel` (→ `cancelled`), and those three alone — are refused unless
+/// (→ `completed`), `cancel` (→ `cancelled`) and `revise` (→ `draft`), and those four alone — are refused unless
 /// `user_confirmed=true` — the guard-rail is enforced in `db.rs`, so it holds through the tool
 /// exactly as through the UI (à la depot `--user-confirmed`), et RIEN n'est re-jugé ici : ce
 /// module est un adaptateur, la règle vit dans l'autorité unique.
@@ -2319,6 +2326,46 @@ mod tests {
         assert_eq!(out.result["revision"]["change_reason"], "rethink");
     }
 
+    /// DONE-CRITERION (gel de la Spec) : **`spec_fork` sur une Spec en review est refusé, et le
+    /// refus NOMME LA ROUTE.** Un `invalid_state` sec renverrait l'agent chercher une autre porte —
+    /// c'est précisément ce qu'il a fait. La phrase doit dire où va un retour de review : un
+    /// FINDING, et le code qui change. `in_progress` est refusé de la même façon.
+    #[test]
+    fn spec_fork_is_refused_past_ready_and_the_refusal_names_the_finding_route() {
+        let _g = db_guard();
+        let (db, project_id, _ws) = seeded_db();
+        let created = spec_create(
+            &db,
+            &json!({ "project_id": project_id, "title": "Frozen", "problem": "p", "solution": "s" }),
+        )
+        .unwrap();
+        let sid = spec_id_of(&created);
+        spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "to": "ready", "user_confirmed": true }),
+        )
+        .unwrap();
+
+        // Depuis `ready`, le fork reste la route de rework : il passe.
+        spec_fork(&db, &json!({ "spec_id": sid })).expect("fork depuis ready");
+
+        for status in ["in_progress", "in_review"] {
+            spec_transition(&db, &json!({ "spec_id": sid, "to": status })).unwrap();
+            let err = spec_fork(&db, &json!({ "spec_id": sid })).unwrap_err();
+            assert_eq!(err.code, RpcCode::InvalidState, "fork depuis {status}");
+            assert!(
+                err.message.contains("finding"),
+                "le refus doit nommer la route — un finding, et le code qui change : {}",
+                err.message
+            );
+            assert!(
+                err.message.contains(status),
+                "le refus cite le statut qui l'a produit : {}",
+                err.message
+            );
+        }
+    }
+
     /// The SENSITIVE-transition confirmation guard-rail must be ENFORCED THROUGH the tool:
     /// a `ready` without `user_confirmed` is refused, and even with confirmation it still
     /// runs the pre-ready validations (an empty draft fails).
@@ -2401,7 +2448,9 @@ mod tests {
     fn spec_transition_refuses_every_sensitive_target_without_user_confirmed() {
         let _g = db_guard();
         let (db, project_id, _ws) = seeded_db();
-        for target in ["ready", "completed", "cancelled"] {
+        // QUATRE, pas trois : `draft` a rejoint l'ensemble le jour où un agent a répondu à une
+        // review en forkant la Spec et en la rouvrant pour qu'elle colle à son code.
+        for target in ["ready", "completed", "cancelled", "draft"] {
             let created = spec_create(
                 &db,
                 &json!({ "project_id": project_id, "title": target, "problem": "p", "solution": "s" }),
@@ -2423,8 +2472,9 @@ mod tests {
 
     /// DONE-CRITERION (`agent-manuals.md` §1 étape 5 / §5 ligne 2) : **`to="draft"` rouvre une Spec
     /// déjà `ready`.** C'est la seconde moitié du geste de rework — `spec_fork` ouvre la révision,
-    /// celle-ci rend les sections éditables — et elle n'est PAS sensible : l'auteur reprend son
-    /// propre travail, il n'engage personne.
+    /// celle-ci rend les sections éditables — et depuis le gel de la Spec elle est SENSIBLE :
+    /// rouvrir dégèle le contrat validé, donc l'humain le dit et l'agent transmet
+    /// `user_confirmed=true`.
     #[test]
     fn spec_transition_to_draft_reopens_a_spec_for_rework() {
         let _g = db_guard();
@@ -2441,13 +2491,22 @@ mod tests {
         )
         .unwrap();
 
-        // Le geste du manuel, dans l'ordre du manuel : fork, puis retour en draft.
+        // Le geste du manuel, dans l'ordre du manuel : fork (légal depuis `ready`), puis retour en
+        // draft — celui-ci confirmé par l'humain.
         spec_fork(&db, &json!({ "spec_id": sid, "change_reason": "rework" })).unwrap();
-        let reopened = spec_transition(&db, &json!({ "spec_id": sid, "to": "draft" })).unwrap();
+        let reopened = spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "to": "draft", "user_confirmed": true }),
+        )
+        .unwrap();
         assert_eq!(reopened.result["spec"]["status"], "draft");
 
         // Une Spec DÉJÀ draft n'a rien à rouvrir : la garde de source la refuse.
-        let err = spec_transition(&db, &json!({ "spec_id": sid, "to": "draft" })).unwrap_err();
+        let err = spec_transition(
+            &db,
+            &json!({ "spec_id": sid, "to": "draft", "user_confirmed": true }),
+        )
+        .unwrap_err();
         assert_eq!(err.code, RpcCode::InvalidState);
     }
 
