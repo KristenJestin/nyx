@@ -65,3 +65,7 @@ failure outside that named list is a real regression.
 ## Recommended IDE setup
 
 - [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+
+## Licence
+
+Free software under the [AGPL-3.0](LICENSE).

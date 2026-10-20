@@ -2,6 +2,7 @@
 name = "nyx-core"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-only"
 description = "Shell-agnostic core of nyx (PTY, OSC, DB, MCP, agents, commands, sessions). No Tauri or Electron types cross its API; shells adapt to it via the EventSink / AppPaths / service-container / boot-shutdown frontiers."
 
 [lib]

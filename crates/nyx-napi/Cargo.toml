@@ -2,6 +2,7 @@
 name = "nyx-napi"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-only"
 description = "napi-rs module exposing nyx-core to Node (the Electron core-host). Builds a .node native addon + generated TypeScript declarations. Exposes the full interactive-PTY surface: spawn (new), write/resize/kill/setPaused/id, plus output/exit/OSC-7/OSC-133 callbacks streamed via a ThreadsafeFunction (the EventSink frontier bridged to Node), with lossless flow-control backpressure."
 
 [lib]
